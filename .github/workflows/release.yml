@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          cd idle-scaler
+          
+          VERSION=${{ steps.version.outputs.VERSION }}
+          
+          # Linux AMD64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-linux-amd64 .
+          
+          # Linux ARM64
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-linux-arm64 .
+          
+          # macOS AMD64 (Intel)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-darwin-amd64 .
+          
+          # macOS ARM64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-darwin-arm64 .
+          
+          # Windows AMD64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-windows-amd64.exe .
+          
+          cd ..
+
+      - name: Generate checksums
+        run: |
+          sha256sum idle-scaler-* > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            idle-scaler-*
+            checksums.txt
+          body: |
+            ## Installation
+            
+            ### Traefik Plugin
+            
+            Add to your Traefik configuration:
+            
+            ```yaml
+            experimental:
+              plugins:
+                scalewaker:
+                  moduleName: "github.com/Metatable-ai/nomad_scale_to_zero/traefik-plugin"
+                  version: "${{ steps.version.outputs.VERSION }}"
+            ```
+            
+            ### Idle-Scaler Binary
+            
+            Download the appropriate binary for your platform and make it executable:
+            
+            ```bash
+            # Example for Linux AMD64
+            wget https://github.com/Metatable-ai/nomad_scale_to_zero/releases/download/${{ steps.version.outputs.VERSION }}/idle-scaler-linux-amd64
+            chmod +x idle-scaler-linux-amd64
+            ./idle-scaler-linux-amd64 --help
+            ```
+            
+            Verify checksums after download:
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+            
+            ## Documentation
+            
+            - [README.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/README.md)
+            - [LOCAL_TESTING.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/LOCAL_TESTING.md)
+            - [CONTRIBUTING.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/CONTRIBUTING.md)
+            - [RELEASE.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/RELEASE.md)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
