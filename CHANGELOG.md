@@ -8,10 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Enhanced README.md with open source best practices
-- Created CONTRIBUTING.md with comprehensive contribution guidelines
-- Added RELEASE.md with release process documentation
-- Added CHANGELOG.md for tracking changes
 
 ### Changed
 
@@ -25,8 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-<!-- Template for first release - update date and details when creating v0.1.0 -->
-## [0.1.0] - YYYY-MM-DD
+## [0.1.0] - 2026-01-28
 
 ### Added
 - Initial public release
@@ -39,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive local testing environment with ACL support
 - Sample job files and configurations
 - Documentation: README.md, LOCAL_TESTING.md, component READMEs
+- CONTRIBUTING.md with comprehensive contribution guidelines
+- RELEASE.md with release process documentation
+- RELEASE_QUICK.md for quick release reference
+- CHANGELOG.md for tracking changes
+- build-release.sh script for building release binaries
+- GitHub Actions workflow (.github/workflows/release.yml) for automated releases
 
 ### Components
 - **traefik-plugin/**: ScaleWaker Traefik middleware (Go module)
