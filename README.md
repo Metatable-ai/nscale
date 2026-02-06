@@ -117,15 +117,32 @@ Traditional auto-scaling typically scales to a minimum of 1 instance, which stil
 
 1. **Deploy the Traefik Plugin**
 
-   Install the ScaleWaker plugin on your Traefik instance:
+   **Option A: Local Plugin Installation** (Recommended for now)
+
+   Copy the plugin to Traefik's local plugins directory:
+
+   ```bash
+   # Clone the repository
+   git clone https://github.com/Metatable-ai/nomad_scale_to_zero.git
+   
+   # Copy plugin to Traefik plugins directory
+   mkdir -p /path/to/traefik/plugins-local
+   cp -r nomad_scale_to_zero/traefik-plugin /path/to/traefik/plugins-local/
+   ```
+
+   Configure Traefik static configuration:
 
    ```yaml
    experimental:
-     plugins:
+     localPlugins:
        scalewaker:
-         moduleName: "github.com/Metatable-ai/nomad_scale_to_zero/traefik-plugin"
-         version: "v0.1.0"  # Use latest release
+         moduleName: "nomad_scale_to_zero/traefik-plugin"
    ```
+
+   **Option B: Plugin Catalog** (Coming soon)
+
+   > **Note:** Plugin Catalog support requires restructuring this repository to have the plugin code at the root.
+   > This is planned for a future release. For now, use local plugin installation (Option A).
 
    Configure environment variables:
 
