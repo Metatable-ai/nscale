@@ -1,0 +1,33 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+api:
+  insecure: true
+  dashboard: true
+
+ping:
+  entryPoint: http
+
+log:
+  level: DEBUG
+
+entryPoints:
+  http:
+    address: ":80"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+  consulCatalog:
+    endpoint:
+      address: consul:8500
+      scheme: http
+    exposedByDefault: false
+    watch: true
+    refreshInterval: 5s
+
+experimental:
+  localPlugins:
+    scalewaker:
+      moduleName: nomad_scale_to_zero/traefik-plugin

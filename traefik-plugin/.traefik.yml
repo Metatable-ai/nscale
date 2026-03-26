@@ -1,0 +1,20 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+displayName: ScaleWaker
+type: middleware
+
+import: "nomad_scale_to_zero/traefik-plugin"
+
+summary: "Scale Nomad jobs to 1 on demand and record activity"
+
+testData:
+  serviceName: "echo-s2z"
+  jobName: "echo-s2z"
+  groupName: "main"
+  nomadAddr: "http://nomad:4646"
+  consulAddr: "http://consul:8500"
+  activityStore: "redis"
+  jobSpecStore: "redis"
+  redisAddr: "redis:6379"
+  timeout: "30s"

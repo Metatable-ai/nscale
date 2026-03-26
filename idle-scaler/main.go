@@ -24,6 +24,9 @@ const (
 	metaEnabled     = "scale-to-zero.enabled"
 	metaIdleTimeout = "scale-to-zero.idle-timeout"
 	metaJobSpecKey  = "scale-to-zero.job-spec-kv"
+
+	idleScalerJobNamePrefix = "idle-scaler"
+	nomadSystemJobType      = "system"
 )
 
 func main() {
@@ -134,11 +137,7 @@ func (s *IdleScaler) RunOnce(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("job info %s: %w", job.ID, err)
 		}
-		if jobInfo == nil || jobInfo.Meta == nil {
-			continue
-		}
-
-		if strings.ToLower(jobInfo.Meta[metaEnabled]) != "true" {
+		if !shouldManageScaleToZeroJob(jobInfo) {
 			continue
 		}
 
@@ -162,6 +161,49 @@ func (s *IdleScaler) RunOnce(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func shouldManageScaleToZeroJob(job *nomad.Job) bool {
+	if job == nil || job.Meta == nil {
+		return false
+	}
+
+	if strings.ToLower(job.Meta[metaEnabled]) != "true" {
+		return false
+	}
+
+	if isProtectedScaleToZeroJob(job) {
+		return false
+	}
+
+	return true
+}
+
+func isProtectedScaleToZeroJob(job *nomad.Job) bool {
+	if job == nil {
+		return false
+	}
+
+	if job.Type != nil && strings.EqualFold(*job.Type, nomadSystemJobType) {
+		return true
+	}
+
+	if hasIdleScalerJobName(job.ID) || hasIdleScalerJobName(job.Name) {
+		return true
+	}
+
+	return false
+}
+
+func hasIdleScalerJobName(value *string) bool {
+	if value == nil {
+		return false
+	}
+
+	return strings.HasPrefix(
+		strings.ToLower(strings.TrimSpace(*value)),
+		idleScalerJobNamePrefix,
+	)
 }
 
 func (s *IdleScaler) storeJobSpec(job *nomad.Job) error {
@@ -201,6 +243,10 @@ func (s *IdleScaler) storeJobSpec(job *nomad.Job) error {
 }
 
 func (s *IdleScaler) maybeScaleToZero(ctx context.Context, job *nomad.Job, timeout time.Duration) error {
+	if !shouldManageScaleToZeroJob(job) {
+		return nil
+	}
+
 	jobID := ""
 	if job.ID != nil {
 		jobID = *job.ID

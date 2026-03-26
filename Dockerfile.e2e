@@ -1,0 +1,38 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM grafana/k6:latest AS k6
+
+FROM hashicorp/nomad:1.10.5 AS nomad
+
+FROM golang:1.25-bookworm
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends bash curl jq gettext-base redis-tools ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy go.mod/go.sum first for layer caching
+COPY activity-store/go.mod activity-store/go.sum* activity-store/
+COPY idle-scaler/go.mod idle-scaler/go.sum* idle-scaler/
+COPY traefik-plugin/go.mod traefik-plugin/
+
+# Download deps for binaries used by the e2e runner image
+RUN cd activity-store && go mod download
+RUN cd idle-scaler && go mod download
+
+# Copy source
+COPY . .
+
+# Build idle-scaler binary for the Nomad docker job
+RUN cd idle-scaler && go build -o /app/bin/idle-scaler .
+RUN cd idle-scaler && go build -o /app/bin/e2e-echo ./cmd/e2e-echo
+
+# Copy k6 binary into the e2e runner image so orchestration can drive it directly
+COPY --from=k6 /usr/bin/k6 /usr/local/bin/k6
+COPY --from=nomad /bin/nomad /usr/local/bin/nomad
+
+RUN chmod +x /app/run-docker-e2e.sh /app/run-e2e-tests.sh /app/e2e/scripts/*.sh
+
+ENTRYPOINT ["/app/run-e2e-tests.sh"]

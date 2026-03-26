@@ -1,0 +1,139 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  consul:
+    image: hashicorp/consul:latest
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - "8500:8500"
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  nomad:
+    image: nomad-scale-to-zero-e2e:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint:
+      - /usr/local/bin/nomad
+    command:
+      - agent
+      - -config=/etc/nomad.d/nomad.hcl
+    privileged: true
+    environment:
+      NOMAD_SKIP_DOCKER_IMAGE_WARN: "true"
+    ports:
+      - "4646:4646"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./e2e/nomad/nomad.d:/etc/nomad.d:ro
+      - nomad-data:/tmp/nomad
+    healthcheck:
+      test: ["CMD", "nomad", "server", "members"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --configfile=/etc/traefik/traefik.yml
+      - --providers.file.watch=true
+    environment:
+      S2Z_NOMAD_ADDR: http://nomad:4646
+      S2Z_CONSUL_ADDR: http://consul:8500
+      S2Z_ACTIVITY_STORE: redis
+      S2Z_JOB_SPEC_STORE: redis
+      S2Z_REDIS_ADDR: redis:6379
+      S2Z_REDIS_PASSWORD: ""
+    ports:
+      - "8080:8080"
+      - "8088:80"
+    volumes:
+      - ./traefik-plugin:/plugins-local/src/nomad_scale_to_zero/traefik-plugin:ro
+      - ./e2e/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./e2e/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    depends_on:
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+
+  idle-scaler:
+    image: nomad-scale-to-zero-e2e:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    entrypoint:
+      - /app/bin/idle-scaler
+    environment:
+      NOMAD_ADDR: http://nomad:4646
+      CONSUL_ADDR: http://consul:8500
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      STORE_TYPE: "${E2E_STORE_TYPE:-redis}"
+      IDLE_CHECK_INTERVAL: "${E2E_IDLE_CHECK_INTERVAL:-3s}"
+      DEFAULT_IDLE_TIMEOUT: "${E2E_IDLE_TIMEOUT:-10s}"
+      PURGE_ON_SCALEDOWN: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+
+  e2e-runner:
+    image: nomad-scale-to-zero-e2e:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    environment:
+      E2E_JOB_COUNT: "${E2E_JOB_COUNT:-10}"
+      E2E_IDLE_TIMEOUT: "${E2E_IDLE_TIMEOUT:-10s}"
+      E2E_IDLE_CHECK_INTERVAL: "${E2E_IDLE_CHECK_INTERVAL:-3s}"
+      E2E_TRAEFIK_BASE_URL: "${E2E_TRAEFIK_BASE_URL:-http://traefik:80}"
+      E2E_TRAEFIK_PUBLIC_URL: "${E2E_TRAEFIK_PUBLIC_URL:-http://traefik:80}"
+      E2E_REQUEST_TIMEOUT: "${E2E_REQUEST_TIMEOUT:-45s}"
+      E2E_SOAK_CYCLES: "${E2E_SOAK_CYCLES:-3}"
+      E2E_TRAFFIC_SCENARIO: "${E2E_TRAFFIC_SCENARIO:-storm}"
+      E2E_WARMUP_VUS: "${E2E_WARMUP_VUS:-5}"
+      E2E_WARMUP_DURATION: "${E2E_WARMUP_DURATION:-10s}"
+      E2E_BURST_VUS: "${E2E_BURST_VUS:-50}"
+      E2E_BURST_DURATION: "${E2E_BURST_DURATION:-20s}"
+      E2E_STORM_VUS: "${E2E_STORM_VUS:-100}"
+      E2E_STORM_DURATION: "${E2E_STORM_DURATION:-30s}"
+      E2E_STORM_RATE: "${E2E_STORM_RATE:-250}"
+      E2E_STORM_PREALLOCATED_VUS: "${E2E_STORM_PREALLOCATED_VUS:-150}"
+      E2E_NOMAD_ADDR: http://nomad:4646
+      E2E_CONSUL_ADDR: http://consul:8500
+      E2E_REDIS_ADDR: redis:6379
+      E2E_REDIS_PASSWORD: ""
+      E2E_STORE_TYPE: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+      traefik:
+        condition: service_started
+      idle-scaler:
+        condition: service_started
+
+volumes:
+  nomad-data:

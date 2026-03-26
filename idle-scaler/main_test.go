@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	nomad "github.com/hashicorp/nomad/api"
 )
 
 // ---------------------------------------------------------------------------
@@ -145,6 +147,90 @@ func TestConsulJobSpecStore_KeyFormat(t *testing.T) {
 	}
 }
 
+func TestShouldManageScaleToZeroJob(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		job  *nomad.Job
+		want bool
+	}{
+		{
+			name: "nil job",
+			job:  nil,
+			want: false,
+		},
+		{
+			name: "missing metadata",
+			job: &nomad.Job{
+				ID:   pointerTo("echo-s2z"),
+				Name: pointerTo("echo-s2z"),
+			},
+			want: false,
+		},
+		{
+			name: "scale to zero disabled",
+			job: &nomad.Job{
+				ID:   pointerTo("echo-s2z"),
+				Name: pointerTo("echo-s2z"),
+				Meta: map[string]string{metaEnabled: "false"},
+			},
+			want: false,
+		},
+		{
+			name: "enabled service job is managed",
+			job: &nomad.Job{
+				ID:   pointerTo("echo-s2z"),
+				Name: pointerTo("echo-s2z"),
+				Type: pointerTo("service"),
+				Meta: map[string]string{metaEnabled: "TRUE"},
+			},
+			want: true,
+		},
+		{
+			name: "system jobs are always skipped",
+			job: &nomad.Job{
+				ID:   pointerTo("echo-s2z"),
+				Name: pointerTo("echo-s2z"),
+				Type: pointerTo("system"),
+				Meta: map[string]string{metaEnabled: "true"},
+			},
+			want: false,
+		},
+		{
+			name: "idle scaler job id is skipped",
+			job: &nomad.Job{
+				ID:   pointerTo("idle-scaler-e2e"),
+				Name: pointerTo("workload"),
+				Type: pointerTo("service"),
+				Meta: map[string]string{metaEnabled: "true"},
+			},
+			want: false,
+		},
+		{
+			name: "idle scaler job name is skipped",
+			job: &nomad.Job{
+				ID:   pointerTo("workload"),
+				Name: pointerTo("idle-scaler"),
+				Type: pointerTo("service"),
+				Meta: map[string]string{metaEnabled: "true"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := shouldManageScaleToZeroJob(tt.job)
+			if got != tt.want {
+				t.Errorf("shouldManageScaleToZeroJob() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Idle-timeout parsing — verify the fix works correctly
 // ---------------------------------------------------------------------------
@@ -182,4 +268,8 @@ func TestIdleTimeoutParsing_Fixed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func pointerTo[T any](value T) *T {
+	return &value
 }
