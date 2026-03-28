@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,7 +24,8 @@ const (
 	readyEndpointTTL         = 30 * time.Second
 	activationFailureTTL     = 10 * time.Second
 	wakePollInterval         = 250 * time.Millisecond
-	probeRequestTTL          = 1 * time.Second
+	probeRequestTTL          = 300 * time.Millisecond
+	tcpDialTimeout           = 200 * time.Millisecond
 	releaseWakeLockTTL       = 5 * time.Second
 	activationStateOpTimeout = 5 * time.Second
 	scaleUpReassertInterval  = 1 * time.Second
@@ -728,11 +730,11 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 		var pollInterval time.Duration
 		switch {
 		case elapsed < 5*time.Second:
-			pollInterval = 500 * time.Millisecond
+			pollInterval = 200 * time.Millisecond
 		case elapsed < 15*time.Second:
-			pollInterval = 1 * time.Second
+			pollInterval = 500 * time.Millisecond
 		default:
-			pollInterval = 2 * time.Second
+			pollInterval = 1 * time.Second
 		}
 
 		if !timer.Stop() {
@@ -820,6 +822,15 @@ func (r *nomadRuntime) probeEndpointHealth(ctx context.Context, endpoint *url.UR
 	if endpoint == nil {
 		return false
 	}
+
+	// TCP pre-check: fail fast if the port is not open yet.
+	dialCtx, dialCancel := context.WithTimeout(ctx, tcpDialTimeout)
+	defer dialCancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", endpoint.Host)
+	if err != nil {
+		return false
+	}
+	conn.Close()
 
 	probeURL := endpoint.ResolveReference(&url.URL{Path: normalizeProbePath(r.probePath)}).String()
 	probeCtx, cancel := context.WithTimeout(ctx, probeRequestTTL)

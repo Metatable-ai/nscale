@@ -424,8 +424,9 @@ func TestActivatorProxyRequest(t *testing.T) {
 	if gotHost != "echo-s2z-0001.localhost" {
 		t.Fatalf("backend host = %q, want %q", gotHost, "echo-s2z-0001.localhost")
 	}
-	if len(store.activities) != 1 || store.activities[0] != "echo-s2z-0001" {
-		t.Fatalf("activities = %#v, want one activity update", store.activities)
+	// Expect two activity writes: early (before activation) and refresh (after proxy).
+	if len(store.activities) != 2 || store.activities[0] != "echo-s2z-0001" || store.activities[1] != "echo-s2z-0001" {
+		t.Fatalf("activities = %#v, want two activity updates for echo-s2z-0001", store.activities)
 	}
 }
 

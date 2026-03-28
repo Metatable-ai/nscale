@@ -305,6 +305,15 @@ func (a *Activator) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Write activity early so the scale-down controller never races us during activation.
+	if err := a.stateStore.SetActivity(ctx, workload.ServiceName, time.Now()); err != nil {
+		a.logger.Warn("activator early activity update failed",
+			"host", host,
+			"service_name", workload.ServiceName,
+			"error", err,
+		)
+	}
+
 	target, err := a.runtime.Activate(ctx, workload)
 	if err != nil {
 		a.logger.Error("activator request failed to wake backend",
@@ -326,8 +335,9 @@ func (a *Activator) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refresh activity after successful activation to reflect actual proxy time.
 	if err := a.stateStore.SetActivity(ctx, workload.ServiceName, time.Now()); err != nil {
-		a.logger.Warn("activator activity update failed",
+		a.logger.Warn("activator activity refresh failed",
 			"host", host,
 			"service_name", workload.ServiceName,
 			"error", err,
