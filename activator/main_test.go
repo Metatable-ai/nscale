@@ -28,6 +28,8 @@ type fakeStateStore struct {
 	readyEndpoints   map[string]*url.URL
 	activationStates map[string]ActivationState
 	activities       []string
+	milestones       []string
+	milestoneSubs    map[string][]chan string
 }
 
 func (f *fakeStateStore) Ping(context.Context) error {
@@ -158,6 +160,49 @@ func (f *fakeStateStore) SetActivity(_ context.Context, service string, _ time.T
 	}
 	f.activities = append(f.activities, service)
 	return nil
+}
+
+func (f *fakeStateStore) PublishMilestone(_ context.Context, host string, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.milestones = append(f.milestones, host+":"+status)
+	for _, ch := range f.milestoneSubs[normalizeHost(host)] {
+		select {
+		case ch <- status:
+		default:
+		}
+	}
+	return nil
+}
+
+func (f *fakeStateStore) SubscribeMilestones(_ context.Context, host string) (<-chan string, func(), error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	ch := make(chan string, 8)
+	key := normalizeHost(host)
+	if f.milestoneSubs == nil {
+		f.milestoneSubs = make(map[string][]chan string)
+	}
+	f.milestoneSubs[key] = append(f.milestoneSubs[key], ch)
+	cleanup := func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		subs := f.milestoneSubs[key]
+		for i, s := range subs {
+			if s == ch {
+				f.milestoneSubs[key] = append(subs[:i], subs[i+1:]...)
+				break
+			}
+		}
+		close(ch)
+	}
+	return ch, cleanup, nil
 }
 
 type fakeRuntime struct {

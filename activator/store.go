@@ -22,6 +22,7 @@ const (
 	activationStateKeyPrefix = registryNamespacePrefix + "/activations/"
 	wakeLockKeyPrefix        = registryNamespacePrefix + "/wake-locks/"
 	activityKeyPrefix        = "scale-to-zero/activity/"
+	milestoneChannelPrefix   = "scale-to-zero/events/"
 )
 
 var releaseWakeLockScript = redis.NewScript(`
@@ -69,6 +70,8 @@ type stateStore interface {
 	ReleaseWakeLock(ctx context.Context, host, owner string) error
 	GetJobSpec(ctx context.Context, key string) ([]byte, bool, error)
 	SetActivity(ctx context.Context, service string, at time.Time) error
+	PublishMilestone(ctx context.Context, host string, status string) error
+	SubscribeMilestones(ctx context.Context, host string) (<-chan string, func(), error)
 }
 
 type redisStateStore struct {
@@ -331,6 +334,41 @@ func (s *redisStateStore) SetActivity(ctx context.Context, service string, at ti
 	return s.client.Set(ctx, activityKey(service), at.UTC().Format(time.RFC3339Nano), 0).Err()
 }
 
+func (s *redisStateStore) PublishMilestone(ctx context.Context, host string, status string) error {
+	if s == nil || s.client == nil {
+		return errors.New("redis client is not configured")
+	}
+	return s.client.Publish(ctx, milestoneChannel(host), status).Err()
+}
+
+func (s *redisStateStore) SubscribeMilestones(ctx context.Context, host string) (<-chan string, func(), error) {
+	if s == nil || s.client == nil {
+		return nil, nil, errors.New("redis client is not configured")
+	}
+
+	sub := s.client.Subscribe(ctx, milestoneChannel(host))
+	if _, err := sub.Receive(ctx); err != nil {
+		_ = sub.Close()
+		return nil, nil, fmt.Errorf("subscribe milestones %s: %w", host, err)
+	}
+
+	ch := make(chan string, 8)
+	go func() {
+		defer close(ch)
+		msgCh := sub.Channel()
+		for msg := range msgCh {
+			select {
+			case ch <- msg.Payload:
+			default:
+				// Drop if consumer is slow — they'll catch up via polling.
+			}
+		}
+	}()
+
+	cleanup := func() { _ = sub.Close() }
+	return ch, cleanup, nil
+}
+
 func registryHostKey(host string) string {
 	return registryHostKeyPrefix + normalizeHost(host)
 }
@@ -349,4 +387,8 @@ func activationStateKey(host string) string {
 
 func activityKey(service string) string {
 	return activityKeyPrefix + normalizeHost(service)
+}
+
+func milestoneChannel(host string) string {
+	return milestoneChannelPrefix + normalizeHost(host)
 }

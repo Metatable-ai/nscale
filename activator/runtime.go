@@ -239,6 +239,11 @@ func (r *nomadRuntime) runActivation(ctx context.Context, workload WorkloadRegis
 		logger.Warn("publish activation result failed", "error", stateErr)
 	}
 
+	// Notify waiters via Pub/Sub so they react instantly instead of polling.
+	if pubErr := r.store.PublishMilestone(stateCtx, workload.HostName, state.Status); pubErr != nil {
+		logger.Warn("publish milestone failed", "status", state.Status, "error", pubErr)
+	}
+
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), releaseWakeLockTTL)
 	defer releaseCancel()
 	if releaseErr := r.store.ReleaseWakeLock(releaseCtx, workload.HostName, owner); releaseErr != nil {
@@ -247,14 +252,29 @@ func (r *nomadRuntime) runActivation(ctx context.Context, workload WorkloadRegis
 }
 
 func (r *nomadRuntime) waitForActivation(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, error) {
-	ticker := time.NewTicker(wakePollInterval)
+	// Subscribe to milestone notifications for instant wake-up.
+	// Falls back to 1s polling if subscribe fails.
+	var milestoneCh <-chan string
+	subCh, cleanup, subErr := r.store.SubscribeMilestones(ctx, workload.HostName)
+	if subErr != nil {
+		logger.WarnContext(ctx, "milestone subscribe failed, using polling fallback", "error", subErr)
+	} else {
+		milestoneCh = subCh
+		defer cleanup()
+	}
+
+	fallbackInterval := 1 * time.Second
+	if milestoneCh == nil {
+		fallbackInterval = wakePollInterval // 250ms if no pub/sub
+	}
+	ticker := time.NewTicker(fallbackInterval)
 	defer ticker.Stop()
 
-	for {
+	checkState := func() (*url.URL, bool, error) {
 		if endpoint, ok, err := r.lookupReadyEndpoint(ctx, workload); err != nil {
 			logger.WarnContext(ctx, "ready endpoint lookup failed while waiting for activation", "error", err)
 		} else if ok {
-			return endpoint, nil
+			return endpoint, true, nil
 		}
 
 		state, ok, err := r.store.GetActivationState(ctx, workload.HostName)
@@ -265,30 +285,49 @@ func (r *nomadRuntime) waitForActivation(ctx context.Context, workload WorkloadR
 			case activationStatusReady:
 				endpoint, ready, parseErr := state.ReadyEndpoint()
 				if parseErr != nil {
-					logger.WarnContext(ctx, "activation state ready endpoint parse failed", "error", parseErr)
-					return nil, parseErr
+					return nil, false, parseErr
 				}
 				if ready {
 					r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
-					return endpoint, nil
+					return endpoint, true, nil
 				}
 			case activationStatusFailed:
 				if state.Error == "" {
-					return nil, errors.New("activation failed")
+					return nil, false, errors.New("activation failed")
 				}
-				return nil, errors.New(state.Error)
+				return nil, false, errors.New(state.Error)
 			}
 		} else if err := r.startActivation(ctx, workload, logger); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		return nil, false, nil
+	}
 
+	// Initial check before entering the wait loop.
+	if endpoint, done, err := checkState(); done || err != nil {
+		return endpoint, err
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil, waitForActivationTimeoutError{service: workload.ServiceName}
 			}
 			return nil, ctx.Err()
+		case _, ok := <-milestoneCh:
+			if !ok {
+				milestoneCh = nil // channel closed — fall back to polling
+				ticker.Reset(wakePollInterval)
+				continue
+			}
+			if endpoint, done, err := checkState(); done || err != nil {
+				return endpoint, err
+			}
 		case <-ticker.C:
+			if endpoint, done, err := checkState(); done || err != nil {
+				return endpoint, err
+			}
 		}
 	}
 }
