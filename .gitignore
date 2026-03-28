@@ -49,3 +49,5 @@ temp/
 # OS generated files
 Thumbs.db
 activator/activator
+**/target
+**/*.rs.bk

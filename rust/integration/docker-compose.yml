@@ -1,0 +1,110 @@
+networks:
+  nscale-net:
+    name: nscale-net
+
+services:
+  redis:
+    image: redis:7-alpine
+    networks: [nscale-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  consul:
+    image: hashicorp/consul:1.22
+    command: agent -dev -client=0.0.0.0
+    networks: [nscale-net]
+    ports:
+      - "8500:8500"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8500/v1/status/leader"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  nomad:
+    image: hashicorp/nomad:1.10.5
+    command: agent -dev -bind=0.0.0.0 -network-interface=eth0 -config=/etc/nomad.d/
+    privileged: true
+    cgroup: host
+    networks: [nscale-net]
+    ports:
+      - "4646:4646"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./nomad.d/:/etc/nomad.d/:ro
+    environment:
+      NOMAD_ADDR: http://127.0.0.1:4646
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4646/v1/status/leader"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      consul:
+        condition: service_healthy
+
+  nscale:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    networks: [nscale-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/:/app/config/:ro
+    environment:
+      RUST_LOG: info,nscale=debug
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+
+  traefik:
+    image: traefik:v3.1
+    networks: [nscale-net]
+    ports:
+      - "8080:8080"
+      - "80:80"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      consul:
+        condition: service_healthy
+      nscale:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:latest
+    profiles: [stress]
+    networks: [nscale-net]
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      NSCALE_TRAEFIK_URL:  "http://traefik:80"
+      NSCALE_NOMAD_URL:    "http://nomad:4646"
+      NSCALE_CONSUL_URL:   "http://consul:8500"
+      NSCALE_SERVICE_NAME: "echo-s2z"
+      NSCALE_NOMAD_GROUP:  "main"
+    depends_on:
+      traefik:
+        condition: service_healthy

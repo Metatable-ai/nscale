@@ -1,0 +1,27 @@
+[default]
+listen_addr = "0.0.0.0:8080"
+admin_addr = "0.0.0.0:9090"
+
+[default.nomad]
+addr = "http://nomad:4646"
+concurrency = 50
+
+[default.consul]
+addr = "http://consul:8500"
+
+[default.redis]
+url = "redis://redis:6379"
+
+[default.scaling]
+idle_timeout_secs = 15
+wake_timeout_secs = 60
+scale_down_interval_secs = 5
+min_scale_down_age_secs = 10
+
+[default.proxy]
+request_timeout_secs = 30
+request_buffer_size = 1000
+
+[default.traefik]
+metrics_url = "http://traefik:8082"
+provider = "consulcatalog"

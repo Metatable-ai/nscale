@@ -1,0 +1,24 @@
+http:
+  middlewares:
+    s2z-error-fallback:
+      errors:
+        status:
+          - "502"
+          - "503"
+        service: s2z-nscale
+        query: "/"
+
+  routers:
+    s2z-fallback:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.localhost$`)"
+      priority: 1
+      entryPoints:
+        - http
+      service: s2z-nscale
+
+  services:
+    s2z-nscale:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://nscale:8080"
