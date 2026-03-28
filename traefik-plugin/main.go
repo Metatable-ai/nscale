@@ -34,12 +34,14 @@ type Config struct {
 	ActivityStore string `json:"activityStore"`
 	JobSpecStore  string `json:"jobSpecStore"` // consul or redis
 	Timeout       string `json:"timeout"`
+	ProbePath     string `json:"probePath"`
 	JobSpecKey    string `json:"jobSpecKey"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		Timeout: "30s",
+		Timeout:   "30s",
+		ProbePath: "/healthz",
 	}
 }
 
@@ -56,6 +58,7 @@ type ScaleWaker struct {
 	activityStore string
 	jobSpecStore  string
 	timeout       time.Duration
+	probePath     string
 	jobName       string
 	group         string
 	service       string
@@ -128,8 +131,8 @@ type nomadAllocation struct {
 }
 
 type nomadAllocNetwork struct {
-	IP           string              `json:"IP"`
-	DynamicPorts []nomadAllocDynPort `json:"DynamicPorts"`
+	IP            string              `json:"IP"`
+	DynamicPorts  []nomadAllocDynPort `json:"DynamicPorts"`
 	ReservedPorts []nomadAllocDynPort `json:"ReservedPorts"`
 }
 
@@ -167,6 +170,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if err != nil {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
+	probePath := normalizeProbePath(config.ProbePath)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -204,6 +208,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		activityStore: activityStore,
 		jobSpecStore:  jobSpecStore,
 		timeout:       timeout,
+		probePath:     probePath,
 		jobName:       config.JobName,
 		group:         config.GroupName,
 		service:       config.ServiceName,
@@ -220,6 +225,17 @@ func coalesce(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeProbePath(raw string) string {
+	probePath := strings.TrimSpace(raw)
+	if probePath == "" {
+		return "/healthz"
+	}
+	if !strings.HasPrefix(probePath, "/") {
+		probePath = "/" + probePath
+	}
+	return probePath
 }
 
 func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -1160,11 +1176,11 @@ func (s *ScaleWaker) waitForNomadAllocation(ctx context.Context, job, group stri
 	}
 }
 
-// probeEndpointHealth does a direct HTTP GET /healthz to verify the endpoint
-// is actually serving traffic. Timeout is short (1s) since we just need to
-// confirm the process is responsive.
+// probeEndpointHealth does a direct HTTP GET to the configured probe path to
+// verify the endpoint is actually serving traffic. Timeout is short (1s) since
+// we just need to confirm the process is responsive.
 func (s *ScaleWaker) probeEndpointHealth(ctx context.Context, endpoint *url.URL) bool {
-	probeURL := fmt.Sprintf("%s/healthz", endpoint.String())
+	probeURL := endpoint.ResolveReference(&url.URL{Path: normalizeProbePath(s.probePath)}).String()
 	probeCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 

@@ -18,3 +18,4 @@ testData:
   jobSpecStore: "redis"
   redisAddr: "redis:6379"
   timeout: "30s"
+  probePath: "/healthz"

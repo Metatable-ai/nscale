@@ -281,7 +281,9 @@ func makeFullAllocation(group, host string, port int) nomadAllocation {
 		ID:           "alloc-test-12345678",
 		TaskGroup:    group,
 		ClientStatus: "running",
-		TaskStates: map[string]struct{ State string `json:"State"` }{
+		TaskStates: map[string]struct {
+			State string `json:"State"`
+		}{
 			"server": {State: "running"},
 		},
 		Resources: struct {
@@ -302,7 +304,9 @@ func makeAllocStubs(group string) []nomadAllocation {
 		ID:           "alloc-test-12345678",
 		TaskGroup:    group,
 		ClientStatus: "running",
-		TaskStates: map[string]struct{ State string `json:"State"` }{
+		TaskStates: map[string]struct {
+			State string `json:"State"`
+		}{
 			"server": {State: "running"},
 		},
 	}}
@@ -739,6 +743,9 @@ func TestNew_Defaults(t *testing.T) {
 
 	if sw.timeout != 30*time.Second {
 		t.Errorf("timeout = %v, want 30s", sw.timeout)
+	}
+	if sw.probePath != "/healthz" {
+		t.Errorf("probePath = %q, want /healthz", sw.probePath)
 	}
 	if sw.activityStore != "consul" {
 		t.Errorf("activityStore = %q, want consul", sw.activityStore)
@@ -1183,7 +1190,9 @@ func TestServeHTTP_NilEndpointAfterWake(t *testing.T) {
 				ID:           "alloc-nil-12345678",
 				TaskGroup:    "main",
 				ClientStatus: "running",
-				TaskStates: map[string]struct{ State string `json:"State"` }{
+				TaskStates: map[string]struct {
+					State string `json:"State"`
+				}{
 					"server": {State: "running"},
 				},
 				// Resources.Networks is empty — no endpoint extractable
@@ -1507,5 +1516,32 @@ func TestWaitForNomadAllocation_AdaptiveBackoff(t *testing.T) {
 			t.Errorf("later interval (%v) should be >= first interval (%v); backoff not working",
 				lastEmptyInterval, firstInterval)
 		}
+	}
+}
+
+func TestProbeEndpointHealth_CustomProbePath(t *testing.T) {
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/readyz":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer be.Close()
+
+	endpoint, err := url.Parse(be.URL)
+	if err != nil {
+		t.Fatalf("parse backend url: %v", err)
+	}
+
+	sw := &ScaleWaker{
+		client:    &http.Client{Timeout: 5 * time.Second},
+		probePath: "/readyz",
+	}
+
+	if !sw.probeEndpointHealth(context.Background(), endpoint) {
+		t.Fatal("probeEndpointHealth = false, want true with custom probe path")
 	}
 }

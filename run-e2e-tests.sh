@@ -93,6 +93,7 @@ RUN_STARTED_AT_MS="$(timestamp_millis)"
 ACTIVE_SCENARIO=""
 ARTIFACTS_READY=0
 CONSUL_CLEANUP_LAST_DURATION_MS=0
+CONSUL_WORKLOAD_CLEANUP_LAST_DURATION_MS=0
 LAST_WORKLOAD_WAKE_DURATION_MS=0
 LAST_WAKE_ALL_DURATION_MS=0
 LAST_K6_WAKE_DURATION_MS=0
@@ -914,6 +915,15 @@ capture_current_consul_cleanup_state() {
 	set_consul_cleanup_state_from_json "$catalog_json" "$checks_json"
 }
 
+consul_workloads_drained() {
+	[ -z "$CURRENT_WORKLOAD_SERVICES" ] && [ -z "$CURRENT_WORKLOAD_CHECKS" ]
+}
+
+consul_nonworkload_matches_baseline() {
+	[ "$CURRENT_NONWORKLOAD_SERVICES_JSON" = "$CONSUL_BASELINE_SERVICE_NAMES_JSON" ] \
+		&& [ "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" = "$CONSUL_BASELINE_CHECK_COUNTS_JSON" ]
+}
+
 load_consul_cleanup_state_from_snapshot() {
 	snapshot_dir="$1"
 	catalog_file="$snapshot_dir/consul/catalog-services.json"
@@ -935,10 +945,7 @@ wait_for_consul_cleanup() {
 	while true; do
 		capture_current_consul_cleanup_state
 
-		if [ -z "$CURRENT_WORKLOAD_SERVICES" ] \
-			&& [ -z "$CURRENT_WORKLOAD_CHECKS" ] \
-			&& [ "$CURRENT_NONWORKLOAD_SERVICES_JSON" = "$CONSUL_BASELINE_SERVICE_NAMES_JSON" ] \
-			&& [ "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" = "$CONSUL_BASELINE_CHECK_COUNTS_JSON" ]; then
+		if consul_workloads_drained && consul_nonworkload_matches_baseline; then
 			end_ms="$(timestamp_millis)"
 			CONSUL_CLEANUP_LAST_DURATION_MS=$((end_ms - start_ms))
 			cleanup_context_json='{}'
@@ -960,6 +967,53 @@ wait_for_consul_cleanup() {
 			write_consul_cleanup_artifact "$label" "timed_out" "$CONSUL_CLEANUP_LAST_DURATION_MS" "$cleanup_context_json"
 			record_event "consul-cleanup" "timed_out" "$(cleanup_event_context_json "$label" "$CONSUL_CLEANUP_LAST_DURATION_MS" "$cleanup_context_json")"
 			echo "Timed out waiting for Consul cleanup after ${label}" >&2
+			echo "Expected baseline services: ${CONSUL_BASELINE_SERVICE_NAMES_JSON}" >&2
+			echo "Current non-workload services: ${CURRENT_NONWORKLOAD_SERVICES_JSON}" >&2
+			echo "Expected non-workload check counts: ${CONSUL_BASELINE_CHECK_COUNTS_JSON}" >&2
+			echo "Current non-workload check counts: ${CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON}" >&2
+			if [ -n "$CURRENT_WORKLOAD_SERVICES" ]; then
+				echo "Stale workload services:" >&2
+				printf '%s\n' "$CURRENT_WORKLOAD_SERVICES" >&2
+			fi
+			if [ -n "$CURRENT_WORKLOAD_CHECKS" ]; then
+				echo "Stale workload checks:" >&2
+				printf '%s\n' "$CURRENT_WORKLOAD_CHECKS" >&2
+			fi
+			exit 1
+		fi
+
+		sleep 2
+	done
+}
+
+wait_for_workload_consul_cleanup() {
+	label="$1"
+	start="$(date +%s)"
+	start_ms="$(timestamp_millis)"
+
+	while true; do
+		capture_current_consul_cleanup_state
+
+		if consul_workloads_drained; then
+			end_ms="$(timestamp_millis)"
+			CONSUL_WORKLOAD_CLEANUP_LAST_DURATION_MS=$((end_ms - start_ms))
+			echo "Workload services removed from Consul after ${label}"
+			return 0
+		fi
+
+		now="$(date +%s)"
+		if [ $((now - start)) -ge "$consul_cleanup_timeout" ]; then
+			end_ms="$(timestamp_millis)"
+			CONSUL_WORKLOAD_CLEANUP_LAST_DURATION_MS=$((end_ms - start_ms))
+			CONSUL_CLEANUP_LAST_DURATION_MS=$CONSUL_WORKLOAD_CLEANUP_LAST_DURATION_MS
+			cleanup_snapshot_label="${label}-consul-cleanup-timeout"
+			cleanup_snapshot_dir="$STATE_ARTIFACTS_DIR/$(slugify "$cleanup_snapshot_label")"
+			capture_state_snapshot "$cleanup_snapshot_label"
+			load_consul_cleanup_state_from_snapshot "$cleanup_snapshot_dir" || true
+			cleanup_context_json="$(build_consul_cleanup_context_from_snapshot "$cleanup_snapshot_label")"
+			write_consul_cleanup_artifact "$label" "timed_out" "$CONSUL_CLEANUP_LAST_DURATION_MS" "$cleanup_context_json"
+			record_event "consul-cleanup" "timed_out" "$(cleanup_event_context_json "$label" "$CONSUL_CLEANUP_LAST_DURATION_MS" "$cleanup_context_json")"
+			echo "Timed out waiting for workload Consul cleanup after ${label}" >&2
 			echo "Expected baseline services: ${CONSUL_BASELINE_SERVICE_NAMES_JSON}" >&2
 			echo "Current non-workload services: ${CURRENT_NONWORKLOAD_SERVICES_JSON}" >&2
 			echo "Expected non-workload check counts: ${CONSUL_BASELINE_CHECK_COUNTS_JSON}" >&2
@@ -1391,21 +1445,26 @@ wait_for_all_workloads_scale_to_zero() {
 	scale_down_started_ms="$(timestamp_millis)"
 	"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "$WORKLOAD_PREFIX" 0 exact "$idle_wait_seconds" "$JOB_COUNT"
 	nomad_zero_detected_ms="$(timestamp_millis)"
-	wait_for_consul_cleanup "$label"
+	wait_for_workload_consul_cleanup "$label"
 	scale_down_finished_at="$(timestamp_utc)"
 	scale_down_finished_ms="$(timestamp_millis)"
 	nomad_scale_down_duration_ms=$((nomad_zero_detected_ms - scale_down_started_ms))
+	workload_consul_cleanup_duration_ms=$((scale_down_finished_ms - nomad_zero_detected_ms))
 	total_scale_down_duration_ms=$((scale_down_finished_ms - scale_down_started_ms))
 	LAST_SCALE_TO_ZERO_CONTEXT_JSON="$(jq -nc \
 		--arg phase_label "$label" \
 		--arg started_at "$scale_down_started_at" \
 		--arg finished_at "$scale_down_finished_at" \
 		--argjson nomad_scale_down_duration_ms "$nomad_scale_down_duration_ms" \
-		--argjson consul_cleanup_duration_ms "$CONSUL_CLEANUP_LAST_DURATION_MS" \
+		--argjson workload_consul_cleanup_duration_ms "$workload_consul_cleanup_duration_ms" \
 		--argjson total_duration_ms "$total_scale_down_duration_ms" \
-		'{label: $phase_label, status: "passed", started_at: $started_at, finished_at: $finished_at, nomad_scale_down_duration_ms: $nomad_scale_down_duration_ms, consul_cleanup_duration_ms: $consul_cleanup_duration_ms, total_duration_ms: $total_duration_ms}')"
+		'{label: $phase_label, status: "passed", started_at: $started_at, finished_at: $finished_at, nomad_scale_down_duration_ms: $nomad_scale_down_duration_ms, workload_consul_cleanup_duration_ms: $workload_consul_cleanup_duration_ms, total_duration_ms: $total_duration_ms}')"
 	record_event "scale-to-zero" "passed" "$LAST_SCALE_TO_ZERO_CONTEXT_JSON"
 	capture_state_snapshot "${label}-scale-to-zero"
+	wait_for_consul_cleanup "$label"
+	LAST_SCALE_TO_ZERO_CONTEXT_JSON="$(printf '%s' "$LAST_SCALE_TO_ZERO_CONTEXT_JSON" | jq -c \
+		--argjson baseline_consul_cleanup_duration_ms "$CONSUL_CLEANUP_LAST_DURATION_MS" \
+		'. + {baseline_consul_cleanup_duration_ms: $baseline_consul_cleanup_duration_ms}')"
 }
 
 assert_job_spec_present() {

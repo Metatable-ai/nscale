@@ -60,13 +60,14 @@ job "${E2E_RENDER_JOB_NAME}" {
           "traefik.http.routers.${E2E_RENDER_SERVICE_NAME}.entryPoints=http",
           "traefik.http.middlewares.scalewaker-${E2E_RENDER_SERVICE_NAME}.plugin.scalewaker.serviceName=${E2E_RENDER_SERVICE_NAME}",
           "traefik.http.middlewares.scalewaker-${E2E_RENDER_SERVICE_NAME}.plugin.scalewaker.timeout=45s",
+          "traefik.http.middlewares.scalewaker-${E2E_RENDER_SERVICE_NAME}.plugin.scalewaker.probePath=/healthz",
           "traefik.http.routers.${E2E_RENDER_SERVICE_NAME}.middlewares=scalewaker-${E2E_RENDER_SERVICE_NAME}",
           "e2e.workload.class=${E2E_RENDER_WORKLOAD_CLASS}",
         ]
 
         check {
           type     = "http"
-          path     = "/healthz"
+          path     = "${E2E_RENDER_JOB_CHECK_PATH}"
           interval = "${E2E_RENDER_JOB_CHECK_INTERVAL}"
           timeout  = "${E2E_RENDER_JOB_CHECK_TIMEOUT}"
         }

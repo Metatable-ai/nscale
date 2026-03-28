@@ -108,7 +108,7 @@ Traditional auto-scaling typically scales to a minimum of 1 instance, which stil
 2. The **ScaleWaker middleware** determines the target service/job from the request (usually the `Host` header).
 3. If the service is not healthy/registered (typically because it’s scaled to 0):
    - it calls the **Nomad API** to scale the job group up (usually to 1)
-   - it waits for the service to become **healthy in Consul** (bounded by a timeout)
+   - it waits for a healthy Nomad allocation and probes the configured readiness path (default `/healthz`)
 4. It records activity (last request timestamp) in the configured activity store.
 5. The request is proxied to the now-running backend.
 
@@ -203,16 +203,17 @@ These metrics intentionally avoid per-service labels; use the structured plugin 
        # ... your group config
        
        service {
-         tags = [
-           "traefik.enable=true",
-           "traefik.http.routers.myservice.rule=Host(`myservice.example.com`)",
-           "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.serviceName=my-service",
-           "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.timeout=30s",
-           "traefik.http.routers.myservice.middlewares=scalewaker-myservice",
-         ]
-       }
-     }
-   }
+          tags = [
+            "traefik.enable=true",
+            "traefik.http.routers.myservice.rule=Host(`myservice.example.com`)",
+            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.serviceName=my-service",
+            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.timeout=30s",
+            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.probePath=/healthz",
+            "traefik.http.routers.myservice.middlewares=scalewaker-myservice",
+          ]
+        }
+      }
+    }
    ```
 
 ### Production Best Practices
@@ -222,7 +223,7 @@ These metrics intentionally avoid per-service labels; use the structured plugin 
 - **Monitor Wake Times**: Track how long services take to become healthy after wake-up
 - **Use ACL Tokens**: Always use least-privilege tokens in production
 - **Test Dead Job Revival**: Verify job specs are stored correctly and can be restored
-- **Configure Health Checks**: Ensure services have proper health checks for reliable wake detection
+- **Split Registration vs Wake Readiness**: Keep Nomad/Consul service checks on a fast local readiness endpoint such as `/readyz`, and let ScaleWaker probe an end-to-end path such as `/healthz` when downstream dependencies matter
 
 ### ACL Setup
 

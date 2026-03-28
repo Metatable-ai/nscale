@@ -244,22 +244,29 @@ func (a *echoApp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/readyz" {
+		if err := a.startupReadinessError(); err != nil {
+			a.writeNotReady(w, err)
+			return
+		}
+		a.writeReadyCheck(w)
+		return
+	}
+
 	if err := a.readinessError(r.Context()); err != nil {
 		a.writeNotReady(w, err)
 		return
 	}
 
 	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
+		a.writeReadyCheck(w)
 		return
 	}
 
 	a.writeReadyResponse(w, r)
 }
 
-func (a *echoApp) readinessError(ctx context.Context) error {
+func (a *echoApp) startupReadinessError() error {
 	if a.cfg.HealthMode == healthModeAlwaysHealthy {
 		return nil
 	}
@@ -273,6 +280,14 @@ func (a *echoApp) readinessError(ctx context.Context) error {
 		return fmt.Errorf("warming up (%s remaining)", remaining)
 	}
 
+	return nil
+}
+
+func (a *echoApp) readinessError(ctx context.Context) error {
+	if err := a.startupReadinessError(); err != nil {
+		return err
+	}
+
 	if a.cfg.HealthMode != healthModeDependencyGated {
 		return nil
 	}
@@ -282,6 +297,12 @@ func (a *echoApp) readinessError(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (a *echoApp) writeReadyCheck(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 func (a *echoApp) writeMetadata(w http.ResponseWriter) {

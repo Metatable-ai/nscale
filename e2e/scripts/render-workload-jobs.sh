@@ -13,11 +13,12 @@ job_cpu="${E2E_JOB_CPU:-50}"
 job_memory="${E2E_JOB_MEMORY:-64}"
 job_check_interval="${E2E_JOB_CHECK_INTERVAL:-2s}"
 job_check_timeout="${E2E_JOB_CHECK_TIMEOUT:-2s}"
+job_check_path="${E2E_JOB_CHECK_PATH:-/readyz}"
 traefik_internal_url="${E2E_TRAEFIK_INTERNAL_URL:-${E2E_TRAEFIK_BASE_URL:-http://traefik:80}}"
 generated_dir="${E2E_GENERATED_DIR:-$ROOT_DIR/.e2e-generated}"
 output_dir="${E2E_GENERATED_JOBS_DIR:-${generated_dir}/jobs}"
 manifest_file="${E2E_WORKLOAD_MANIFEST_FILE:-${generated_dir}/workload-manifest.tsv}"
-render_vars='${E2E_RENDER_SERVICE_NAME} ${E2E_RENDER_HOST_NAME} ${E2E_RENDER_JOB_NAME} ${E2E_RENDER_IDLE_TIMEOUT} ${E2E_RENDER_JOB_SPEC_KEY} ${E2E_RENDER_JOB_CPU} ${E2E_RENDER_JOB_MEMORY} ${E2E_RENDER_JOB_CHECK_INTERVAL} ${E2E_RENDER_JOB_CHECK_TIMEOUT} ${E2E_RENDER_WORKLOAD_CLASS} ${E2E_RENDER_WORKLOAD_ORDINAL} ${E2E_RENDER_RESPONSE_MODE} ${E2E_RENDER_RESPONSE_TEXT} ${E2E_RENDER_STARTUP_DELAY} ${E2E_RENDER_HEALTH_MODE} ${E2E_RENDER_DEPENDENCY_URL} ${E2E_RENDER_DEPENDENCY_HOST} ${E2E_RENDER_DEPENDENCY_TIMEOUT}'
+render_vars='${E2E_RENDER_SERVICE_NAME} ${E2E_RENDER_HOST_NAME} ${E2E_RENDER_JOB_NAME} ${E2E_RENDER_IDLE_TIMEOUT} ${E2E_RENDER_JOB_SPEC_KEY} ${E2E_RENDER_JOB_CPU} ${E2E_RENDER_JOB_MEMORY} ${E2E_RENDER_JOB_CHECK_INTERVAL} ${E2E_RENDER_JOB_CHECK_TIMEOUT} ${E2E_RENDER_JOB_CHECK_PATH} ${E2E_RENDER_WORKLOAD_CLASS} ${E2E_RENDER_WORKLOAD_ORDINAL} ${E2E_RENDER_RESPONSE_MODE} ${E2E_RENDER_RESPONSE_TEXT} ${E2E_RENDER_STARTUP_DELAY} ${E2E_RENDER_HEALTH_MODE} ${E2E_RENDER_DEPENDENCY_URL} ${E2E_RENDER_DEPENDENCY_HOST} ${E2E_RENDER_DEPENDENCY_TIMEOUT}'
 
 trim_label() {
   printf '%s' "$1" | tr -d '[:space:]'
@@ -134,6 +135,7 @@ set_workload_defaults() {
   default_idle_timeout="$idle_timeout"
   default_job_check_interval="$job_check_interval"
   default_job_check_timeout="$job_check_timeout"
+  default_job_check_path="$job_check_path"
   default_response_mode="text"
   default_startup_delay="0s"
   default_health_mode="startup-gated"
@@ -249,6 +251,7 @@ printf '%s' "$plan" | while IFS='|' read -r job_name workload_class workload_ord
   render_idle_timeout="$(workload_value "$workload_class" IDLE_TIMEOUT "$default_idle_timeout")"
   render_job_check_interval="$(workload_value "$workload_class" CHECK_INTERVAL "$default_job_check_interval")"
   render_job_check_timeout="$(workload_value "$workload_class" CHECK_TIMEOUT "$default_job_check_timeout")"
+  render_job_check_path="$(workload_value "$workload_class" CHECK_PATH "$default_job_check_path")"
   render_response_mode="$(workload_value "$workload_class" RESPONSE_MODE "$default_response_mode")"
   render_startup_delay="$(workload_value "$workload_class" STARTUP_DELAY "$default_startup_delay")"
   render_health_mode="$(workload_value "$workload_class" HEALTH_MODE "$default_health_mode")"
@@ -272,6 +275,7 @@ printf '%s' "$plan" | while IFS='|' read -r job_name workload_class workload_ord
   export E2E_RENDER_JOB_MEMORY="$render_job_memory"
   export E2E_RENDER_JOB_CHECK_INTERVAL="$render_job_check_interval"
   export E2E_RENDER_JOB_CHECK_TIMEOUT="$render_job_check_timeout"
+  export E2E_RENDER_JOB_CHECK_PATH="$render_job_check_path"
   export E2E_RENDER_WORKLOAD_CLASS="$workload_class"
   export E2E_RENDER_WORKLOAD_ORDINAL="$workload_ordinal"
   export E2E_RENDER_RESPONSE_MODE="$render_response_mode"

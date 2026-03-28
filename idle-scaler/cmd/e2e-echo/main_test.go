@@ -207,7 +207,25 @@ func TestEchoAppHandler(t *testing.T) {
 			t.Fatalf("status before dependency ready = %d, want %d", firstResp.Code, http.StatusServiceUnavailable)
 		}
 
+		healthResp := httptest.NewRecorder()
+		app.ServeHTTP(healthResp, httptest.NewRequest(http.MethodGet, "http://example/healthz", nil))
+		if healthResp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("dependency health status = %d, want %d", healthResp.Code, http.StatusServiceUnavailable)
+		}
+
+		readyResp := httptest.NewRecorder()
+		app.ServeHTTP(readyResp, httptest.NewRequest(http.MethodGet, "http://example/readyz", nil))
+		if readyResp.Code != http.StatusOK {
+			t.Fatalf("local readiness status = %d, want %d", readyResp.Code, http.StatusOK)
+		}
+
 		dependencyReady = true
+
+		healthResp = httptest.NewRecorder()
+		app.ServeHTTP(healthResp, httptest.NewRequest(http.MethodGet, "http://example/healthz", nil))
+		if healthResp.Code != http.StatusOK {
+			t.Fatalf("dependency health after ready = %d, want %d", healthResp.Code, http.StatusOK)
+		}
 
 		secondResp := httptest.NewRecorder()
 		app.ServeHTTP(secondResp, httptest.NewRequest(http.MethodGet, "http://example/", nil))
