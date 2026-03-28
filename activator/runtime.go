@@ -29,6 +29,7 @@ const (
 	releaseWakeLockTTL       = 5 * time.Second
 	activationStateOpTimeout = 5 * time.Second
 	scaleUpReassertInterval  = 1 * time.Second
+	defaultNomadConcurrency  = 50
 )
 
 var errActivationTimeout = errors.New("timeout waiting for backend activation")
@@ -110,6 +111,7 @@ type nomadRuntime struct {
 	store          stateStore
 	client         *http.Client
 	inflight       singleflight.Group
+	nomadSem       chan struct{}
 	nomadAddr      string
 	consulAddr     string
 	nomadToken     string
@@ -124,10 +126,16 @@ func newNomadRuntime(logger *slog.Logger, store stateStore, cfg Config) *nomadRu
 		logger = newJSONLogger("activator")
 	}
 
+	concurrency := envOrDefaultInt("ACTIVATOR_NOMAD_CONCURRENCY", defaultNomadConcurrency)
+	if concurrency <= 0 {
+		concurrency = defaultNomadConcurrency
+	}
+
 	return &nomadRuntime{
 		logger:         logger,
 		store:          store,
 		client:         &http.Client{Timeout: 10 * time.Second},
+		nomadSem:       make(chan struct{}, concurrency),
 		nomadAddr:      strings.TrimSpace(cfg.NomadAddr),
 		consulAddr:     strings.TrimSpace(cfg.ConsulAddr),
 		nomadToken:     strings.TrimSpace(cfg.NomadToken),
@@ -136,6 +144,26 @@ func newNomadRuntime(logger *slog.Logger, store stateStore, cfg Config) *nomadRu
 		activationTTL:  cfg.ActivationTTL,
 		probePath:      normalizeProbePath(cfg.ProbePath),
 	}
+}
+
+// acquireNomadSlot blocks until a Nomad API slot is available or ctx is cancelled.
+func (r *nomadRuntime) acquireNomadSlot(ctx context.Context) error {
+	if r.nomadSem == nil {
+		return nil
+	}
+	select {
+	case r.nomadSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *nomadRuntime) releaseNomadSlot() {
+	if r.nomadSem == nil {
+		return
+	}
+	<-r.nomadSem
 }
 
 func (r *nomadRuntime) Activate(ctx context.Context, workload WorkloadRegistration) (*url.URL, error) {
@@ -355,6 +383,12 @@ func (r *nomadRuntime) lookupActivationReadyEndpoint(ctx context.Context, worklo
 }
 
 func (r *nomadRuntime) performWake(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, error) {
+	// Acquire a Nomad API slot to bound concurrent Nomad calls.
+	if err := r.acquireNomadSlot(ctx); err != nil {
+		return nil, fmt.Errorf("acquire nomad slot: %w", err)
+	}
+	defer r.releaseNomadSlot()
+
 	if endpoint, healthy, err := r.resolveHealthyEndpoint(ctx, workload); err != nil {
 		logger.WarnContext(ctx, "consul health check failed under activator wake lock", "error", err)
 	} else if healthy {
