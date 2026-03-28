@@ -307,6 +307,8 @@ while IFS= read -r k6_label; do
 			--arg summary_file_rel "k6/$k6_slug.summary.json" \
 			--slurpfile summary "$summary_file" \
 			'($summary[0] // {}) as $s
+			| (.expected_iterations? // null) as $expected_iterations
+			| (($s.metrics.iterations.count? // null)) as $completed_iterations
 			| . + {
 				file: $file,
 				exists: true,
@@ -314,6 +316,8 @@ while IFS= read -r k6_label; do
 				summary_file: (.summary_file // $summary_file_rel),
 				success_rate: (if ($s.metrics.http_req_failed.value? != null) then (1 - ($s.metrics.http_req_failed.value | tonumber)) else null end),
 				failure_rate: ($s.metrics.http_req_failed.value? // null),
+				completed_iterations: $completed_iterations,
+				interrupted_iterations: (if ($expected_iterations != null and $completed_iterations != null) then ((($expected_iterations | tonumber) - ($completed_iterations | tonumber)) | if . < 0 then 0 else . end) else null end),
 				http_req_duration_p95_ms: ($s.metrics.http_req_duration["p(95)"]? // null),
 				http_req_duration_p99_ms: ($s.metrics.http_req_duration["p(99)"]? // null)
 			}' "$metadata_file")"
@@ -328,6 +332,8 @@ while IFS= read -r k6_label; do
 				summary_file: (.summary_file // $summary_file_rel),
 				success_rate: null,
 				failure_rate: null,
+				completed_iterations: null,
+				interrupted_iterations: null,
 				http_req_duration_p95_ms: null,
 				http_req_duration_p99_ms: null
 			}' "$metadata_file")"
@@ -502,7 +508,7 @@ jq -n \
 	| ($scenario_results | map(select(.exists and (.status != "passed")) | {scenario: .scenario_id, status: .status})) as $scenario_failed
 	| ($k6_cycles | map(select(.exists | not) | .label)) as $k6_missing_metadata
 	| ($k6_cycles | map(select(.exists and (.summary_exists | not)) | .label)) as $k6_missing_summaries
-	| ($k6_cycles | map(select(.exists and (((.status // "") != "passed") or ((.exit_code // 0) != 0))) | {label: .label, status: (.status // "unknown"), exit_code: (.exit_code // null)})) as $k6_failed_cycles
+	| ($k6_cycles | map(select(.exists and (((.status // "") != "passed") or ((.exit_code // 0) != 0) or ((.interrupted_iterations // 0) > 0))) | {label: .label, status: (.status // "unknown"), exit_code: (.exit_code // null), interrupted_iterations: (.interrupted_iterations // 0)})) as $k6_failed_cycles
 	| ($k6_cycles | map(select(.exists and .summary_exists and (.success_rate == null)) | .label)) as $k6_missing_success_rates
 	| ($k6_cycles | map(select(.exists and .summary_exists and (.success_rate != null) and $traffic_threshold != null and (.success_rate < $traffic_threshold)) | {label: .label, success_rate: .success_rate})) as $k6_traffic_failures
 	| (($k6_cycles | map(select(.success_rate != null) | .success_rate) | min?) // null) as $min_success_rate
@@ -622,7 +628,7 @@ jq -n \
 				"k6-coverage";
 				true;
 				"failed";
-				"One or more k6 cycles exited non-zero or reported failure.";
+				"One or more k6 cycles exited non-zero, reported failure, or had interrupted iterations.";
 				{
 					missing_metadata: $k6_missing_metadata,
 					missing_summaries: $k6_missing_summaries,

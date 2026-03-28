@@ -26,6 +26,7 @@ const (
 	probeRequestTTL          = 1 * time.Second
 	releaseWakeLockTTL       = 5 * time.Second
 	activationStateOpTimeout = 5 * time.Second
+	scaleUpReassertInterval  = 1 * time.Second
 )
 
 var errActivationTimeout = errors.New("timeout waiting for backend activation")
@@ -434,7 +435,7 @@ func (r *nomadRuntime) ensureJob(ctx context.Context, workload WorkloadRegistrat
 	if err != nil {
 		return err
 	}
-	if status != "not-found" && status != "dead" && status != "stopped" {
+	if status != "not-found" && status != "stopped" {
 		return nil
 	}
 
@@ -657,6 +658,7 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 	logger := r.logger.With("job", job, "group", group)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	lastScaleUpAt := startedAt
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -671,8 +673,15 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 			return nil, err
 		}
 
+		sawActiveAllocation := false
 		for _, alloc := range allocs {
-			if alloc.TaskGroup != group || alloc.ClientStatus != "running" {
+			if alloc.TaskGroup != group {
+				continue
+			}
+			if alloc.ClientStatus == "pending" || alloc.ClientStatus == "running" {
+				sawActiveAllocation = true
+			}
+			if alloc.ClientStatus != "running" {
 				continue
 			}
 
@@ -705,6 +714,15 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 				return endpoint, nil
 			}
 		}
+		if !sawActiveAllocation {
+			reasserted, err := r.reassertScaleUpIfNeeded(ctx, job, group, logger, lastScaleUpAt)
+			if err != nil {
+				return nil, err
+			}
+			if reasserted {
+				lastScaleUpAt = time.Now()
+			}
+		}
 
 		elapsed := time.Since(startedAt)
 		var pollInterval time.Duration
@@ -734,6 +752,27 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 		case <-timer.C:
 		}
 	}
+}
+
+func (r *nomadRuntime) reassertScaleUpIfNeeded(ctx context.Context, job, group string, logger *slog.Logger, lastScaleUpAt time.Time) (bool, error) {
+	if !lastScaleUpAt.IsZero() && time.Since(lastScaleUpAt) < scaleUpReassertInterval {
+		return false, nil
+	}
+
+	count, err := r.getJobGroupCount(ctx, job, group)
+	if err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return false, nil
+	}
+
+	if err := r.scaleUp(ctx, job, group); err != nil {
+		return false, err
+	}
+
+	logger.InfoContext(ctx, "reasserted nomad scale up while waiting for allocation", "target_count", 1)
+	return true, nil
 }
 
 func extractAllocEndpoint(alloc nomadAllocation) *url.URL {

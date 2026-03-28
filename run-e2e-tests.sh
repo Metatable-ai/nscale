@@ -1332,9 +1332,11 @@ validate_all_workloads_metadata_concurrently() {
 		service_name="${pid_and_service#*:}"
 		if ! wait "$request_pid"; then
 			echo "Post-wake metadata validation failed for $service_name" >&2
-			exit 1
+			return 1
 		fi
 	done
+
+	return 0
 }
 
 write_k6_request_distribution_artifact() {
@@ -1380,7 +1382,7 @@ run_k6_cycle() {
 	label="$1"
 	scenario_name="$2"
 	target_mode="$3"
-	service_name="${4:-}"
+	target_service_name="${4:-}"
 	label_slug="$(slugify "$label")"
 	summary_file="$K6_ARTIFACTS_DIR/${label_slug}.summary.json"
 	results_file="$K6_ARTIFACTS_DIR/${label_slug}.results.json"
@@ -1388,13 +1390,22 @@ run_k6_cycle() {
 	metadata_file="$K6_ARTIFACTS_DIR/${label_slug}.metadata.json"
 	k6_started_at="$(timestamp_utc)"
 	k6_started_ms="$(timestamp_millis)"
+	wake_detection_mode="pre-k6-readiness"
+	expected_iterations_json="null"
+	if [ "$scenario_name" = "coldstart" ]; then
+		if [ "$target_mode" = "fixed" ]; then
+			expected_iterations_json=1
+		else
+			expected_iterations_json="$JOB_COUNT"
+		fi
+	fi
 
 	printf "${CYAN}=== %s (%s) ===${NC}\n" "$label" "$scenario_name"
 	record_event "k6-cycle-start" "running" "$(jq -nc \
 		--arg cycle_label "$label" \
 		--arg scenario "$scenario_name" \
 		--arg target_mode "$target_mode" \
-		--arg service_name "$service_name" \
+		--arg service_name "$target_service_name" \
 		'{"label": $cycle_label, scenario: $scenario, target_mode: $target_mode, service_name: (if $service_name == "" then null else $service_name end)}')"
 
 	export E2E_TRAFFIC_SCENARIO="$scenario_name"
@@ -1403,18 +1414,23 @@ run_k6_cycle() {
 	export E2E_K6_SUMMARY_FILE="$summary_file"
 	export E2E_K6_RESULTS_FILE="$results_file"
 	if [ "$target_mode" = "fixed" ]; then
-		export E2E_K6_SERVICE_NAME="$service_name"
+		export E2E_K6_SERVICE_NAME="$target_service_name"
 	else
 		unset E2E_K6_SERVICE_NAME
 	fi
 
 	"$ROOT_DIR"/e2e/scripts/run-k6-scenario.sh &
 	k6_pid=$!
+	wait_for_matrix_after_k6=0
+	post_k6_validation_status="not-run"
 
 	if [ "$target_mode" = "fixed" ]; then
-		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$service_name" 1 "$nomad_wake_timeout"
-		workload_class="$(manifest_class_for_job "$service_name")"
-		wait_for_service_ready "$service_name" "$workload_class"
+		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$target_service_name" 1 "$nomad_wake_timeout"
+		workload_class="$(manifest_class_for_job "$target_service_name")"
+		wait_for_service_ready "$target_service_name" "$workload_class"
+	elif [ "$ACTIVATOR_ENABLED" = "true" ] && { [ "$scenario_name" = "coldstart" ] || [ "$target_mode" = "round-robin" ]; }; then
+		wait_for_matrix_after_k6=1
+		wake_detection_mode="post-k6-metadata"
 	elif [ "$scenario_name" = "coldstart" ] || [ "$target_mode" = "round-robin" ]; then
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "$WORKLOAD_PREFIX" "$JOB_COUNT" exact "$startup_ready_timeout" "$JOB_COUNT"
 		wait_for_all_workloads_ready_concurrently
@@ -1422,54 +1438,98 @@ run_k6_cycle() {
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "$WORKLOAD_PREFIX" 1 at-least "$nomad_wake_timeout" "$JOB_COUNT"
 	fi
 
-	wake_detected_at="$(timestamp_utc)"
-	wake_detected_ms="$(timestamp_millis)"
-	wake_duration_ms=$((wake_detected_ms - k6_started_ms))
-	"$ROOT_DIR"/e2e/scripts/collect-redis-info.sh "${label}-post-wake" || true
-	capture_state_snapshot "${label}-post-wake"
+	if [ "$wait_for_matrix_after_k6" -eq 1 ]; then
+		if wait "$k6_pid"; then
+			k6_exit_code=0
+			k6_status="passed"
+		else
+			k6_exit_code=$?
+			k6_status="failed"
+		fi
 
-	if wait "$k6_pid"; then
-		k6_exit_code=0
-		k6_status="passed"
+		k6_finished_at="$(timestamp_utc)"
+		k6_finished_ms="$(timestamp_millis)"
+		k6_duration_ms=$((k6_finished_ms - k6_started_ms))
+		write_k6_request_distribution_artifact "$results_file" "$distribution_file" "$JOB_COUNT"
+		capture_state_snapshot "${label}-post-k6"
+
+		wake_detected_at="$k6_finished_at"
+		wake_detected_ms="$k6_finished_ms"
+		if [ "$k6_exit_code" -eq 0 ]; then
+			if validate_all_workloads_metadata_concurrently; then
+				post_k6_validation_status="passed"
+				wake_detected_at="$(timestamp_utc)"
+				wake_detected_ms="$(timestamp_millis)"
+			else
+				post_k6_validation_status="failed"
+			fi
+		fi
+		wake_duration_ms=$((wake_detected_ms - k6_started_ms))
+		"$ROOT_DIR"/e2e/scripts/collect-redis-info.sh "${label}-post-wake" || true
+		capture_state_snapshot "${label}-post-wake"
 	else
-		k6_exit_code=$?
-		k6_status="failed"
+		wake_detected_at="$(timestamp_utc)"
+		wake_detected_ms="$(timestamp_millis)"
+		wake_duration_ms=$((wake_detected_ms - k6_started_ms))
+		"$ROOT_DIR"/e2e/scripts/collect-redis-info.sh "${label}-post-wake" || true
+		capture_state_snapshot "${label}-post-wake"
+
+		if wait "$k6_pid"; then
+			k6_exit_code=0
+			k6_status="passed"
+		else
+			k6_exit_code=$?
+			k6_status="failed"
+		fi
+
+		k6_finished_at="$(timestamp_utc)"
+		k6_finished_ms="$(timestamp_millis)"
+		k6_duration_ms=$((k6_finished_ms - k6_started_ms))
+		write_k6_request_distribution_artifact "$results_file" "$distribution_file" "$JOB_COUNT"
+		capture_state_snapshot "${label}-post-k6"
 	fi
 
-	k6_finished_at="$(timestamp_utc)"
-	k6_finished_ms="$(timestamp_millis)"
-	k6_duration_ms=$((k6_finished_ms - k6_started_ms))
-	write_k6_request_distribution_artifact "$results_file" "$distribution_file" "$JOB_COUNT"
-	capture_state_snapshot "${label}-post-k6"
+	cycle_status="$k6_status"
+	if [ "$post_k6_validation_status" = "failed" ]; then
+		cycle_status="failed"
+	fi
 
 	jq -n \
 		--arg cycle_label "$label" \
 		--arg scenario "$scenario_name" \
 		--arg target_mode "$target_mode" \
-		--arg service_name "$service_name" \
-		--arg status "$k6_status" \
+		--arg service_name "$target_service_name" \
+		--arg status "$cycle_status" \
+		--arg k6_status "$k6_status" \
 		--arg started_at "$k6_started_at" \
 		--arg wake_detected_at "$wake_detected_at" \
 		--arg finished_at "$k6_finished_at" \
 		--arg distribution_file "k6/${label_slug}.distribution.json" \
 		--arg summary_file "k6/${label_slug}.summary.json" \
 		--arg results_file "k6/${label_slug}.results.json" \
+		--arg wake_detection_mode "$wake_detection_mode" \
+		--arg post_k6_validation_status "$post_k6_validation_status" \
 		--argjson wake_duration_ms "$wake_duration_ms" \
 		--argjson duration_ms "$k6_duration_ms" \
 		--argjson exit_code "$k6_exit_code" \
+		--argjson expected_iterations "$expected_iterations_json" \
 		'{
 			"label": $cycle_label,
 			scenario: $scenario,
 			target_mode: $target_mode,
 			service_name: (if $service_name == "" then null else $service_name end),
 			status: $status,
+			k6_status: $k6_status,
 			started_at: $started_at,
 			wake_detected_at: $wake_detected_at,
 			finished_at: $finished_at,
 			distribution_file: $distribution_file,
+			wake_detection_mode: $wake_detection_mode,
+			post_k6_validation_status: $post_k6_validation_status,
 			wake_duration_ms: $wake_duration_ms,
 			duration_ms: $duration_ms,
 			exit_code: $exit_code,
+			expected_iterations: $expected_iterations,
 			summary_file: $summary_file,
 			results_file: $results_file
 		}' > "$metadata_file"
@@ -1477,22 +1537,29 @@ run_k6_cycle() {
 	LAST_K6_WAKE_DURATION_MS="$wake_duration_ms"
 	LAST_K6_LABEL="$label"
 
-	record_event "k6-cycle-complete" "$k6_status" "$(jq -nc \
+	record_event "k6-cycle-complete" "$cycle_status" "$(jq -nc \
 		--arg cycle_label "$label" \
 		--arg scenario "$scenario_name" \
 		--arg target_mode "$target_mode" \
-		--arg service_name "$service_name" \
-		--arg status "$k6_status" \
+		--arg service_name "$target_service_name" \
+		--arg status "$cycle_status" \
+		--arg k6_status "$k6_status" \
 		--arg metadata_file "k6/${label_slug}.metadata.json" \
 		--arg summary_file "k6/${label_slug}.summary.json" \
 		--arg results_file "k6/${label_slug}.results.json" \
+		--arg wake_detection_mode "$wake_detection_mode" \
+		--arg post_k6_validation_status "$post_k6_validation_status" \
 		--argjson wake_duration_ms "$wake_duration_ms" \
 		--argjson duration_ms "$k6_duration_ms" \
 		--argjson exit_code "$k6_exit_code" \
-		'{"label": $cycle_label, scenario: $scenario, target_mode: $target_mode, service_name: (if $service_name == "" then null else $service_name end), status: $status, metadata_file: $metadata_file, summary_file: $summary_file, results_file: $results_file, wake_duration_ms: $wake_duration_ms, duration_ms: $duration_ms, exit_code: $exit_code}')"
+		--argjson expected_iterations "$expected_iterations_json" \
+		'{"label": $cycle_label, scenario: $scenario, target_mode: $target_mode, service_name: (if $service_name == "" then null else $service_name end), status: $status, k6_status: $k6_status, metadata_file: $metadata_file, summary_file: $summary_file, results_file: $results_file, wake_detection_mode: $wake_detection_mode, post_k6_validation_status: $post_k6_validation_status, wake_duration_ms: $wake_duration_ms, duration_ms: $duration_ms, exit_code: $exit_code, expected_iterations: $expected_iterations}')"
 
 	if [ "$k6_exit_code" -ne 0 ]; then
 		return "$k6_exit_code"
+	fi
+	if [ "$post_k6_validation_status" = "failed" ]; then
+		return 1
 	fi
 }
 
@@ -1608,7 +1675,9 @@ run_mixed_traffic_scenario() {
 	run_k6_cycle "mixed-traffic-cold-start" "coldstart" "round-robin"
 	mixed_traffic_cold_start_k6_label="$LAST_K6_LABEL"
 	mixed_traffic_cold_start_duration_ms="$LAST_K6_WAKE_DURATION_MS"
-	validate_all_workloads_metadata_concurrently
+	if [ "$ACTIVATOR_ENABLED" != "true" ]; then
+		validate_all_workloads_metadata_concurrently
+	fi
 	"$ROOT_DIR"/e2e/scripts/collect-redis-info.sh "mixed-traffic-matrix-wake" || true
 	capture_state_snapshot "mixed-traffic-matrix-wake"
 
