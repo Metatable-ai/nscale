@@ -13,48 +13,73 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: nscale-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: nscale-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: nscale-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: nscale-darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: '1.25'
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/nscale ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Get version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Build binaries
-        run: |
-          cd idle-scaler
-          
-          VERSION=${{ steps.version.outputs.VERSION }}
-          
-          # Linux AMD64
-          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-linux-amd64 .
-          
-          # Linux ARM64
-          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-linux-arm64 .
-          
-          # macOS AMD64 (Intel)
-          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-darwin-amd64 .
-          
-          # macOS ARM64 (Apple Silicon)
-          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-darwin-arm64 .
-          
-          # Windows AMD64
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../idle-scaler-windows-amd64.exe .
-          
-          cd ..
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
 
       - name: Generate checksums
-        run: |
-          sha256sum idle-scaler-* > checksums.txt
+        run: sha256sum nscale-* > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -62,44 +87,35 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
-            idle-scaler-*
+            nscale-*
             checksums.txt
           body: |
             ## Installation
-            
-            ### Traefik Plugin
-            
-            Add to your Traefik configuration:
-            
-            ```yaml
-            experimental:
-              plugins:
-                scalewaker:
-                  moduleName: "github.com/Metatable-ai/nomad_scale_to_zero/traefik-plugin"
-                  version: "${{ steps.version.outputs.VERSION }}"
-            ```
-            
-            ### Idle-Scaler Binary
-            
+
             Download the appropriate binary for your platform and make it executable:
-            
+
             ```bash
             # Example for Linux AMD64
-            wget https://github.com/Metatable-ai/nomad_scale_to_zero/releases/download/${{ steps.version.outputs.VERSION }}/idle-scaler-linux-amd64
-            chmod +x idle-scaler-linux-amd64
-            ./idle-scaler-linux-amd64 --help
+            curl -LO https://github.com/Metatable-ai/nomad_scale_to_zero/releases/download/${{ steps.version.outputs.VERSION }}/nscale-linux-amd64
+            chmod +x nscale-linux-amd64
+            ./nscale-linux-amd64
             ```
-            
+
             Verify checksums after download:
             ```bash
             sha256sum -c checksums.txt
             ```
-            
+
+            ## Docker
+
+            ```bash
+            docker pull ghcr.io/metatable-ai/nscale:${{ steps.version.outputs.VERSION }}
+            ```
+
             ## Documentation
-            
+
             - [README.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/README.md)
-            - [LOCAL_TESTING.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/LOCAL_TESTING.md)
+            - [CHANGELOG.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/CHANGELOG.md)
             - [CONTRIBUTING.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/CONTRIBUTING.md)
-            - [RELEASE.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/RELEASE.md)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

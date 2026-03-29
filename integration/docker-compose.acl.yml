@@ -1,0 +1,181 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Docker Compose stack for integration testing with Consul & Nomad ACLs enabled.
+#
+# Architecture:
+#   1. Consul starts with ACLs enabled (deny-by-default)
+#   2. consul-acl-bootstrap sidecar bootstraps Consul ACLs, creates tokens,
+#      writes them to a shared /bootstrap volume
+#   3. Nomad starts with ACLs, reads Consul agent token from /bootstrap,
+#      then bootstraps its own ACLs and writes Nomad tokens to /bootstrap
+#   4. nscale starts after loading both token env files
+#   5. Traefik starts with a templated config containing the catalog read token
+
+networks:
+  nscale-net:
+    name: nscale-acl-net
+
+volumes:
+  bootstrap:
+
+services:
+  # ── Redis ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    networks: [nscale-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  # ── Consul (ACL-enabled) ───────────────────────────────
+  consul:
+    image: hashicorp/consul:1.22
+    command: agent -config-file=/consul/config/consul.hcl
+    networks: [nscale-net]
+    ports:
+      - "8500:8500"
+    volumes:
+      - ./acl/consul.hcl:/consul/config/consul.hcl:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8500/v1/status/leader"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ── Consul ACL Bootstrap (sidecar — runs once, then exits) ──
+  consul-acl-bootstrap:
+    image: hashicorp/consul:1.22
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-consul-acls.sh"]
+    networks: [nscale-net]
+    volumes:
+      - bootstrap:/bootstrap
+      - ./acl/scripts:/scripts:ro
+      - ./acl/policies:/policies:ro
+      - ./acl/templates:/templates:ro
+    environment:
+      BOOTSTRAP_DIR: /bootstrap
+      CONSUL_ADDR: http://consul:8500
+    depends_on:
+      consul:
+        condition: service_healthy
+
+  # ── Nomad (ACL-enabled, starts with Consul agent token) ──
+  nomad:
+    image: hashicorp/nomad:1.10.5
+    entrypoint: ["/bin/sh", "/scripts/start-nomad.sh"]
+    privileged: true
+    cgroup: host
+    networks: [nscale-net]
+    ports:
+      - "4646:4646"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - bootstrap:/bootstrap:ro
+      - ./acl/scripts:/scripts:ro
+      - ./acl/templates:/templates:ro
+    environment:
+      BOOTSTRAP_DIR: /bootstrap
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4646/v1/status/leader"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      consul-acl-bootstrap:
+        condition: service_completed_successfully
+
+  # ── Nomad ACL Bootstrap (sidecar — runs once, then exits) ──
+  nomad-acl-bootstrap:
+    image: hashicorp/nomad:1.10.5
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-nomad-acls.sh"]
+    networks: [nscale-net]
+    volumes:
+      - bootstrap:/bootstrap
+      - ./acl/scripts:/scripts:ro
+      - ./acl/policies:/policies:ro
+    environment:
+      BOOTSTRAP_DIR: /bootstrap
+      NOMAD_ADDR: http://nomad:4646
+    depends_on:
+      nomad:
+        condition: service_healthy
+
+  # ── nscale (with ACL tokens) ────────────────────────────
+  nscale:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "/scripts/start-nscale.sh"]
+    networks: [nscale-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - bootstrap:/bootstrap:ro
+      - ./config/:/app/config/:ro
+      - ./acl/scripts:/scripts:ro
+    environment:
+      RUST_LOG: info,nscale=debug
+      BOOTSTRAP_DIR: /bootstrap
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad-acl-bootstrap:
+        condition: service_completed_successfully
+
+  # ── Traefik (with Consul catalog ACL token) ─────────────
+  traefik:
+    image: traefik:v3.1
+    entrypoint: ["/bin/sh", "/scripts/start-traefik.sh"]
+    networks: [nscale-net]
+    ports:
+      - "8080:8080"
+      - "80:80"
+    volumes:
+      - bootstrap:/bootstrap:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./acl/scripts:/scripts:ro
+    environment:
+      BOOTSTRAP_DIR: /bootstrap
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    depends_on:
+      consul-acl-bootstrap:
+        condition: service_completed_successfully
+      nscale:
+        condition: service_healthy
+      nomad-acl-bootstrap:
+        condition: service_completed_successfully
+
+  # ── k6 (stress tests, manual profile) ───────────────────
+  k6:
+    image: grafana/k6:latest
+    profiles: [stress]
+    networks: [nscale-net]
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      NSCALE_TRAEFIK_URL:  "http://traefik:80"
+      NSCALE_NOMAD_URL:    "http://nomad:4646"
+      NSCALE_CONSUL_URL:   "http://consul:8500"
+      NSCALE_SERVICE_NAME: "echo-s2z"
+      NSCALE_NOMAD_GROUP:  "main"
+    depends_on:
+      traefik:
+        condition: service_healthy

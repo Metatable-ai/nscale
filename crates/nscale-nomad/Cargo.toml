@@ -1,0 +1,19 @@
+[package]
+name = "nscale-nomad"
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
+nscale-core = { path = "../nscale-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+wiremock = { workspace = true }

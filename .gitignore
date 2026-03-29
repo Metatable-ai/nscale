@@ -1,24 +1,16 @@
 # Copyright 2026 Metatable Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-# Binaries for programs and plugins
+# Rust build output
+**/target/
+**/*.rs.bk
+
+# Binaries
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool
-*.out
-
-# Go workspace file
-go.work
-
-# Dependency directories
-vendor/
 
 # Build output
 release/
@@ -37,7 +29,6 @@ build/
 tmp/
 temp/
 *.tmp
-.e2e-artifacts/
 
 # Logs
 *.log
@@ -48,6 +39,3 @@ temp/
 
 # OS generated files
 Thumbs.db
-activator/activator
-**/target
-**/*.rs.bk

@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nscale-core",
+    "crates/nscale-nomad",
+    "crates/nscale-consul",
+    "crates/nscale-store",
+    "crates/nscale-proxy",
+    "crates/nscale-waker",
+    "crates/nscale-scaler",
+]
+
+[package]
+name = "nscale"
+version = "2.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[[bin]]
+name = "nscale"
+path = "src/main.rs"
+
+[dependencies]
+nscale-core = { path = "crates/nscale-core" }
+nscale-nomad = { path = "crates/nscale-nomad" }
+nscale-consul = { path = "crates/nscale-consul" }
+nscale-store = { path = "crates/nscale-store" }
+nscale-proxy = { path = "crates/nscale-proxy" }
+nscale-waker = { path = "crates/nscale-waker" }
+nscale-scaler = { path = "crates/nscale-scaler" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
+fred = { version = "10", features = ["i-keys", "i-sorted-sets", "i-hashes", "i-scripts", "i-pubsub", "partial-tracing"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "2"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+fred = { version = "10", features = ["i-keys", "i-sorted-sets", "i-hashes", "i-scripts", "i-pubsub", "partial-tracing"] }
+dashmap = "6"
+figment = { version = "0.10", features = ["toml", "env"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
+axum = "0.8"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+wiremock = "0.6"

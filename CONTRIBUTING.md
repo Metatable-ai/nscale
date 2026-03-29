@@ -59,11 +59,10 @@ Before creating a bug report, please check existing issues to avoid duplicates.
   - Nomad version
   - Consul version
   - Traefik version
-  - Go version (if building from source)
+  - Rust version (if building from source)
   - Operating system
-  - Storage backend (Consul KV or Redis)
 - **Configuration** - Relevant configuration snippets (sanitize any secrets!)
-- **Logs** - Relevant log output from Traefik, idle-scaler, or Nomad
+- **Logs** - Relevant log output from Traefik, nscale, or Nomad
 - **Screenshots** - If applicable, add screenshots to help explain your problem
 
 **Example Bug Report:**
@@ -72,21 +71,22 @@ Before creating a bug report, please check existing issues to avoid duplicates.
 ## Bug: Service doesn't wake after scaling to zero
 
 **Environment:**
-- Nomad: v1.6.2
-- Consul: v1.16.1
-- Traefik: v2.10.4
-- Storage: Redis 7.0
+- Nomad: v1.10.5
+- Consul: v1.22
+- Traefik: v3.1
+- Redis: 7.0
+- Rust: 1.87+
 
 **Steps to Reproduce:**
 1. Deploy job with scale-to-zero enabled
-2. Scale to 0: `nomad job scale my-job main 0`
-3. Make request: `curl -H 'Host: my-job.localhost' http://localhost/`
+2. Register with nscale: `curl -X POST http://localhost:9090/admin/registry ...`
+3. Make request: `curl -H 'Host: my-job.localhost' http://localhost:8080/`
 
 **Expected:** Service wakes up and responds
 **Actual:** Request times out after 30s
 
 **Logs:**
-[Attach relevant Traefik/idle-scaler logs]
+[Attach relevant Traefik/nscale logs]
 ```
 
 ### Suggesting Enhancements
@@ -118,60 +118,58 @@ Unsure where to start? Look for issues labeled:
 
 ### Prerequisites
 
-- **Go 1.25+** - [Install Go](https://go.dev/doc/install)
-- **Nomad** - [Install Nomad](https://www.nomadproject.io/downloads)
-- **Consul** - [Install Consul](https://www.consul.io/downloads)
-- **Traefik** - [Install Traefik](https://doc.traefik.io/traefik/getting-started/install-traefik/)
-- **Docker** (optional) - For running sample jobs
-- **Redis** (optional) - For Redis backend testing
+- **Rust 1.87+** - [Install Rust](https://rustup.rs/)
+- **Docker & Docker Compose** - For the integration stack
+- **Nomad 1.10+** - [Install Nomad](https://developer.hashicorp.com/nomad/install)
+- **Consul 1.18+** - [Install Consul](https://developer.hashicorp.com/consul/install)
+- **Redis 7+** - Used as activity store
 
 ### Local Development Environment
-
-The easiest way to get started is with our all-in-one local test script:
 
 ```bash
 # Clone the repository
 git clone https://github.com/Metatable-ai/nomad_scale_to_zero.git
 cd nomad_scale_to_zero
 
-# Run the local development environment
-./local-test/scripts/start-local-with-acl.sh
+# Start the integration stack (Nomad, Consul, Redis, Traefik, nscale)
+cd integration
+docker compose up -d
 ```
 
-This starts Nomad, Consul, Traefik, and the idle-scaler with ACLs enabled.
-
-**For detailed development setup, see [LOCAL_TESTING.md](LOCAL_TESTING.md).**
-
-### Building Components
+### Building
 
 ```bash
-# Build the idle-scaler
-cd idle-scaler
-go build -o idle-scaler .
+# Build the nscale binary
+cargo build --release
 
-# Build/test the Traefik plugin
-cd traefik-plugin
-go build .
-go test ./...
-
-# Build the activity-store library
-cd activity-store
-go test ./...
+# Build with Docker
+docker build -t nscale .
 ```
 
 ### Running Tests
 
 ```bash
-# Run all tests
-cd idle-scaler && go test ./...
-cd traefik-plugin && go test ./...
-cd activity-store && go test ./...
+# Run all unit tests across the workspace
+cargo test --workspace
 
-# Run tests with coverage
-go test -v -cover ./...
+# Run tests for a specific crate
+cargo test -p nscale-nomad
+cargo test -p nscale-waker
 
-# Run tests with race detection
-go test -race ./...
+# Run with verbose output
+cargo test --workspace -- --nocapture
+```
+
+### Integration / Stress Tests
+
+```bash
+cd integration
+
+# Basic integration test
+./test.sh
+
+# Stress test with 50 services + chaos killing
+./stress-test.sh
 ```
 
 ## Pull Request Process
@@ -188,8 +186,8 @@ go test -race ./...
    - Update documentation as needed
 
 3. **Test your changes**
-   - Run the test suite: `go test ./...`
-   - Test locally with the development environment
+   - Run the test suite: `cargo test --workspace`
+   - Test locally with the integration stack
    - Ensure no existing functionality is broken
 
 4. **Commit your changes**
@@ -223,56 +221,54 @@ go test -race ./...
 
 ## Code Style Guidelines
 
-### Go Code Style
+### Rust Code Style
 
-We follow standard Go conventions:
+We follow standard Rust conventions:
 
-- **Use `gofmt`** - All code must be formatted with `gofmt`
-- **Use `go vet`** - Check for common mistakes
-- **Follow Go idioms** - Write idiomatic Go code
+- **Use `cargo fmt`** - All code must be formatted with rustfmt
+- **Use `cargo clippy`** - Check for common mistakes and lints
+- **Follow Rust idioms** - Write idiomatic Rust code
 - **Keep it simple** - Prefer clarity over cleverness
 
 ```bash
 # Format your code
-gofmt -s -w .
+cargo fmt --all
 
 # Check for issues
-go vet ./...
-
-# Run linters (optional but recommended)
-golangci-lint run
+cargo clippy --workspace -- -D warnings
 ```
 
 ### Code Organization
 
 - **One logical change per commit** - Don't mix unrelated changes
 - **Keep functions focused** - Each function should do one thing well
-- **Document exported functions** - Use Go doc comments
+- **Document public items** - Use `///` doc comments on public types and functions
 - **Use meaningful names** - Variable and function names should be descriptive
 
 ### Comments
 
 - Write comments for **why**, not **what**
-- Document all exported types, functions, and constants
+- Document all public types, functions, and constants with `///`
 - Use complete sentences in comments
 - Keep comments up-to-date with code changes
 
 ### Error Handling
 
-- Always check errors - Never ignore returned errors
-- Provide context - Wrap errors with additional context
+- Use `Result<T, E>` for fallible operations
+- Provide context with `.map_err()` or `anyhow::Context`
 - Use meaningful error messages
 
-```go
+```rust
 // Good
-if err != nil {
-    return fmt.Errorf("failed to scale job %s: %w", jobID, err)
-}
+let resp = client
+    .post(&url)
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| anyhow!("failed to scale job {}: {}", job_id, e))?;
 
 // Bad
-if err != nil {
-    return err
-}
+let resp = client.post(&url).json(&body).send().await?;
 ```
 
 ## Testing Requirements
@@ -291,21 +287,22 @@ if err != nil {
 
 ### Test Naming
 
-```go
-// Format: TestFunctionName_Scenario_ExpectedBehavior
-func TestScaleJob_WhenScaledToZero_ShouldStartAllocation(t *testing.T) {
+```rust
+// Format: test_function_name_scenario_expected_behavior
+#[tokio::test]
+async fn test_scale_up_when_scaled_to_zero_should_start_allocation() {
     // Test implementation
 }
 ```
 
 ### Integration Testing
 
-Before submitting a PR, test your changes in a local environment:
+Before submitting a PR, test your changes in the integration environment:
 
-1. Start the local test environment
-2. Deploy sample jobs
-3. Test the scale-to-zero lifecycle
-4. Verify logs and metrics
+1. Start the integration stack: `cd integration && docker compose up -d`
+2. Deploy sample jobs: `nomad job run integration/jobs/echo-s2z.nomad`
+3. Register with nscale and test the wake/idle/scale-down lifecycle
+4. Verify logs: `docker compose logs nscale`
 
 ## Commit Message Conventions
 
@@ -362,7 +359,7 @@ in the local development environment.
 Need assistance? We're here to help!
 
 - 💬 **Questions**: Use [GitHub Discussions](https://github.com/Metatable-ai/nomad_scale_to_zero/discussions)
-- 📖 **Documentation**: Check [LOCAL_TESTING.md](LOCAL_TESTING.md) and component READMEs
+- 📖 **Documentation**: Check the [README](README.md) and crate-level docs
 - 🐛 **Issues**: Search existing issues or create a new one
 - 📧 **Direct Contact**: Reach out to maintainers via GitHub
 

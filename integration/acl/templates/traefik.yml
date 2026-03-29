@@ -1,0 +1,44 @@
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Traefik config template for ACL mode.
+# ${CONSUL_CATALOG_TOKEN} is substituted by bootstrap-consul-acls.sh.
+
+api:
+  insecure: true
+  dashboard: true
+
+ping: {}
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+log:
+  level: DEBUG
+
+entryPoints:
+  http:
+    address: ":80"
+  metrics:
+    address: ":8082"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+  consulCatalog:
+    endpoint:
+      address: consul:8500
+      scheme: http
+      token: "${CONSUL_CATALOG_TOKEN}"
+    exposedByDefault: false
+    watch: true
+    refreshInterval: 1s
+    defaultRule: "Host(`{{ .Name }}.localhost`)"
+    strictChecks: true
+
+serversTransport:
+  forwardingTimeouts:
+    dialTimeout: 1s
+    responseHeaderTimeout: 3s
