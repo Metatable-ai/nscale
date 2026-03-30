@@ -406,4 +406,36 @@ mod tests {
         coord.mark_dormant(&reg.job_id);
         assert!(!coord.is_ready(&reg.job_id));
     }
+
+    #[tokio::test]
+    async fn test_invalidate_clears_cache_triggers_rewake() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coord = WakeCoordinator::new(orch.clone(), disc, 10, Duration::from_secs(2));
+
+        let reg = test_registration();
+
+        // First call wakes the job
+        let ep = coord.ensure_running(&reg).await.unwrap();
+        assert_eq!(ep.host, "10.0.0.1");
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(coord.is_ready(&reg.job_id));
+
+        // Invalidate clears the cache and resets state to dormant
+        coord.invalidate(&reg.job_id);
+        assert!(!coord.is_ready(&reg.job_id));
+
+        // Next ensure_running must trigger a fresh scale-up
+        let ep2 = coord.ensure_running(&reg).await.unwrap();
+        assert_eq!(ep2.host, "10.0.0.1");
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 }

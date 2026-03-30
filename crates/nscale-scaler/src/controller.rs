@@ -346,4 +346,72 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// Verify that InFlightTracker prevents scale-down while requests are in-flight,
+    /// and allows scale-down once the guard is dropped.
+    #[tokio::test]
+    async fn test_in_flight_tracker_blocks_scale_down() {
+        // Simulate the scale-down decision logic from scale_down_job()
+        let tracker = InFlightTracker::new();
+        let job_id = "in-flight-job";
+
+        // No in-flight requests → should allow scale-down
+        assert!(!tracker.has_in_flight(job_id), "no requests tracked yet");
+
+        // Acquire an in-flight guard (simulates proxy_handler tracking a request)
+        let guard = tracker.track(job_id);
+        assert!(
+            tracker.has_in_flight(job_id),
+            "guard is held, should show in-flight"
+        );
+        assert_eq!(tracker.count(job_id), 1);
+
+        // Scale-down check: should skip because of in-flight
+        // (mirrors the logic in scale_down_job)
+        let should_skip = tracker.has_in_flight(job_id);
+        assert!(
+            should_skip,
+            "scale-down should be skipped with in-flight request"
+        );
+
+        // Acquire a second guard (concurrent request)
+        let guard2 = tracker.track(job_id);
+        assert_eq!(tracker.count(job_id), 2);
+
+        // Drop first guard — still 1 in-flight
+        drop(guard);
+        assert!(tracker.has_in_flight(job_id));
+        assert_eq!(tracker.count(job_id), 1);
+
+        // Drop second guard — now 0 in-flight
+        drop(guard2);
+        assert!(!tracker.has_in_flight(job_id));
+        assert_eq!(tracker.count(job_id), 0);
+
+        // Now scale-down should proceed
+        let should_proceed = !tracker.has_in_flight(job_id);
+        assert!(
+            should_proceed,
+            "scale-down should proceed with no in-flight requests"
+        );
+    }
+
+    /// Verify that InFlightTracker correctly isolates per-job counts.
+    #[tokio::test]
+    async fn test_in_flight_tracker_per_job_isolation() {
+        let tracker = InFlightTracker::new();
+
+        let _guard_a = tracker.track("job-a");
+        let _guard_b = tracker.track("job-b");
+
+        // job-a has in-flight but job-c does not
+        assert!(tracker.has_in_flight("job-a"));
+        assert!(tracker.has_in_flight("job-b"));
+        assert!(!tracker.has_in_flight("job-c"));
+
+        // Dropping job-a guard should not affect job-b
+        drop(_guard_a);
+        assert!(!tracker.has_in_flight("job-a"));
+        assert!(tracker.has_in_flight("job-b"));
+    }
 }

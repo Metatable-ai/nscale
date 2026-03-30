@@ -2,23 +2,41 @@
 # multi-job.sh — Submit and register N echo jobs for multi-service stress testing.
 #
 # Usage:
-#   ./scripts/multi-job.sh submit 50    # submit + register 50 jobs
-#   ./scripts/multi-job.sh status 50    # check running status of all 50
-#   ./scripts/multi-job.sh teardown 50  # stop and purge all 50 jobs
+#   ./scripts/multi-job.sh submit 50              # submit + register 50 fast jobs
+#   ./scripts/multi-job.sh submit 50 --slow-pct 30 # 30% of jobs get CGI /cgi-bin/slow?delay=N
+#   ./scripts/multi-job.sh status 50              # check running status of all 50
+#   ./scripts/multi-job.sh teardown 50            # stop and purge all 50 jobs
 set -euo pipefail
 
-ACTION="${1:?Usage: multi-job.sh <submit|status|teardown> <count>}"
+ACTION="${1:?Usage: multi-job.sh <submit|status|teardown> <count> [--slow-pct N]}"
 COUNT="${2:-50}"
+
+# Parse optional --slow-pct flag
+SLOW_PCT=0
+shift 2 || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --slow-pct) SLOW_PCT="${2:-0}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
 
 NOMAD_ADDR="${NOMAD_ADDR:-http://localhost:4646}"
 NSCALE_ADDR="${NSCALE_ADDR:-http://localhost:9090}"
 
 job_name() { printf "echo-%03d" "$1"; }
 
-generate_job_hcl() {
+# Determine if a job index should be slow (CGI-enabled).
+# Uses deterministic assignment: first N% of jobs are slow.
+is_slow_job() {
   local idx=$1
-  local name
-  name=$(job_name "$idx")
+  local slow_count=$(( (COUNT * SLOW_PCT + 99) / 100 ))
+  [[ "$idx" -le "$slow_count" ]]
+}
+
+# Generate a fast echo-only job.
+generate_fast_job_hcl() {
+  local name=$1
   cat <<EOF
 job "${name}" {
   datacenters = ["dc1"]
@@ -87,15 +105,106 @@ job "${name}" {
 EOF
 }
 
+# Generate a slow CGI job (has /cgi-bin/slow?delay=N plus normal index).
+# Uses the same pattern as jobs/slow-service.nomad.
+generate_slow_job_hcl() {
+  local name=$1
+  local dir="/tmp/${name}-www"
+  cat <<HCLEOF
+job "${name}" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  group "main" {
+    count = 1
+
+    network {
+      mode = "host"
+      port "http" {}
+    }
+
+    task "setup" {
+      driver = "raw_exec"
+      lifecycle {
+        hook    = "prestart"
+        sidecar = false
+      }
+      config {
+        command = "/bin/sh"
+        args    = ["-c", <<EOT
+mkdir -p ${dir}/cgi-bin
+echo 'Hello from ${name}!' > ${dir}/index.html
+cat > ${dir}/cgi-bin/slow << 'CGI'
+#!/bin/sh
+DELAY=\$(echo "\$QUERY_STRING" | sed -n 's/.*delay=\([0-9]*\).*/\1/p')
+[ -z "\$DELAY" ] && DELAY=0
+[ "\$DELAY" -gt 0 ] 2>/dev/null && sleep "\$DELAY"
+printf "Content-Type: text/plain\r\n\r\nDone after %ss delay\n" "\$DELAY"
+CGI
+chmod +x ${dir}/cgi-bin/slow
+EOT
+        ]
+      }
+      resources {
+        cpu    = 1
+        memory = 10
+      }
+    }
+
+    task "echo" {
+      driver = "raw_exec"
+
+      config {
+        command = "/bin/busybox"
+        args    = ["httpd", "-f", "-p", "\${NOMAD_PORT_http}", "-h", "${dir}"]
+      }
+
+      resources {
+        cpu    = 10
+        memory = 32
+      }
+
+      service {
+        name         = "${name}"
+        provider     = "consul"
+        port         = "http"
+        address_mode = "host"
+
+        tags = [
+          "traefik.enable=true",
+          "traefik.http.routers.${name}.rule=Host(\`${name}.localhost\`)",
+          "traefik.http.routers.${name}.entryPoints=http",
+          "traefik.http.routers.${name}.service=s2z-nscale@file",
+        ]
+
+        check {
+          type     = "http"
+          path     = "/"
+          interval = "2s"
+          timeout  = "1s"
+        }
+      }
+    }
+  }
+}
+HCLEOF
+}
+
 do_submit() {
-  echo "==> Submitting ${COUNT} jobs..."
+  local slow_count=$(( (COUNT * SLOW_PCT + 99) / 100 ))
+  echo "==> Submitting ${COUNT} jobs (${slow_count} slow, $((COUNT - slow_count)) fast)..."
   local ok=0 fail=0
 
   for i in $(seq 1 "$COUNT"); do
     local name
     name=$(job_name "$i")
     local tmpfile="/tmp/${name}.nomad"
-    generate_job_hcl "$i" > "$tmpfile"
+
+    if is_slow_job "$i"; then
+      generate_slow_job_hcl "$name" > "$tmpfile"
+    else
+      generate_fast_job_hcl "$name" > "$tmpfile"
+    fi
 
     # Copy into Nomad container and run
     docker cp "$tmpfile" integration-nomad-1:/tmp/"${name}.nomad" 2>/dev/null
@@ -134,6 +243,7 @@ do_submit() {
     fi
   done
   echo "==> Registered: ${ok} ok, ${fail} failed"
+  echo "==> Slow jobs (indices 1..${slow_count}): echo-001 .. $(job_name "$slow_count")"
 }
 
 do_status() {
