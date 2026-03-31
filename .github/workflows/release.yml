@@ -108,6 +108,10 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+          labels: |
+            org.opencontainers.image.title=nscale
+            org.opencontainers.image.description=Wake-on-request and scale-to-zero for HashiCorp Nomad services
+            org.opencontainers.image.licenses=Apache-2.0
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
