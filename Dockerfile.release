@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+ARG TARGETPLATFORM
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY docker-build/ /tmp/binaries/
+
+RUN set -eux; \
+    case "${TARGETPLATFORM}" in \
+      linux/amd64) cp /tmp/binaries/linux-amd64/nscale-linux-amd64 /app/nscale ;; \
+      linux/arm64) cp /tmp/binaries/linux-arm64/nscale-linux-arm64 /app/nscale ;; \
+      *) echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 ;; \
+    esac; \
+    chmod +x /app/nscale; \
+    rm -rf /tmp/binaries
+
+CMD ["/app/nscale"]

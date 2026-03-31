@@ -101,15 +101,18 @@ flowchart TD
     Lock --> Idle["Query Redis for idle jobs<br/>(activity score < now − idle_timeout)"]
     Idle -->|No idle jobs| Done["Sleep until next tick"]
     Idle -->|Found idle jobs| Loop["For each idle job"]
-    Loop --> InFlight{"InFlightTracker<br/>has_in_flight?"}
+    Loop --> Deferred{"Deferred due to<br/>active deployment?"}
+    Deferred -->|Yes, backoff active| Skip["Skip job"]
+    Deferred -->|No| InFlight{"InFlightTracker<br/>has_in_flight?"}
     InFlight -->|Yes| Refresh["Refresh activity<br/>→ skip"]
     InFlight -->|No| Probe{"Traefik traffic probe<br/>request delta > 0?"}
     Probe -->|Active traffic| Refresh
+    Probe -->|Probe error| Skip
     Probe -->|No traffic| Scale["Scale job to count=0"]
-    Scale --> Invalidate["Invalidate coordinator cache"]
-    Invalidate --> MarkDormant["Mark dormant"]
+    Scale --> Cleanup["Mark dormant<br/>Remove activity<br/>Clear traffic baseline"]
     Refresh --> Loop
-    MarkDormant --> Loop
+    Skip --> Loop
+    Cleanup --> Loop
 ```
 
 **nscale** is a single Rust binary composed of seven internal crates:
@@ -137,6 +140,9 @@ flowchart TD
 - **Nomad event stream** — Reacts to allocation lifecycle events for instant state transitions
 - **Active-deployment tolerance** — Gracefully handles Nomad 400 "scaling blocked due to active deployment"
 - **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
+
+Additional operator docs live in [`docs/`](./docs/), starting with the
+[`performance-configuration.md`](./docs/performance-configuration.md) guide.
 
 ## Quick Start
 
@@ -400,7 +406,7 @@ endpoint, then proxies the original request.
 When the service is healthy, Traefik creates a ConsulCatalog route (priority 30)
 that also points to `s2z-nscale@file`. The request still flows through nscale,
 which tracks it with `InFlightTracker`, spawns a heartbeat, and proxies to the
-real backend discovered via Consul.
+real backend using the coordinator's cached endpoint (resolved from Consul during wake).
 
 ### 4. In-flight protection
 
@@ -416,10 +422,11 @@ The scale-down controller runs a periodic sweep:
 
 1. Acquire distributed lock in Redis
 2. Query the activity sorted set for jobs with score < `now - idle_timeout`
-3. For each idle job, check `InFlightTracker` (in-flight requests block scale-down)
-4. Check Traefik traffic probe (request counter delta)
-5. If truly idle, scale Nomad job to `count = 0`
-6. Invalidate the coordinator cache and mark dormant
+3. For each idle job, check deployment deferral (skip if Nomad reported active deployment recently)
+4. Check `InFlightTracker` (in-flight requests block scale-down and refresh activity)
+5. Check Traefik traffic probe (request counter delta; fail-open on probe errors)
+6. If truly idle, scale Nomad job to `count = 0`
+7. Mark dormant, remove activity, and clear the traffic probe baseline
 
 ### 6. Nomad event stream
 
@@ -431,6 +438,7 @@ clears the coordinator cache — enabling instant state transitions without poll
 
 ```
 ├── Cargo.toml              # Workspace + binary definition
+├── docs/                   # Operator-facing guides and configuration docs
 ├── src/main.rs             # Binary entrypoint
 ├── crates/
 │   ├── nscale-core/        # Config, traits, shared types
@@ -449,6 +457,7 @@ clears the coordinator cache — enabling instant state transitions without poll
 │   ├── scripts/            # Helper scripts
 │   └── traefik/            # Traefik configuration
 ├── Dockerfile              # Multi-stage production build
+├── Dockerfile.release      # Lean release image using pre-built binaries
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
 └── LICENSE                 # Apache 2.0

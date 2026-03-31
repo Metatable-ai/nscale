@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "nscale"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "axum",
  "figment",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "figment",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-nomad"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-scaler"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-waker"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "dashmap",
