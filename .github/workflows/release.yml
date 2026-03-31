@@ -138,6 +138,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: nscale-*
 
       - name: Flatten artifacts
         run: |
