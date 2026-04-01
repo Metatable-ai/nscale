@@ -129,7 +129,7 @@ Why this matters:
 A good rule is:
 
 $$
-\text{proxy.request\_timeout\_secs} \ge \text{wake\_timeout\_secs} + \text{max backend request time}
+\text{proxy.request\\_timeout\\_secs} \ge \text{wake\\_timeout\\_secs} + \text{max backend request time}
 $$
 
 For the recommended baseline:
@@ -147,7 +147,7 @@ If your workloads can hold a request open longer than 30 seconds, raise `proxy.r
 `nscale` derives its heartbeat interval from:
 
 $$
-\text{heartbeat interval} = \frac{\text{idle\_timeout\_secs}}{3}
+\text{heartbeat interval} = \frac{\text{idle\\_timeout\\_secs}}{3}
 $$
 
 With `idle_timeout_secs = 45`, heartbeats fire every 15 seconds during long-running proxied requests.
