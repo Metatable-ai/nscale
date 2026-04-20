@@ -164,10 +164,7 @@ mod tests {
 
     #[test]
     fn ip_address_host() {
-        assert_eq!(
-            extract_job_id_from_host("192.168.1.1"),
-            Some("192".into())
-        );
+        assert_eq!(extract_job_id_from_host("192.168.1.1"), Some("192".into()));
     }
 
     #[test]
@@ -213,5 +210,3 @@ mod tests {
         );
     }
 }
-
-

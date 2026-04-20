@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
@@ -7,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::{any, get, post},
 };
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
@@ -15,11 +17,13 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use nscale_consul::client::ConsulClient;
 use nscale_core::config::Config;
+use nscale_core::error::NscaleError;
 use nscale_core::inflight::InFlightTracker;
-use nscale_core::job::JobRegistration;
+use nscale_core::job::{JobId, JobRegistration};
 use nscale_core::traits::ActivityStore;
 use nscale_nomad::client::NomadClient;
 use nscale_nomad::events::{EventStreamConfig, start_event_stream};
+use nscale_nomad::job_mutator::inject_nscale_tags;
 use nscale_proxy::handler::{AppState, proxy_handler};
 use nscale_proxy::middleware::ActivityLayer;
 use nscale_scaler::controller::ScaleDownController;
@@ -161,11 +165,14 @@ async fn main() {
     let admin_state = AdminState {
         registry: registry.clone(),
         activity_store: activity_store.clone(),
+        nomad_client: nomad_client.clone(),
+        file_provider_service: config.routing.file_provider_service.clone(),
     };
 
     let admin_router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/admin/jobs", post(admin_submit_job))
         .route("/admin/registry", post(admin_register))
         .route("/admin/registry/sync", post(admin_sync))
         .with_state(admin_state);
@@ -211,10 +218,44 @@ async fn main() {
 struct AdminState {
     registry: Arc<JobRegistry>,
     activity_store: Arc<dyn ActivityStore>,
+    nomad_client: Arc<NomadClient>,
+    file_provider_service: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitJobRequest {
+    hcl: String,
+    #[serde(default)]
+    variables: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegistrationFailure {
+    service_name: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitJobResponse {
+    job_id: String,
+    eval_id: String,
+    job_modify_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warnings: Option<String>,
+    managed_services: Vec<JobRegistration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    registration_failures: Vec<RegistrationFailure>,
 }
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+fn admin_error_status(error: &NscaleError) -> StatusCode {
+    match error {
+        NscaleError::Http(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
+    }
 }
 
 async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
@@ -222,6 +263,129 @@ async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
         Ok(_) => (StatusCode::OK, "ready").into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}")).into_response(),
     }
+}
+
+async fn admin_submit_job(
+    State(state): State<AdminState>,
+    Json(request): Json<SubmitJobRequest>,
+) -> impl IntoResponse {
+    let mut parsed_job = match state
+        .nomad_client
+        .parse_job(&request.hcl, request.variables.as_deref())
+        .await
+    {
+        Ok(job) => job,
+        Err(e) => {
+            error!(error = %e, "failed to parse Nomad job submission");
+            return (
+                admin_error_status(&e),
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let managed_services = match inject_nscale_tags(&mut parsed_job, &state.file_provider_service) {
+        Ok(services) => services,
+        Err(e) => {
+            error!(error = %e, "failed to inject nscale routing tags into parsed job");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    if managed_services.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "parsed job does not contain any Traefik-enabled services for nscale"
+            })),
+        )
+            .into_response();
+    }
+
+    let unique_groups = managed_services
+        .iter()
+        .map(|registration| registration.nomad_group.clone())
+        .collect::<BTreeSet<_>>();
+    if unique_groups.len() > 1 {
+        error!(
+            job_id = %managed_services[0].job_id,
+            groups = ?unique_groups,
+            "multiple groups detected for submitted job; scale-down will use the last registered group"
+        );
+    }
+
+    let submit_response = match state.nomad_client.submit_job(&parsed_job).await {
+        Ok(response) => response,
+        Err(e) => {
+            error!(error = %e, "failed to submit Nomad job");
+            return (
+                admin_error_status(&e),
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut seeded_job_ids = BTreeSet::new();
+    let mut registration_failures = Vec::new();
+    for registration in &managed_services {
+        match state.registry.register(registration).await {
+            Ok(()) => {
+                seeded_job_ids.insert(registration.job_id.0.clone());
+                info!(
+                    job_id = %registration.job_id,
+                    service_name = %registration.service_name,
+                    group = %registration.nomad_group,
+                    "registered submitted job with nscale"
+                );
+            }
+            Err(e) => {
+                error!(
+                    job_id = %registration.job_id,
+                    service_name = %registration.service_name,
+                    error = %e,
+                    "failed to register submitted job with nscale"
+                );
+                registration_failures.push(RegistrationFailure {
+                    service_name: registration.service_name.0.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    for job_id in seeded_job_ids {
+        let job_id = JobId(job_id);
+        if let Err(e) = state.activity_store.record_activity(&job_id).await {
+            error!(job_id = %job_id, error = %e, "failed to seed activity for submitted job");
+        }
+    }
+
+    let status = if registration_failures.is_empty() {
+        StatusCode::CREATED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+
+    (
+        status,
+        Json(SubmitJobResponse {
+            job_id: managed_services[0].job_id.0.clone(),
+            eval_id: submit_response.eval_id,
+            job_modify_index: submit_response.job_modify_index,
+            warnings: submit_response
+                .warnings
+                .filter(|warning| !warning.is_empty()),
+            managed_services,
+            registration_failures,
+        }),
+    )
+        .into_response()
 }
 
 async fn admin_register(

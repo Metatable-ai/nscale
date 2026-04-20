@@ -142,7 +142,8 @@ flowchart TD
 - **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
 
 Additional operator docs live in [`docs/`](./docs/), starting with the
-[`performance-configuration.md`](./docs/performance-configuration.md) guide.
+[`performance-configuration.md`](./docs/performance-configuration.md) guide and the
+[`job-submission.md`](./docs/job-submission.md) guide for the new admin submission flow.
 
 ## Quick Start
 
@@ -161,21 +162,16 @@ cd integration
 docker compose up -d
 ```
 
-Register a sample job:
+Submit a sample job through nscale:
 
 ```bash
-# Submit the echo service
-nomad job run jobs/echo-s2z.nomad
-
-# Register it with nscale (seeds activity for idle detection)
-curl -X POST http://localhost:9090/admin/registry \
+# Build a safe JSON payload from the sample HCL fixture
+curl -X POST http://localhost:9090/admin/jobs \
   -H 'Content-Type: application/json' \
-  -d '{
-    "job_id": "echo-s2z",
-    "service_name": "echo-s2z",
-    "endpoint": "http://echo-s2z.localhost",
-    "nomad_group": "main"
-  }'
+  --data "$(jq -n \
+    --rawfile hcl jobs/echo-submit.nomad \
+    --arg variables $'service_name = \"echo-s2z\"\nhost_name = \"echo-s2z.localhost\"' \
+    '{hcl: $hcl, variables: $variables}')"
 ```
 
 Send a request — nscale wakes the service and proxies the response:
@@ -229,6 +225,9 @@ min_scale_down_age_secs  = 120
 [default.proxy]
 request_timeout_secs = 30
 request_buffer_size  = 1000
+
+[default.routing]
+file_provider_service = "s2z-nscale@file"
 ```
 
 ### Environment variables
@@ -249,6 +248,10 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_SCALING__IDLE_TIMEOUT_SECS` | `300` | Seconds before idle service is scaled down |
 | `NSCALE_SCALING__WAKE_TIMEOUT_SECS` | `60` | Max seconds to wait for a service to become healthy |
 | `NSCALE_SCALING__SCALE_DOWN_INTERVAL_SECS` | `30` | Scale-down sweep interval |
+| `NSCALE_SCALING__MIN_SCALE_DOWN_AGE_SECS` | `120` | Minimum job age before scale-down eligibility (reserved for future runtime wiring) |
+| `NSCALE_PROXY__REQUEST_TIMEOUT_SECS` | `30` | Upstream request timeout |
+| `NSCALE_PROXY__REQUEST_BUFFER_SIZE` | `1000` | Request wake buffer size (reserved for future runtime wiring) |
+| `NSCALE_ROUTING__FILE_PROVIDER_SERVICE` | `s2z-nscale@file` | Traefik service target injected into router tags during `/admin/jobs` submissions |
 | `NSCALE_TRAEFIK__METRICS_URL` | — | Traefik Prometheus endpoint (enables traffic probe) |
 | `NSCALE_TRAEFIK__PROVIDER` | — | Traefik provider name for metric labels |
 | `RUST_LOG` | `info,nscale=debug` | Tracing filter |
@@ -296,6 +299,10 @@ http:
 ### Nomad job tags
 
 Services must route through nscale on both cold and warm paths.
+If you submit jobs directly to Nomad, include `service=s2z-nscale@file` yourself.
+If you submit through `/admin/jobs`, nscale injects or overrides this tag automatically
+for every Traefik-enabled service that already declares explicit router tags.
+
 Use `service=s2z-nscale@file` to point the ConsulCatalog router at nscale:
 
 ```hcl
@@ -327,22 +334,56 @@ This creates two routes to nscale:
 | `my-service@consulcatalog` | ConsulCatalog | 30 | Service is running (healthy in Consul) |
 | `s2z-fallback@file` | File | 1 | Always (catches dormant services) |
 
+### Job submission via `/admin/jobs`
+
+The admin submission endpoint lets nscale own the full registration flow:
+
+1. parse Nomad HCL with optional variables through Nomad's parser
+2. inject or override `traefik.http.routers.<name>.service=s2z-nscale@file`
+3. submit the mutated job to Nomad
+4. auto-register every managed service in Redis
+5. seed initial activity so the scaler can safely discover the job later
+
+The endpoint only manages services that:
+
+- set `traefik.enable=true`
+- include at least one explicit router tag like `traefik.http.routers.api.rule=...`
+
+Non-Traefik services are ignored. Traefik-enabled services without explicit router tags are rejected,
+because nscale has no router name to target for the injected `.service=` override.
+
 ## Admin API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/readyz` | Readiness check (verifies Redis) |
+| `POST` | `/admin/jobs` | Parse HCL, inject required Traefik routing tags, submit to Nomad, auto-register managed services |
 | `POST` | `/admin/registry` | Register a single job (seeds activity) |
 | `POST` | `/admin/registry/sync` | Bulk-sync all job registrations (seeds activity) |
 
-### Registration payload
+### Job submission payload
+
+```json
+{
+  "hcl": "job \"echo-submit-job\" { ... }",
+  "variables": "service_name = \"echo-s2z\"\nhost_name = \"echo-s2z.localhost\""
+}
+```
+
+`variables` is optional. When present, it is passed straight through to Nomad's HCL parser.
+Keep variable interpolation inside attribute values — Nomad does not allow template expressions
+inside block labels such as `job "${var.name}"`.
+
+Successful responses include the Nomad evaluation information plus the set of managed services that
+nscale registered automatically.
+
+### Manual registration payload
 
 ```json
 {
   "job_id": "my-service",
   "service_name": "my-service",
-  "endpoint": "http://my-service.localhost",
   "nomad_group": "main"
 }
 ```
@@ -350,6 +391,9 @@ This creates two routes to nscale:
 Registration seeds an activity timestamp in Redis so the scaler can detect the job
 as idle once `idle_timeout` expires. Without this, registered jobs would never be
 discovered by the scale-down controller.
+
+This endpoint is still useful when jobs are submitted outside nscale and you only need
+to register an already-known service.
 
 ## Testing
 
@@ -371,6 +415,17 @@ docker compose --profile stress run --rm \
   k6 run /scripts/multi-service.js
 ```
 
+### Admin submission flow
+
+```bash
+cd integration
+./test.sh
+```
+
+The main integration script now submits `jobs/echo-submit.nomad` through `/admin/jobs`, verifies
+that nscale injected the Traefik service override tag in Consul, confirms lookup still works when
+`service_name` differs from `job_id`, and then exercises wake-up and automatic scale-down.
+
 ### Multi-job management
 
 ```bash
@@ -388,11 +443,15 @@ bash scripts/multi-job.sh teardown 50
 
 ## How It Works
 
-### 1. Registration
+### 1. Submission and registration
 
-A Nomad job is registered via the admin API. nscale stores the job in Redis and
-seeds an initial activity timestamp. The job can be at any count — nscale will
-scale it down once idle_timeout expires if there's no traffic.
+A Nomad job can be submitted through `/admin/jobs`. nscale parses the HCL via Nomad,
+injects the Traefik router service override, submits the mutated job, stores the managed
+services in Redis, and seeds an initial activity timestamp. The job can be at any count —
+nscale will scale it down once `idle_timeout` expires if there's no traffic.
+
+If you submit jobs outside nscale, use `/admin/registry` or `/admin/registry/sync` to add
+the same registration data manually.
 
 ### 2. Cold-start wake
 

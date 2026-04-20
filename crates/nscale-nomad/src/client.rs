@@ -38,6 +38,56 @@ impl NomadClient {
         format!("{}{}", self.base_url, path)
     }
 
+    async fn ensure_success(
+        &self,
+        resp: reqwest::Response,
+        method: &str,
+        path: &str,
+    ) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(NscaleError::Nomad(format!(
+            "{} {} returned {}: {}",
+            method, path, status, body
+        )))
+    }
+
+    #[instrument(skip(self, hcl, variables), fields(has_variables = variables.is_some()))]
+    pub async fn parse_job(&self, hcl: &str, variables: Option<&str>) -> Result<serde_json::Value> {
+        let request = ParseJobRequest {
+            job_hcl: hcl.to_string(),
+            canonicalize: true,
+            variables: variables.map(ToOwned::to_owned),
+        };
+
+        let resp = self
+            .client
+            .post(self.url("/v1/jobs/parse"))
+            .json(&request)
+            .send()
+            .await?;
+
+        let resp = self.ensure_success(resp, "POST", "/v1/jobs/parse").await?;
+        Ok(resp.json().await?)
+    }
+
+    #[instrument(skip(self, job))]
+    pub async fn submit_job(&self, job: &serde_json::Value) -> Result<JobSubmitResponse> {
+        let resp = self
+            .client
+            .post(self.url("/v1/jobs"))
+            .json(&JobSubmitRequest { job })
+            .send()
+            .await?;
+
+        let resp = self.ensure_success(resp, "POST", "/v1/jobs").await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn get_job(&self, job_id: &JobId) -> Result<Job> {
         let resp = self
             .client
@@ -234,8 +284,71 @@ impl Orchestrator for NomadClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_parse_job() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/jobs/parse"))
+            .and(body_json(serde_json::json!({
+                "JobHCL": "job \"example\" {}",
+                "Canonicalize": true,
+                "Variables": "var.project_id = \"demo\""
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ID": "example",
+                "TaskGroups": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let job = client
+            .parse_job("job \"example\" {}", Some("var.project_id = \"demo\""))
+            .await
+            .unwrap();
+
+        assert_eq!(job["ID"], "example");
+    }
+
+    #[tokio::test]
+    async fn test_submit_job() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/jobs"))
+            .and(body_json(serde_json::json!({
+                "Job": {
+                    "ID": "example",
+                    "TaskGroups": []
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "EvalID": "eval-123",
+                "JobModifyIndex": 42,
+                "Warnings": ""
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let response = client
+            .submit_job(&serde_json::json!({
+                "ID": "example",
+                "TaskGroups": []
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response.eval_id, "eval-123");
+        assert_eq!(response.job_modify_index, 42);
+        assert_eq!(response.warnings.as_deref(), Some(""));
+    }
 
     #[tokio::test]
     async fn test_scale_up() {

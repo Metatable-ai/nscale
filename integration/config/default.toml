@@ -22,6 +22,9 @@ min_scale_down_age_secs = 10
 request_timeout_secs = 90
 request_buffer_size = 1000
 
+[default.routing]
+file_provider_service = "s2z-nscale@file"
+
 [default.traefik]
 metrics_url = "http://traefik:8082"
 provider = "consulcatalog"

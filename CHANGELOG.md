@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.0] - 2026-04-20
+
+### Added
+- Added `POST /admin/jobs`, allowing `nscale` to parse Nomad HCL with optional variables, inject the Traefik file-provider routing override, submit the job to Nomad, auto-register managed services, and seed activity in one step.
+- Added `routing.file_provider_service` / `NSCALE_ROUTING__FILE_PROVIDER_SERVICE` so the injected Traefik service target is configurable without depending on optional Traefik metrics settings.
+- Added integration coverage for the admin submission flow in `integration/test.sh`, `integration/test-acl.sh`, and `nscale-kubernetes/test-hybrid.sh`, plus dedicated submit fixtures for both environments.
+- Added operator documentation for the admin submission flow in `docs/job-submission.md` and reflected the new workflow in the root `README.md`.
+
+### Changed
+- Updated the job registry path to support both job-id and service-name based lookup so submitted services keep working when `service_name` differs from the Nomad job ID.
+- Updated the README quick-start and admin API documentation to treat `/admin/jobs` as the preferred submission path and `/admin/registry` as the manual fallback.
+
+### Fixed
+- Fixed automatic tag injection coverage for variableized submit fixtures by keeping Nomad block labels literal while still supporting variables inside the job body.
+
+---
+
 ## [2.0.0] - 2026-03-30
 
 ### Added
@@ -78,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **idle-scaler/**: Idle scaler agent binary
 - **activity-store/**: Shared store library for Consul KV and Redis
 
-[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.1.0
 [2.0.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.0.0
 [0.1.0]: https://github.com/Metatable-ai/nscale/releases/tag/v0.1.0

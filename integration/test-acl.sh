@@ -6,11 +6,10 @@
 #
 # This test verifies that nscale can:
 #   1. Authenticate to Nomad and Consul using scoped ACL tokens
-#   2. Submit and scale jobs via the Nomad API with ACL tokens
-#   3. Read service health from Consul with ACL tokens
-#   4. Proxy requests and wake dormant services
-#   5. Scale down idle services
-#   6. Re-wake services after scale-down
+#   2. Accept HCL + variables at /admin/jobs and submit the parsed job to Nomad
+#   3. Inject the required Traefik router service override tag before submission
+#   4. Auto-register the managed service and route proxy traffic by service name
+#   5. Scale down idle services and re-wake them on demand
 #
 # The test also verifies that unauthenticated requests are rejected
 # by Nomad and Consul (i.e. ACLs are actually enforced).
@@ -23,12 +22,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.acl.yml"
-JOB_FILE="$SCRIPT_DIR/jobs/echo-s2z.nomad"
+JOB_FILE="$SCRIPT_DIR/jobs/echo-submit.nomad"
 
 NOMAD_ADDR="http://localhost:4646"
 CONSUL_ADDR="http://localhost:8500"
 NSCALE_PROXY="http://localhost:80"
 NSCALE_ADMIN="http://localhost:9090"
+
+JOB_ID="echo-submit-job"
+SERVICE_NAME="${SERVICE_NAME:-echo-s2z}"
+SERVICE_GROUP="${SERVICE_GROUP:-main}"
+ROUTER_HOST="${ROUTER_HOST:-${SERVICE_NAME}.localhost}"
+HOST_HEADER="${HOST_HEADER:-${ROUTER_HOST}}"
+EXPECTED_TRAEFIK_SERVICE_TAG="traefik.http.routers.${SERVICE_NAME}.service=s2z-nscale@file"
 
 INFRA_TIMEOUT=180
 WAKE_TIMEOUT=60
@@ -66,6 +72,17 @@ assert_fail() {
   fail "$1"
 }
 
+build_submit_payload() {
+  local variables
+  variables=$(cat <<EOF
+service_name = "${SERVICE_NAME}"
+host_name = "${ROUTER_HOST}"
+EOF
+)
+
+  jq -n --rawfile hcl "$JOB_FILE" --arg variables "$variables" '{hcl: $hcl, variables: $variables}'
+}
+
 cleanup() {
   if $TEARDOWN; then
     info "Cleaning up..."
@@ -91,6 +108,13 @@ for cmd in docker curl jq; do
   fi
 done
 assert_pass "Prerequisites OK"
+
+info "Checking submit fixture relies on nscale tag injection..."
+if grep -Eq 'traefik\.http\.routers\..*\.service=s2z-nscale@file' "$JOB_FILE"; then
+  assert_fail "Submit fixture already contains the injected Traefik service tag"
+  exit 1
+fi
+assert_pass "Submit fixture requires nscale tag injection"
 
 # ══════════════════════════════════════════════════════════
 header "Phase 1: Start ACL-enabled infrastructure"
@@ -198,33 +222,45 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════
-header "Phase 3: Submit job & register with nscale"
+header "Phase 3: Submit job through nscale"
 # ══════════════════════════════════════════════════════════
 
-info "Submitting echo-s2z job to Nomad (with ACL token)..."
-JOB_HCL=$(cat "$JOB_FILE")
-JOB_JSON=$(curl -fsS "$NOMAD_ADDR/v1/jobs/parse" \
-  -X POST \
-  -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-  -d "{\"JobHCL\": $(echo "$JOB_HCL" | jq -Rs .), \"Canonicalize\": true}" \
-  -H "Content-Type: application/json")
+info "Submitting variableized echo job through nscale /admin/jobs..."
+SUBMIT_PAYLOAD=$(build_submit_payload)
+SUBMIT_RESP=$(curl -sS -w "\n%{http_code}" \
+  -X POST "$NSCALE_ADMIN/admin/jobs" \
+  -H "Content-Type: application/json" \
+  -d "$SUBMIT_PAYLOAD")
+SUBMIT_CODE=$(echo "$SUBMIT_RESP" | tail -1)
+SUBMIT_BODY=$(echo "$SUBMIT_RESP" | sed '$d')
 
-SUBMIT_RESP=$(curl -fsS "$NOMAD_ADDR/v1/jobs" \
-  -X POST \
-  -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-  -d "{\"Job\": $JOB_JSON}" \
-  -H "Content-Type: application/json")
-EVAL_ID=$(echo "$SUBMIT_RESP" | jq -r '.EvalID')
+if [ "$SUBMIT_CODE" != "201" ]; then
+  assert_fail "nscale submission failed (HTTP $SUBMIT_CODE)"
+  echo "$SUBMIT_BODY"
+  exit 1
+fi
 
-if [ -n "$EVAL_ID" ] && [ "$EVAL_ID" != "null" ]; then
-  assert_pass "Job submitted (eval: ${EVAL_ID:0:8})"
+if echo "$SUBMIT_BODY" | jq -e \
+  --arg job_id "$JOB_ID" \
+  --arg service_name "$SERVICE_NAME" \
+  --arg group "$SERVICE_GROUP" '
+  .job_id == $job_id and
+  (.managed_services | length) == 1 and
+  .managed_services[0].job_id == $job_id and
+  .managed_services[0].service_name == $service_name and
+  .managed_services[0].nomad_group == $group and
+  ((.registration_failures // []) | length) == 0
+' >/dev/null; then
+  EVAL_ID=$(echo "$SUBMIT_BODY" | jq -r '.eval_id')
+  assert_pass "nscale submitted the job and auto-registered the managed service (eval: ${EVAL_ID:0:8})"
 else
-  assert_fail "Job submission failed"
+  assert_fail "Unexpected /admin/jobs response payload"
+  echo "$SUBMIT_BODY" | jq .
   exit 1
 fi
 
 # ── Wait for job to be running ────────────────────────────
-info "Waiting for echo-s2z to be running..."
+info "Waiting for ${JOB_ID} to be running..."
 elapsed=0
 while true; do
   if [ "$elapsed" -ge "$WAKE_TIMEOUT" ]; then
@@ -234,10 +270,10 @@ while true; do
 
   STATUS=$(curl -s \
     -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-    "$NOMAD_ADDR/v1/job/echo-s2z" | jq -r '.Status')
+    "$NOMAD_ADDR/v1/job/${JOB_ID}" | jq -r '.Status // "unknown"')
   ALLOCS=$(curl -s \
     -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-    "$NOMAD_ADDR/v1/job/echo-s2z/allocations" \
+    "$NOMAD_ADDR/v1/job/${JOB_ID}/allocations" \
     | jq '[.[] | select(.ClientStatus=="running")] | length')
 
   if [ "$STATUS" = "running" ] && [ "$ALLOCS" -gt 0 ]; then
@@ -249,7 +285,7 @@ done
 assert_pass "Job running (${elapsed}s)"
 
 # ── Wait for healthy in Consul ────────────────────────────
-info "Waiting for echo-s2z to be healthy in Consul..."
+info "Waiting for ${SERVICE_NAME} to be healthy in Consul..."
 elapsed=0
 while true; do
   if [ "$elapsed" -ge "$WAKE_TIMEOUT" ]; then
@@ -259,7 +295,7 @@ while true; do
 
   HEALTHY=$(curl -s \
     -H "X-Consul-Token: $CONSUL_MGMT_TOKEN" \
-    "$CONSUL_ADDR/v1/health/service/echo-s2z?passing=true" | jq 'length')
+    "$CONSUL_ADDR/v1/health/service/${SERVICE_NAME}?passing=true" | jq 'length')
   if [ "$HEALTHY" -gt 0 ]; then
     break
   fi
@@ -268,17 +304,14 @@ while true; do
 done
 assert_pass "Service healthy in Consul (${elapsed}s)"
 
-# ── Register with nscale ──────────────────────────────────
-info "Registering echo-s2z in nscale..."
-REG_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X POST "$NSCALE_ADMIN/admin/registry" \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"echo-s2z","service_name":"echo-s2z","nomad_group":"main"}')
-
-if [ "$REG_CODE" = "201" ] || [ "$REG_CODE" = "409" ]; then
-  assert_pass "Registered in nscale (HTTP $REG_CODE)"
+info "Verifying nscale injected the Traefik service override tag..."
+if curl -s \
+  -H "X-Consul-Token: $CONSUL_MGMT_TOKEN" \
+  "$CONSUL_ADDR/v1/health/service/${SERVICE_NAME}?passing=true" \
+  | jq -e --arg tag "$EXPECTED_TRAEFIK_SERVICE_TAG" 'any(.[]?; ((.Service.Tags // []) | index($tag)) != null)' >/dev/null; then
+  assert_pass "Injected Traefik service tag is present in Consul"
 else
-  assert_fail "Registration failed (HTTP $REG_CODE)"
+  assert_fail "Injected Traefik service tag was not found in Consul"
   exit 1
 fi
 
@@ -288,7 +321,7 @@ header "Phase 4: Test warm-path proxy (service already running)"
 
 info "Sending request through Traefik → nscale (warm path)..."
 WARM_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Host: echo-s2z.localhost" \
+  -H "Host: $HOST_HEADER" \
   --max-time 30 \
   "$NSCALE_PROXY/" 2>/dev/null || echo "000")
 
@@ -312,7 +345,7 @@ while true; do
 
     DEP_STATUS=$(curl -s \
         -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-        "$NOMAD_ADDR/v1/job/echo-s2z/deployments" \
+      "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" \
         | jq -r '.[0].Status // "unknown"')
     if [ "$DEP_STATUS" = "successful" ] || [ "$DEP_STATUS" = "null" ]; then
         break
@@ -323,12 +356,12 @@ while true; do
 done
 assert_pass "Deployment complete (${elapsed}s)"
 
-info "Scaling echo-s2z to 0 (via Nomad API with ACL token)..."
+info "Scaling ${JOB_ID} to 0 (via Nomad API with ACL token)..."
 SCALE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X POST "$NOMAD_ADDR/v1/job/echo-s2z/scale" \
+  -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
   -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"Count": 0, "Target": {"Group": "main"}}')
+  -d "{\"Count\": 0, \"Target\": {\"Group\": \"${SERVICE_GROUP}\"}}")
 
 if [ "$SCALE_RESP" = "200" ]; then
   assert_pass "Scaled job to 0 (HTTP 200)"
@@ -347,7 +380,7 @@ while true; do
 
   RUNNING=$(curl -s \
     -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-    "$NOMAD_ADDR/v1/job/echo-s2z/allocations" \
+    "$NOMAD_ADDR/v1/job/${JOB_ID}/allocations" \
     | jq '[.[] | select(.ClientStatus=="running")] | length')
   if [ "$RUNNING" -eq 0 ]; then
     assert_pass "All allocations stopped (${elapsed}s)"
@@ -364,7 +397,7 @@ sleep 3
 info "Sending wake-on-request through nscale proxy..."
 WAKE_START=$(date +%s)
 WAKE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Host: echo-s2z.localhost" \
+  -H "Host: $HOST_HEADER" \
   --max-time "$WAKE_TIMEOUT" \
   "$NSCALE_PROXY/" 2>/dev/null || echo "000")
 WAKE_END=$(date +%s)
@@ -412,7 +445,7 @@ while true; do
 
   COUNT=$(curl -s \
     -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-    "$NOMAD_ADDR/v1/job/echo-s2z" \
+    "$NOMAD_ADDR/v1/job/${JOB_ID}" \
     | jq '.TaskGroups[0].Count')
 
   if [ "$COUNT" = "0" ]; then
@@ -440,7 +473,7 @@ if $scaled_down; then
   sleep 3
   info "Sending request to re-wake service..."
   REWAKE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Host: echo-s2z.localhost" \
+    -H "Host: $HOST_HEADER" \
     --max-time "$WAKE_TIMEOUT" \
     "$NSCALE_PROXY/" 2>/dev/null || echo "000")
 
