@@ -17,6 +17,8 @@ pub struct Config {
     pub scaling: ScalingConfig,
     pub proxy: ProxyConfig,
     #[serde(default)]
+    pub routing: RoutingConfig,
+    #[serde(default)]
     pub traefik: Option<TraefikConfig>,
 }
 
@@ -88,6 +90,20 @@ pub struct ProxyConfig {
     pub request_buffer_size: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    #[serde(default = "default_file_provider_service")]
+    pub file_provider_service: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            file_provider_service: default_file_provider_service(),
+        }
+    }
+}
+
 impl ProxyConfig {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
@@ -114,6 +130,9 @@ fn default_request_timeout() -> u64 {
 }
 fn default_request_buffer_size() -> usize {
     1000
+}
+fn default_file_provider_service() -> String {
+    "s2z-nscale@file".to_string()
 }
 fn default_traefik_provider() -> String {
     "consulcatalog".to_string()
@@ -146,6 +165,9 @@ impl Default for Config {
                 request_timeout_secs: default_request_timeout(),
                 request_buffer_size: default_request_buffer_size(),
             },
+            routing: RoutingConfig {
+                file_provider_service: default_file_provider_service(),
+            },
             traefik: None,
         }
     }
@@ -175,5 +197,6 @@ mod tests {
         assert_eq!(cfg.scaling.idle_timeout_secs, 300);
         assert_eq!(cfg.scaling.wake_timeout().as_secs(), 60);
         assert_eq!(cfg.proxy.request_timeout().as_secs(), 30);
+        assert_eq!(cfg.routing.file_provider_service, "s2z-nscale@file");
     }
 }

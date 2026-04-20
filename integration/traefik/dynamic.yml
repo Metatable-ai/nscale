@@ -16,9 +16,27 @@ http:
         - http
       service: s2z-nscale
 
+    s2z-fallback-https:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.localhost$`)"
+      priority: 1
+      entryPoints:
+        - https
+      tls: {}
+      service: s2z-nscale
+
   services:
     s2z-nscale:
       loadBalancer:
         passHostHeader: true
         servers:
           - url: "http://nscale:8080"
+
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/server.crt
+      keyFile: /etc/traefik/certs/server.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/server.crt
+        keyFile: /etc/traefik/certs/server.key

@@ -20,6 +20,8 @@ log:
 entryPoints:
   http:
     address: ":80"
+  https:
+    address: ":443"
   metrics:
     address: ":8082"
 
@@ -36,7 +38,9 @@ providers:
     watch: true
     refreshInterval: 1s
     defaultRule: "Host(`{{ .Name }}.localhost`)"
-    strictChecks: true
+    strictChecks:
+      - "passing"
+      - "warning"
 
 serversTransport:
   forwardingTimeouts:

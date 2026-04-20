@@ -143,9 +143,11 @@ services:
     ports:
       - "8080:8080"
       - "80:80"
+      - "443:443"
     volumes:
       - bootstrap:/bootstrap:ro
       - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./traefik/certs:/etc/traefik/certs:ro
       - ./acl/scripts:/scripts:ro
     environment:
       BOOTSTRAP_DIR: /bootstrap

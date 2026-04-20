@@ -1,4 +1,12 @@
-job "echo-s2z" {
+variable "service_name" {
+  type = string
+}
+
+variable "host_name" {
+  type = string
+}
+
+job "echo-submit-job" {
   datacenters = ["dc1"]
   type        = "service"
 
@@ -18,7 +26,7 @@ job "echo-s2z" {
       }
       config {
         command = "/bin/sh"
-        args    = ["-c", "mkdir -p /tmp/echo-www && echo 'Hello from scale-to-zero echo service!' > /tmp/echo-www/index.html"]
+        args    = ["-c", "mkdir -p /tmp/echo-submit-www && echo 'Hello from admin-submitted echo service!' > /tmp/echo-submit-www/index.html"]
       }
       resources {
         cpu    = 1
@@ -31,7 +39,7 @@ job "echo-s2z" {
 
       config {
         command = "/bin/busybox"
-        args    = ["httpd", "-f", "-p", "${NOMAD_PORT_http}", "-h", "/tmp/echo-www"]
+        args    = ["httpd", "-f", "-p", "${NOMAD_PORT_http}", "-h", "/tmp/echo-submit-www"]
       }
 
       resources {
@@ -40,17 +48,16 @@ job "echo-s2z" {
       }
 
       service {
-        name         = "echo-s2z"
+        name         = var.service_name
         provider     = "consul"
         port         = "http"
         address_mode = "host"
 
         tags = [
           "traefik.enable=true",
-          "traefik.http.routers.echo-s2z.rule=Host(`echo-s2z.localhost`)",
-          "traefik.http.routers.echo-s2z.entryPoints=http,https",
-          "traefik.http.routers.echo-s2z.tls=true",
-          "traefik.http.routers.echo-s2z.service=s2z-nscale@file",
+          "traefik.http.routers.${var.service_name}.rule=Host(`${var.host_name}`)",
+          "traefik.http.routers.${var.service_name}.entryPoints=http,https",
+          "traefik.http.routers.${var.service_name}.tls=true",
         ]
 
         check {

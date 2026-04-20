@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+/// Request body for POST /v1/jobs/parse.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ParseJobRequest {
+    #[serde(rename = "JobHCL")]
+    pub job_hcl: String,
+    pub canonicalize: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<String>,
+}
+
+/// Request body for POST /v1/jobs.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct JobSubmitRequest<'a> {
+    pub job: &'a serde_json::Value,
+}
+
+/// Response from POST /v1/jobs.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct JobSubmitResponse {
+    #[serde(rename = "EvalID")]
+    pub eval_id: String,
+    #[serde(default)]
+    pub job_modify_index: u64,
+    #[serde(default)]
+    pub warnings: Option<String>,
+}
+
 /// Request body for PUT /v1/job/{id}/scale.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
