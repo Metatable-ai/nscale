@@ -23,11 +23,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.acl.yml"
 JOB_FILE="$SCRIPT_DIR/jobs/echo-submit.nomad"
+TRAEFIK_CERT_SCRIPT="$SCRIPT_DIR/traefik/certs/generate.sh"
 
 NOMAD_ADDR="http://localhost:4646"
 CONSUL_ADDR="http://localhost:8500"
 NSCALE_PROXY="http://localhost:80"
 NSCALE_ADMIN="http://localhost:9090"
+HTTPS_RESOLVE_ADDR="${HTTPS_RESOLVE_ADDR:-127.0.0.1}"
 
 JOB_ID="echo-submit-job"
 SERVICE_NAME="${SERVICE_NAME:-echo-s2z}"
@@ -58,6 +60,22 @@ pass()   { echo -e "${GREEN}✓ $1${NC}"; }
 fail()   { echo -e "${RED}✗ $1${NC}"; }
 info()   { echo -e "${YELLOW}→ $1${NC}"; }
 header() { echo -e "\n${CYAN}══ $1 ══${NC}"; }
+
+request_http_code() {
+  local max_time="${1:-30}"
+  curl -s -o /dev/null -w "%{http_code}" \
+    -H "Host: $HOST_HEADER" \
+    --max-time "$max_time" \
+    "$NSCALE_PROXY/" 2>/dev/null || echo "000"
+}
+
+request_https_code() {
+  local max_time="${1:-30}"
+  curl -k -s -o /dev/null -w "%{http_code}" \
+    --resolve "${HOST_HEADER}:443:${HTTPS_RESOLVE_ADDR}" \
+    --max-time "$max_time" \
+    "https://${HOST_HEADER}/" 2>/dev/null || echo "000"
+}
 
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -101,7 +119,7 @@ header "Phase 0: Preflight"
 # ══════════════════════════════════════════════════════════
 
 info "Checking prerequisites..."
-for cmd in docker curl jq; do
+for cmd in docker curl jq openssl; do
   if ! command -v "$cmd" &>/dev/null; then
     assert_fail "Required command '$cmd' not found"
     exit 1
@@ -115,6 +133,10 @@ if grep -Eq 'traefik\.http\.routers\..*\.service=s2z-nscale@file' "$JOB_FILE"; t
   exit 1
 fi
 assert_pass "Submit fixture requires nscale tag injection"
+
+info "Ensuring local Traefik TLS certificates exist..."
+bash "$TRAEFIK_CERT_SCRIPT"
+assert_pass "Traefik TLS certificates ready"
 
 # ══════════════════════════════════════════════════════════
 header "Phase 1: Start ACL-enabled infrastructure"
@@ -320,15 +342,21 @@ header "Phase 4: Test warm-path proxy (service already running)"
 # ══════════════════════════════════════════════════════════
 
 info "Sending request through Traefik → nscale (warm path)..."
-WARM_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Host: $HOST_HEADER" \
-  --max-time 30 \
-  "$NSCALE_PROXY/" 2>/dev/null || echo "000")
+WARM_RESP=$(request_http_code 30)
 
 if [ "$WARM_RESP" = "200" ]; then
-  assert_pass "Warm-path request succeeded (HTTP 200)"
+  assert_pass "HTTP warm-path request succeeded (HTTP 200)"
 else
-  assert_fail "Warm-path request failed (HTTP $WARM_RESP)"
+  assert_fail "HTTP warm-path request failed (HTTP $WARM_RESP)"
+fi
+
+info "Sending HTTPS request through Traefik → nscale (warm path)..."
+WARM_TLS_RESP=$(request_https_code 30)
+
+if [ "$WARM_TLS_RESP" = "200" ]; then
+  assert_pass "HTTPS warm-path request succeeded (HTTP 200)"
+else
+  assert_fail "HTTPS warm-path request failed (HTTP $WARM_TLS_RESP)"
 fi
 
 # ══════════════════════════════════════════════════════════
@@ -394,19 +422,16 @@ done
 sleep 3
 
 # ── Wake-on-request: request should trigger scale-up ──────
-info "Sending wake-on-request through nscale proxy..."
+info "Sending HTTPS wake-on-request through nscale proxy..."
 WAKE_START=$(date +%s)
-WAKE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Host: $HOST_HEADER" \
-  --max-time "$WAKE_TIMEOUT" \
-  "$NSCALE_PROXY/" 2>/dev/null || echo "000")
+WAKE_RESP=$(request_https_code "$WAKE_TIMEOUT")
 WAKE_END=$(date +%s)
 WAKE_LATENCY=$((WAKE_END - WAKE_START))
 
 if [ "$WAKE_RESP" = "200" ]; then
-  assert_pass "Wake-on-request succeeded (HTTP 200, ${WAKE_LATENCY}s)"
+  assert_pass "HTTPS wake-on-request succeeded (HTTP 200, ${WAKE_LATENCY}s)"
 else
-  assert_fail "Wake-on-request failed (HTTP $WAKE_RESP, ${WAKE_LATENCY}s)"
+  assert_fail "HTTPS wake-on-request failed (HTTP $WAKE_RESP, ${WAKE_LATENCY}s)"
   info "nscale logs:"
   docker compose -f "$COMPOSE_FILE" logs nscale --tail=20
 fi
@@ -418,9 +443,12 @@ header "Phase 6: Verify nscale uses scoped tokens (not mgmt)"
 info "Checking nscale logs for token-related errors..."
 NSCALE_LOGS=$(docker compose -f "$COMPOSE_FILE" logs nscale 2>/dev/null)
 
-if echo "$NSCALE_LOGS" | grep -qi "permission denied\|403\|ACL token not found"; then
+ACL_ERROR_PATTERN='permission denied|forbidden|ACL token not found|status code[[:space:]:=]*403|HTTP 403|response status[^0-9]*403|acl[^[:cntrl:]]*(denied|forbidden)'
+ACL_ERROR_LINES=$(echo "$NSCALE_LOGS" | grep -Ei "$ACL_ERROR_PATTERN" || true)
+
+if [ -n "$ACL_ERROR_LINES" ]; then
   assert_fail "nscale encountered ACL permission errors"
-  echo "$NSCALE_LOGS" | grep -i "permission denied\|403\|ACL token" | tail -5
+  echo "$ACL_ERROR_LINES" | tail -5
 else
   assert_pass "nscale has no ACL permission errors in logs"
 fi
@@ -471,16 +499,13 @@ header "Phase 8: Re-wake after scale-down"
 
 if $scaled_down; then
   sleep 3
-  info "Sending request to re-wake service..."
-  REWAKE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Host: $HOST_HEADER" \
-    --max-time "$WAKE_TIMEOUT" \
-    "$NSCALE_PROXY/" 2>/dev/null || echo "000")
+  info "Sending HTTP request to re-wake service..."
+  REWAKE_RESP=$(request_http_code "$WAKE_TIMEOUT")
 
   if [ "$REWAKE_RESP" = "200" ]; then
-    assert_pass "Re-wake after scale-down succeeded (HTTP 200)"
+    assert_pass "HTTP re-wake after scale-down succeeded (HTTP 200)"
   else
-    assert_fail "Re-wake failed (HTTP $REWAKE_RESP)"
+    assert_fail "HTTP re-wake failed (HTTP $REWAKE_RESP)"
     info "nscale logs:"
     docker compose -f "$COMPOSE_FILE" logs nscale --tail=20
   fi

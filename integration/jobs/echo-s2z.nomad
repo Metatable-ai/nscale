@@ -48,7 +48,8 @@ job "echo-s2z" {
         tags = [
           "traefik.enable=true",
           "traefik.http.routers.echo-s2z.rule=Host(`echo-s2z.localhost`)",
-          "traefik.http.routers.echo-s2z.entryPoints=http",
+          "traefik.http.routers.echo-s2z.entryPoints=http,https",
+          "traefik.http.routers.echo-s2z.tls=true",
           "traefik.http.routers.echo-s2z.service=s2z-nscale@file",
         ]
 

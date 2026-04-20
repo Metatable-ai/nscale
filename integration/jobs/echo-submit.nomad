@@ -56,7 +56,8 @@ job "echo-submit-job" {
         tags = [
           "traefik.enable=true",
           "traefik.http.routers.${var.service_name}.rule=Host(`${var.host_name}`)",
-          "traefik.http.routers.${var.service_name}.entryPoints=http",
+          "traefik.http.routers.${var.service_name}.entryPoints=http,https",
+          "traefik.http.routers.${var.service_name}.tls=true",
         ]
 
         check {

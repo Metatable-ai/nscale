@@ -73,6 +73,19 @@ Then it injects or overrides:
 The exact target is configurable through `routing.file_provider_service` or
 `NSCALE_ROUTING__FILE_PROVIDER_SERVICE`.
 
+`nscale` does **not** strip or rewrite HTTPS-related router tags. Jobs like the following are
+supported as-is:
+
+- `traefik.http.routers.api.entryPoints=http,https`
+- `traefik.http.routers.api.tls=true`
+
+That means `nscale` keeps your edge-TLS intent intact and only rewires the router target back to
+the file-provider service.
+
+> Important: Traefik still needs an HTTPS fallback router pointing at `s2z-nscale` for cold-path
+> TLS requests. The repository integration stack and hybrid Kubernetes setup now include that by
+> default.
+
 ## Service requirements
 
 A service is managed by `/admin/jobs` only when all of the following are true:
@@ -189,4 +202,4 @@ The main Docker integration test verifies that `/admin/jobs`:
 - injects the Traefik service override tag
 - auto-registers the service
 - works when `service_name != job_id`
-- still supports wake-on-request and scale-to-zero
+- still supports wake-on-request and scale-to-zero over both HTTP and HTTPS

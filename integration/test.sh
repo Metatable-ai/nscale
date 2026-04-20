@@ -19,11 +19,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 JOB_FILE="$SCRIPT_DIR/jobs/echo-submit.nomad"
+TRAEFIK_CERT_SCRIPT="$SCRIPT_DIR/traefik/certs/generate.sh"
 
 NOMAD_ADDR="http://localhost:4646"
 CONSUL_ADDR="http://localhost:8500"
 NSCALE_PROXY="http://localhost:80"
 NSCALE_ADMIN="http://localhost:9090"
+HTTPS_RESOLVE_ADDR="${HTTPS_RESOLVE_ADDR:-127.0.0.1}"
 
 JOB_ID="echo-submit-job"
 SERVICE_NAME="${SERVICE_NAME:-echo-s2z}"
@@ -45,6 +47,19 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}✓ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; }
 info() { echo -e "${YELLOW}→ $1${NC}"; }
+
+request_http() {
+    local max_time="${1:-30}"
+    curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY/" --max-time "$max_time"
+}
+
+request_https() {
+    local max_time="${1:-30}"
+    curl -k -s -w "\n%{http_code}" \
+        --resolve "${HOST_HEADER}:443:${HTTPS_RESOLVE_ADDR}" \
+        "https://${HOST_HEADER}/" \
+        --max-time "$max_time"
+}
 
 cleanup() {
     info "Cleaning up..."
@@ -68,7 +83,7 @@ trap cleanup EXIT
 
 # ── 0. Preflight ──────────────────────────────────────────
 info "Checking prerequisites..."
-for cmd in docker curl jq; do
+for cmd in docker curl jq openssl; do
     if ! command -v "$cmd" &>/dev/null; then
         fail "Required command '$cmd' not found"
         exit 1
@@ -82,6 +97,10 @@ if grep -Eq 'traefik\.http\.routers\..*\.service=s2z-nscale@file' "$JOB_FILE"; t
     exit 1
 fi
 pass "Submit fixture requires nscale tag injection"
+
+info "Ensuring local Traefik TLS certificates exist..."
+bash "$TRAEFIK_CERT_SCRIPT"
+pass "Traefik TLS certificates ready"
 
 # ── 1. Start infrastructure ──────────────────────────────
 info "Starting infrastructure via docker compose..."
@@ -201,16 +220,29 @@ else
 fi
 
 # ── 3. Request through nscale proxy (warm path) ──────────
-info "Making first request through nscale proxy..."
-RESP=$(curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY/" --max-time 30)
+info "Making first HTTP request through nscale proxy..."
+RESP=$(request_http 30)
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 
 if [ "$HTTP_CODE" = "200" ]; then
-    pass "First request succeeded: HTTP $HTTP_CODE — $BODY"
+    pass "HTTP warm-path request succeeded: HTTP $HTTP_CODE — $BODY"
 else
-    fail "First request failed: HTTP $HTTP_CODE — $BODY"
+    fail "HTTP warm-path request failed: HTTP $HTTP_CODE — $BODY"
     docker compose -f "$COMPOSE_FILE" logs nscale
+    exit 1
+fi
+
+info "Making first HTTPS request through nscale proxy..."
+RESP_TLS=$(request_https 30)
+HTTP_CODE_TLS=$(echo "$RESP_TLS" | tail -1)
+BODY_TLS=$(echo "$RESP_TLS" | sed '$d')
+
+if [ "$HTTP_CODE_TLS" = "200" ]; then
+    pass "HTTPS warm-path request succeeded: HTTP $HTTP_CODE_TLS — $BODY_TLS"
+else
+    fail "HTTPS warm-path request failed: HTTP $HTTP_CODE_TLS — $BODY_TLS"
+    docker compose -f "$COMPOSE_FILE" logs traefik nscale
     exit 1
 fi
 
@@ -267,15 +299,15 @@ JOB_COUNT=$(curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}" | jq '.TaskGroups[0].Count')
 info "Nomad job count for ${JOB_ID}: $JOB_COUNT"
 
 # ── 5. Request through nscale proxy (should wake again) ──
-info "Making second request through nscale proxy (should trigger wake-up)..."
-info "This will wake the job from zero — may take up to ${WAKE_TIMEOUT}s..."
+info "Making second HTTPS request through nscale proxy (should trigger wake-up)..."
+info "This will wake the job from zero over TLS — may take up to ${WAKE_TIMEOUT}s..."
 
-RESP2=$(curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY/" --max-time "$WAKE_TIMEOUT")
+RESP2=$(request_https "$WAKE_TIMEOUT")
 HTTP_CODE2=$(echo "$RESP2" | tail -1)
 BODY2=$(echo "$RESP2" | sed '$d')
 
 if [ "$HTTP_CODE2" = "200" ]; then
-    pass "Second request succeeded (wake-up!): HTTP $HTTP_CODE2 — $BODY2"
+    pass "HTTPS wake-up request succeeded: HTTP $HTTP_CODE2 — $BODY2"
 else
     info "Got HTTP $HTTP_CODE2 on wake attempt. Checking state..."
 
@@ -301,20 +333,20 @@ else
             elapsed=$((elapsed + 2))
         done
 
-        RESP3=$(curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY/" --max-time 30)
+        RESP3=$(request_https 30)
         HTTP_CODE3=$(echo "$RESP3" | tail -1)
         BODY3=$(echo "$RESP3" | sed '$d')
 
         if [ "$HTTP_CODE3" = "200" ]; then
-            pass "Retry request succeeded: HTTP $HTTP_CODE3 — $BODY3"
+            pass "HTTPS retry request succeeded: HTTP $HTTP_CODE3 — $BODY3"
         else
             fail "Retry request also failed: HTTP $HTTP_CODE3 — $BODY3"
-            docker compose -f "$COMPOSE_FILE" logs nscale
+            docker compose -f "$COMPOSE_FILE" logs traefik nscale
             exit 1
         fi
     else
         fail "Job was not scaled up by nscale"
-        docker compose -f "$COMPOSE_FILE" logs nscale
+        docker compose -f "$COMPOSE_FILE" logs traefik nscale
         exit 1
     fi
 fi
@@ -367,8 +399,8 @@ echo "Verified:"
 echo "  1. Infrastructure starts correctly (Redis, Consul, Nomad, Traefik, nscale)"
 echo "  2. nscale accepts HCL + variables at /admin/jobs and submits to Nomad"
 echo "  3. nscale injects the Traefik router service override and auto-registers the service"
-echo "  4. Proxy lookup works when service_name (${SERVICE_NAME}) differs from job_id (${JOB_ID})"
-echo "  5. nscale wakes the dormant job on incoming request"
+echo "  4. HTTP and HTTPS proxy lookup both work when service_name (${SERVICE_NAME}) differs from job_id (${JOB_ID})"
+echo "  5. nscale wakes the dormant job on incoming HTTPS request"
 if $scaled_down; then
     echo "  6. Automatic scale-down after idle timeout"
 fi

@@ -13,14 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added HTTPS support in the local Traefik integration and hybrid Kubernetes stacks by exposing `:443`, loading a local self-signed certificate for `localhost` / `*.localhost`, and adding TLS-aware fallback routers so dormant services can still wake on HTTPS requests.
+- Added HTTPS coverage to the end-to-end integration scripts (`integration/test.sh`, `integration/test-acl.sh`, and `nscale-kubernetes/test-hybrid.sh`) so both warm-path routing and cold-start wake-up are exercised over TLS.
 
 ### Changed
+- Updated the sample submit fixtures and echo job fixtures to advertise `entryPoints=http,https` with `tls=true`, matching production-style Traefik job tags while still routing through `s2z-nscale@file`.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+- Fixed the cold HTTPS path where Traefik previously returned `404` for dormant services because the file-provider fallback route only existed on the plain `http` entrypoint.
 
 ### Security
 

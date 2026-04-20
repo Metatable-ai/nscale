@@ -159,6 +159,7 @@ The integration stack brings up Nomad, Consul, Redis, Traefik, and nscale:
 
 ```bash
 cd integration
+bash traefik/certs/generate.sh
 docker compose up -d
 ```
 
@@ -178,6 +179,9 @@ Send a request — nscale wakes the service and proxies the response:
 
 ```bash
 curl -H "Host: echo-s2z.localhost" http://localhost:80/
+
+# HTTPS works too (Traefik terminates TLS; -k accepts the local self-signed cert)
+curl -k --resolve 'echo-s2z.localhost:443:127.0.0.1' https://echo-s2z.localhost/
 ```
 
 ### Build from source
@@ -288,13 +292,42 @@ http:
       entryPoints: [http]
       service: s2z-nscale
 
+    s2z-fallback-https:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.localhost$`)"
+      priority: 1
+      entryPoints: [https]
+      tls: {}
+      service: s2z-nscale
+
   services:
     s2z-nscale:
       loadBalancer:
         passHostHeader: true
         servers:
           - url: "http://nscale:8080"
+
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/server.crt
+      keyFile: /etc/traefik/certs/server.key
 ```
+
+### TLS / HTTPS
+
+`nscale` itself still speaks plain HTTP on the inside. HTTPS support is provided by
+**Traefik TLS termination**:
+
+- clients connect to Traefik on `:443`
+- Traefik terminates TLS and forwards to `http://nscale:8080`
+- `nscale` still proxies to plain-HTTP Nomad allocations unless your deployment adds a separate upstream TLS layer
+
+For cold-start over HTTPS to work, every TLS entrypoint must also have a fallback file-provider
+router pointing at `s2z-nscale`. Otherwise warm traffic may work while cold HTTPS requests return
+Traefik `404` before `nscale` can wake the job.
+
+The integration stack ships a local self-signed certificate for `localhost` / `*.localhost` via
+`integration/traefik/certs/generate.sh`. Production deployments should replace that with their own
+certificate or ACME resolver setup.
 
 ### Nomad job tags
 
@@ -314,7 +347,8 @@ service {
   tags = [
     "traefik.enable=true",
     "traefik.http.routers.my-service.rule=Host(`my-service.localhost`)",
-    "traefik.http.routers.my-service.entryPoints=http",
+    "traefik.http.routers.my-service.entryPoints=http,https",
+    "traefik.http.routers.my-service.tls=true",
     "traefik.http.routers.my-service.service=s2z-nscale@file",
   ]
 
@@ -348,6 +382,10 @@ The endpoint only manages services that:
 
 - set `traefik.enable=true`
 - include at least one explicit router tag like `traefik.http.routers.api.rule=...`
+
+Router TLS tags such as `traefik.http.routers.api.entryPoints=http,https` and
+`traefik.http.routers.api.tls=true` are preserved exactly as submitted. `nscale` only injects
+or overrides the `.service=s2z-nscale@file` target.
 
 Non-Traefik services are ignored. Traefik-enabled services without explicit router tags are rejected,
 because nscale has no router name to target for the injected `.service=` override.
