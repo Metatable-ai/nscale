@@ -259,6 +259,38 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_TRAEFIK__METRICS_URL` | — | Traefik Prometheus endpoint (enables traffic probe) |
 | `NSCALE_TRAEFIK__PROVIDER` | — | Traefik provider name for metric labels |
 | `RUST_LOG` | `info,nscale=debug` | Tracing filter |
+| `NSCALE_LOG_FORMAT` | auto | Log output format: `compact`, `pretty`, or `json` (see below) |
+
+## Logging
+
+nscale uses [`tracing-subscriber`](https://docs.rs/tracing-subscriber) for structured logging.
+Filter verbosity with `RUST_LOG` and control the output format with `NSCALE_LOG_FORMAT`.
+
+### Log formats
+
+| Value | Description | Typical use |
+|-------|-------------|-------------|
+| `compact` | Plain text, no ANSI colour codes | Docker / Kubernetes / any non-TTY environment |
+| `pretty` | Human-friendly output with ANSI colour | Interactive local development |
+| `json` | One JSON object per log line | Log aggregators (Loki, CloudWatch, Datadog, …) |
+
+When `NSCALE_LOG_FORMAT` is not set nscale **auto-detects** the right default:
+
+- stdout is a TTY → `pretty` (coloured output for the terminal)
+- stdout is not a TTY → `compact` (plain text, safe for container runtimes)
+
+**Examples**
+
+```sh
+# Plain text for a Docker Compose deployment (also the automatic default):
+NSCALE_LOG_FORMAT=compact docker compose up
+
+# JSON for a Kubernetes deployment that ships logs to Loki:
+NSCALE_LOG_FORMAT=json ./nscale
+
+# Coloured output forced on even when piped:
+NSCALE_LOG_FORMAT=pretty ./nscale 2>&1 | tee nscale.log
+```
 
 ## Traefik Integration
 

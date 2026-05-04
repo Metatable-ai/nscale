@@ -36,10 +36,49 @@ use nscale_waker::coordinator::WakeCoordinator;
 #[tokio::main]
 async fn main() {
     // ── Tracing ──────────────────────────────────────────
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,nscale=debug".into()))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    //
+    // Log format is controlled by the `NSCALE_LOG_FORMAT` environment variable:
+    //   compact  – plain text, no ANSI escape codes (default when stdout is not a TTY)
+    //   pretty   – human-friendly with ANSI colour (default when stdout is a TTY)
+    //   json     – structured JSON, suitable for log aggregators (Loki, CloudWatch, …)
+    {
+        use std::io::IsTerminal as _;
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,nscale=debug".into());
+
+        // Resolve the env var once so we can borrow it as &str.
+        let format_var = std::env::var("NSCALE_LOG_FORMAT").ok();
+        let log_format = format_var.as_deref().unwrap_or_else(|| {
+            if std::io::stdout().is_terminal() {
+                "pretty"
+            } else {
+                "compact"
+            }
+        });
+        let unknown_format = !matches!(log_format, "compact" | "pretty" | "json");
+
+        match log_format {
+            "json" => tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .init(),
+            "pretty" => tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init(),
+            _ => tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).compact())
+                .init(),
+        }
+
+        if unknown_format {
+            tracing::warn!(
+                value = log_format,
+                "unrecognised NSCALE_LOG_FORMAT value; defaulting to compact (valid values: compact, pretty, json)"
+            );
+        }
+    }
 
     info!("nscale — Nomad Scale-to-Zero starting");
 
