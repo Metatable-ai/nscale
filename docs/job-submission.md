@@ -7,7 +7,7 @@ The `/admin/jobs` endpoint is the preferred path when you want `nscale` to own t
 1. parse Nomad HCL with optional variables
 2. inject the Traefik router service override required for warm-path routing through `nscale`
 3. submit the mutated job to Nomad
-4. auto-register every managed service in Redis
+4. auto-register every managed service in Redis, and in etcd when durable registry mode is enabled
 5. seed activity so the scaler can safely detect future idleness
 
 ## Why use `/admin/jobs`
@@ -20,6 +20,12 @@ Without it, operators have to do two things correctly every time:
 - call `/admin/registry` or `/admin/registry/sync` so `nscale` can wake and scale the job later
 
 With `/admin/jobs`, `nscale` does both automatically.
+
+When durable registry mode is enabled, that automatic registration becomes durable-first:
+
+- write the registration to etcd
+- refresh the Redis cache from the durable result
+- repopulate Redis on cache miss if a replica needs to read through later
 
 ## Request format
 
@@ -128,6 +134,9 @@ That registration is used by:
 This is especially important when `service_name` differs from `job_id`.
 The updated registry path supports both lookup modes.
 
+If durable registry mode is enabled, the same `JobRegistration` is also persisted in etcd so
+another replica can recover the cache later without manual per-job re-registration.
+
 ## Response shape
 
 Successful responses return the submitted Nomad evaluation data plus the services that were managed:
@@ -195,6 +204,8 @@ The repository now covers this flow in both environments:
 - `integration/test.sh`
 - `integration/test-acl.sh`
 - `nscale-kubernetes/test-hybrid.sh`
+- `integration/test-durable.sh`
+- `integration/test-durable-multi-replica.sh`
 
 The main Docker integration test verifies that `/admin/jobs`:
 
@@ -203,3 +214,9 @@ The main Docker integration test verifies that `/admin/jobs`:
 - auto-registers the service
 - works when `service_name != job_id`
 - still supports wake-on-request and scale-to-zero over both HTTP and HTTPS
+
+The durable integration tests verify that:
+
+- registrations survive Redis cache loss when etcd is available
+- a second nscale replica can read through to etcd and repopulate Redis
+- service lookup still works when `service_name != job_id`

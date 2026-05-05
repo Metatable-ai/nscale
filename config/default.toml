@@ -22,5 +22,11 @@ min_scale_down_age_secs = 120
 request_timeout_secs = 30
 request_buffer_size = 1000
 
+[default.registry]
+durable_enabled = false
+etcd_endpoints = "http://localhost:2379"
+etcd_key_prefix = "/nscale/registrations"
+etcd_watch_backoff_secs = 5
+
 [default.routing]
 file_provider_service = "s2z-nscale@file"

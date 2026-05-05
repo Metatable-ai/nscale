@@ -17,6 +17,8 @@ pub struct Config {
     pub scaling: ScalingConfig,
     pub proxy: ProxyConfig,
     #[serde(default)]
+    pub registry: RegistryConfig,
+    #[serde(default)]
     pub routing: RoutingConfig,
     #[serde(default)]
     pub traefik: Option<TraefikConfig>,
@@ -41,6 +43,18 @@ pub struct ConsulConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
     pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    #[serde(default)]
+    pub durable_enabled: bool,
+    #[serde(default = "default_etcd_endpoints")]
+    pub etcd_endpoints: String,
+    #[serde(default = "default_etcd_key_prefix")]
+    pub etcd_key_prefix: String,
+    #[serde(default = "default_etcd_watch_backoff")]
+    pub etcd_watch_backoff_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +118,17 @@ impl Default for RoutingConfig {
     }
 }
 
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            durable_enabled: false,
+            etcd_endpoints: default_etcd_endpoints(),
+            etcd_key_prefix: default_etcd_key_prefix(),
+            etcd_watch_backoff_secs: default_etcd_watch_backoff(),
+        }
+    }
+}
+
 impl ProxyConfig {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
@@ -130,6 +155,15 @@ fn default_request_timeout() -> u64 {
 }
 fn default_request_buffer_size() -> usize {
     1000
+}
+fn default_etcd_endpoints() -> String {
+    "http://localhost:2379".to_string()
+}
+fn default_etcd_key_prefix() -> String {
+    "/nscale/registrations".to_string()
+}
+fn default_etcd_watch_backoff() -> u64 {
+    5
 }
 fn default_file_provider_service() -> String {
     "s2z-nscale@file".to_string()
@@ -165,6 +199,7 @@ impl Default for Config {
                 request_timeout_secs: default_request_timeout(),
                 request_buffer_size: default_request_buffer_size(),
             },
+            registry: RegistryConfig::default(),
             routing: RoutingConfig {
                 file_provider_service: default_file_provider_service(),
             },
@@ -197,6 +232,8 @@ mod tests {
         assert_eq!(cfg.scaling.idle_timeout_secs, 300);
         assert_eq!(cfg.scaling.wake_timeout().as_secs(), 60);
         assert_eq!(cfg.proxy.request_timeout().as_secs(), 30);
+        assert!(!cfg.registry.durable_enabled);
+        assert_eq!(cfg.registry.etcd_endpoints, "http://localhost:2379");
         assert_eq!(cfg.routing.file_provider_service, "s2z-nscale@file");
     }
 }

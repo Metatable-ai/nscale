@@ -1,0 +1,56 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    networks: [nscale-net]
+    environment:
+      ETCDCTL_API: "3"
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-1
+      - --data-dir=/etcd-data
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd-1=http://etcd:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  nscale:
+    environment:
+      NSCALE_REGISTRY__DURABLE_ENABLED: "true"
+      NSCALE_REGISTRY__ETCD_ENDPOINTS: "http://etcd:2379"
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  nscale-2:
+    image: integration-nscale:latest
+    networks: [nscale-net]
+    ports:
+      - "18080:8080"
+      - "19090:9090"
+    volumes:
+      - ./config/:/app/config/:ro
+    environment:
+      RUST_LOG: info,nscale=debug
+      NSCALE_REGISTRY__DURABLE_ENABLED: "true"
+      NSCALE_REGISTRY__ETCD_ENDPOINTS: "http://etcd:2379"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy

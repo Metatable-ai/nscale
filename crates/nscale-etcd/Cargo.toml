@@ -1,15 +1,15 @@
 [package]
-name = "nscale-core"
+name = "nscale-etcd"
 version = "2.1.0"
 edition = "2024"
 
 [dependencies]
+nscale-core = { path = "../nscale-core" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 async-trait = { workspace = true }
-figment = { workspace = true }
-reqwest = { workspace = true }
+etcd-client = "0.18"
 futures-core = "0.3"
+futures-util = "0.3"

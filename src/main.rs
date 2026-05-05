@@ -21,6 +21,7 @@ use nscale_core::error::NscaleError;
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::{JobId, JobRegistration};
 use nscale_core::traits::ActivityStore;
+use nscale_etcd::EtcdClient;
 use nscale_nomad::client::NomadClient;
 use nscale_nomad::events::{EventStreamConfig, start_event_stream};
 use nscale_nomad::job_mutator::inject_nscale_tags;
@@ -110,7 +111,46 @@ async fn main() {
     };
     let redis_client = activity_store.client().clone();
     let activity_store: Arc<dyn ActivityStore> = Arc::new(activity_store);
-    let registry = Arc::new(JobRegistry::new(redis_client));
+
+    let registry = if config.registry.durable_enabled {
+        let endpoints = config
+            .registry
+            .etcd_endpoints
+            .split(',')
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        if endpoints.is_empty() {
+            error!(
+                "durable registry enabled but registry.etcd_endpoints (NSCALE_REGISTRY__ETCD_ENDPOINTS) is empty"
+            );
+            std::process::exit(1);
+        }
+
+        let durable_registry = Arc::new(
+            EtcdClient::new(endpoints, config.registry.etcd_key_prefix.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    error!(error = %e, "failed to connect to etcd durable registry");
+                    std::process::exit(1);
+                }),
+        );
+
+        let registry = Arc::new(JobRegistry::with_durable(redis_client, durable_registry));
+        match registry.sync_from_durable().await {
+            Ok(restored) => {
+                info!(restored, "hydrated Redis registry cache from etcd");
+            }
+            Err(e) => {
+                error!(error = %e, "failed to hydrate Redis registry cache from etcd");
+            }
+        }
+        registry
+    } else {
+        Arc::new(JobRegistry::new(redis_client))
+    };
     info!("connected to Redis");
 
     // ── Build subsystems ─────────────────────────────────

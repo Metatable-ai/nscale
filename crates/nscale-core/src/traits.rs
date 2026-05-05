@@ -1,9 +1,11 @@
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_core::Stream;
 
 use crate::error::Result;
-use crate::job::{Endpoint, JobId, ServiceName};
+use crate::job::{Endpoint, JobId, JobRegistration, ServiceName};
 
 /// Abstraction over a job orchestrator (Nomad).
 #[async_trait]
@@ -64,4 +66,38 @@ pub trait ActivityStore: Send + Sync {
 
     /// Remove activity tracking for a job (after scale-down).
     async fn remove_activity(&self, job_id: &JobId) -> Result<()>;
+}
+
+/// Change notification emitted by a durable registration store.
+#[derive(Debug, Clone)]
+pub enum RegistrationEvent {
+    Upsert(JobRegistration),
+    Remove(JobRegistration),
+}
+
+/// Abstraction over a durable registration store.
+#[async_trait]
+pub trait DurableRegistry: Send + Sync {
+    /// Store or update a job registration durably.
+    async fn store_registration(&self, reg: &JobRegistration) -> Result<()>;
+
+    /// Remove a registration from durable storage.
+    async fn remove_registration(&self, job_id: &JobId) -> Result<()>;
+
+    /// Look up a registration by job id.
+    async fn get_by_job_id(&self, job_id: &JobId) -> Result<Option<JobRegistration>>;
+
+    /// Look up a registration by service name.
+    async fn get_by_service_name(
+        &self,
+        service_name: &ServiceName,
+    ) -> Result<Option<JobRegistration>>;
+
+    /// List all current registrations.
+    async fn list_all(&self) -> Result<Vec<JobRegistration>>;
+
+    /// Watch for registration changes.
+    async fn watch_registrations(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = RegistrationEvent> + Send>>>;
 }

@@ -23,7 +23,8 @@ graph LR
     nscale -->|proxy| Backend["Nomad job<br/>(healthy allocation)"]
     nscale -->|scale up| Nomad
     nscale -->|health poll| Consul
-    nscale -->|activity + registry| Redis
+    nscale -->|activity + cache| Redis
+    nscale -->|durable registry| Etcd[(etcd)]
 
     Nomad -->|registers service| Consul
     Consul -->|service discovery| Traefik
@@ -122,7 +123,8 @@ flowchart TD
 | `nscale-core` | Shared types, config (Figment), traits, `InFlightTracker` |
 | `nscale-nomad` | Nomad API client — scale up/down, event stream |
 | `nscale-consul` | Consul catalog — health checks, service discovery |
-| `nscale-store` | Redis activity store (sorted set) and job registry |
+| `nscale-store` | Redis activity store (sorted set) and registry cache |
+| `nscale-etcd` | Durable job-registration store used as the registry source of truth |
 | `nscale-proxy` | Reverse proxy with in-flight tracking and heartbeat |
 | `nscale-waker` | Wake coordinator — request coalescing, state machine |
 | `nscale-scaler` | Scale-down controller with traffic probe + in-flight guard |
@@ -135,6 +137,7 @@ flowchart TD
 - **Heartbeat activity** — Long-running requests refresh activity every `idle_timeout / 3`, surviving any idle window
 - **Reverse proxy** — All requests (cold and warm path) route through nscale for full visibility
 - **Idle detection** — Services with no recent activity are scaled to zero via Redis sorted set
+- **Durable registry** — Job registrations can be stored in etcd and cached in Redis for resilient multi-replica recovery
 - **Traffic probe** — Scrapes Traefik Prometheus metrics as a secondary guard against scaling down active services
 - **Retry with cache invalidation** — On upstream failure, invalidates stale endpoints and retries the full wake cycle
 - **Nomad event stream** — Reacts to allocation lifecycle events for instant state transitions
@@ -142,8 +145,9 @@ flowchart TD
 - **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
 
 Additional operator docs live in [`docs/`](./docs/), starting with the
-[`performance-configuration.md`](./docs/performance-configuration.md) guide and the
-[`job-submission.md`](./docs/job-submission.md) guide for the new admin submission flow.
+[`performance-configuration.md`](./docs/performance-configuration.md) guide,
+[`job-submission.md`](./docs/job-submission.md) for the admin submission flow,
+and [`durable-registry.md`](./docs/durable-registry.md) for etcd-backed registry mode.
 
 ## Quick Start
 
@@ -249,6 +253,10 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_CONSUL__ADDR` | `http://localhost:8500` | Consul API address |
 | `NSCALE_CONSUL__TOKEN` | — | Consul ACL token (optional) |
 | `NSCALE_REDIS__URL` | `redis://localhost:6379` | Redis connection URL |
+| `NSCALE_REGISTRY__DURABLE_ENABLED` | `false` | Enable etcd-backed durable registrations and Redis read-through cache |
+| `NSCALE_REGISTRY__ETCD_ENDPOINTS` | `http://localhost:2379` | Comma-separated etcd endpoints |
+| `NSCALE_REGISTRY__ETCD_KEY_PREFIX` | `/nscale/registrations` | etcd key prefix used for registrations |
+| `NSCALE_REGISTRY__ETCD_WATCH_BACKOFF_SECS` | `5` | Reserved for future watch/reconciliation backoff wiring; currently ignored |
 | `NSCALE_SCALING__IDLE_TIMEOUT_SECS` | `300` | Seconds before idle service is scaled down |
 | `NSCALE_SCALING__WAKE_TIMEOUT_SECS` | `60` | Max seconds to wait for a service to become healthy |
 | `NSCALE_SCALING__SCALE_DOWN_INTERVAL_SECS` | `30` | Scale-down sweep interval |
@@ -496,6 +504,18 @@ The main integration script now submits `jobs/echo-submit.nomad` through `/admin
 that nscale injected the Traefik service override tag in Consul, confirms lookup still works when
 `service_name` differs from `job_id`, and then exercises wake-up and automatic scale-down.
 
+### Durable registry mode
+
+```bash
+cd integration
+./test-durable.sh
+./test-durable-multi-replica.sh
+```
+
+The durable integration scripts enable etcd-backed registrations, verify Redis cache loss recovery,
+and confirm that a second nscale replica can serve requests by reading through to etcd and
+repopulating Redis.
+
 ### Multi-job management
 
 ```bash
@@ -522,6 +542,10 @@ nscale will scale it down once `idle_timeout` expires if there's no traffic.
 
 If you submit jobs outside nscale, use `/admin/registry` or `/admin/registry/sync` to add
 the same registration data manually.
+
+If durable registry mode is enabled, nscale writes registrations to etcd first and then refreshes
+the Redis cache. A Redis cache miss is then repaired by reading from etcd and writing the result
+back into Redis.
 
 ### 2. Cold-start wake
 

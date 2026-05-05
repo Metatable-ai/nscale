@@ -5,6 +5,7 @@ members = [
     "crates/nscale-nomad",
     "crates/nscale-consul",
     "crates/nscale-store",
+    "crates/nscale-etcd",
     "crates/nscale-proxy",
     "crates/nscale-waker",
     "crates/nscale-scaler",
@@ -25,6 +26,7 @@ nscale-core = { path = "crates/nscale-core" }
 nscale-nomad = { path = "crates/nscale-nomad" }
 nscale-consul = { path = "crates/nscale-consul" }
 nscale-store = { path = "crates/nscale-store" }
+nscale-etcd = { path = "crates/nscale-etcd" }
 nscale-proxy = { path = "crates/nscale-proxy" }
 nscale-waker = { path = "crates/nscale-waker" }
 nscale-scaler = { path = "crates/nscale-scaler" }
