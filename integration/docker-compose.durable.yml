@@ -27,3 +27,30 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+
+  nscale-2:
+    image: integration-nscale:latest
+    networks: [nscale-net]
+    ports:
+      - "18080:8080"
+      - "19090:9090"
+    volumes:
+      - ./config/:/app/config/:ro
+    environment:
+      RUST_LOG: info,nscale=debug
+      NSCALE_REGISTRY__DURABLE_ENABLED: "true"
+      NSCALE_REGISTRY__ETCD_ENDPOINTS: "http://etcd:2379"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      nomad:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy

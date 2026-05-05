@@ -307,6 +307,23 @@ The following settings are accepted by the configuration loader but do not yet a
 
 Do not assume changing them will affect performance until a future release wires them into the active code path.
 
+## Durable registry mode
+
+If you enable the etcd-backed durable registry, treat it as a correctness and resilience feature,
+not a latency optimization.
+
+Key points:
+
+- Redis remains the hot cache for request-path lookups and scale-down coordination.
+- etcd stores the durable registration source of truth.
+- a Redis cache miss may incur a slightly slower first lookup because `nscale` reads through to etcd
+  and then repopulates Redis.
+- multi-replica deployments should keep durable registry mode enabled so each replica can recover
+  its cache from the same source of truth.
+
+The durable registry settings are configured under `[default.registry]` and are described in more
+detail in [`durable-registry.md`](./durable-registry.md).
+
 ## Suggested environment variables
 
 ```bash
