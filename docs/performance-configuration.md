@@ -304,6 +304,7 @@ The following settings are accepted by the configuration loader but do not yet a
 
 - `scaling.min_scale_down_age_secs`
 - `proxy.request_buffer_size`
+- `registry.etcd_watch_backoff_secs`
 
 Do not assume changing them will affect performance until a future release wires them into the active code path.
 

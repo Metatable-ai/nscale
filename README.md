@@ -256,7 +256,7 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_REGISTRY__DURABLE_ENABLED` | `false` | Enable etcd-backed durable registrations and Redis read-through cache |
 | `NSCALE_REGISTRY__ETCD_ENDPOINTS` | `http://localhost:2379` | Comma-separated etcd endpoints |
 | `NSCALE_REGISTRY__ETCD_KEY_PREFIX` | `/nscale/registrations` | etcd key prefix used for registrations |
-| `NSCALE_REGISTRY__ETCD_WATCH_BACKOFF_SECS` | `5` | Backoff between durable registry reconciliation attempts |
+| `NSCALE_REGISTRY__ETCD_WATCH_BACKOFF_SECS` | `5` | Reserved for future watch/reconciliation backoff wiring; currently ignored |
 | `NSCALE_SCALING__IDLE_TIMEOUT_SECS` | `300` | Seconds before idle service is scaled down |
 | `NSCALE_SCALING__WAKE_TIMEOUT_SECS` | `60` | Max seconds to wait for a service to become healthy |
 | `NSCALE_SCALING__SCALE_DOWN_INTERVAL_SECS` | `30` | Scale-down sweep interval |

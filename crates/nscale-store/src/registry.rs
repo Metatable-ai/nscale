@@ -54,6 +54,33 @@ impl JobRegistry {
         Ok(())
     }
 
+    async fn remove_cached_registration(&self, job_id: &JobId) -> Result<()> {
+        let service_entries: std::collections::HashMap<String, String> = self
+            .client
+            .hgetall(REGISTRY_BY_SERVICE_KEY)
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+
+        for (service_name, value) in service_entries {
+            let reg: JobRegistration = serde_json::from_str(&value)?;
+            if reg.job_id == *job_id {
+                let _: i64 = self
+                    .client
+                    .hdel(REGISTRY_BY_SERVICE_KEY, service_name.as_str())
+                    .await
+                    .map_err(|e| NscaleError::Store(e.to_string()))?;
+            }
+        }
+
+        let _: i64 = self
+            .client
+            .hdel(REGISTRY_BY_JOB_KEY, job_id.0.as_str())
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+
+        Ok(())
+    }
+
     pub async fn sync_from_durable(&self) -> Result<usize> {
         let Some(durable) = &self.durable else {
             return Ok(0);
@@ -80,32 +107,11 @@ impl JobRegistry {
 
     #[instrument(skip(self), fields(job_id = %job_id))]
     pub async fn deregister(&self, job_id: &JobId) -> Result<()> {
+        self.remove_cached_registration(job_id).await?;
+
         if let Some(durable) = &self.durable {
             durable.remove_registration(job_id).await?;
         }
-
-        let service_entries: std::collections::HashMap<String, String> = self
-            .client
-            .hgetall(REGISTRY_BY_SERVICE_KEY)
-            .await
-            .map_err(|e| NscaleError::Store(e.to_string()))?;
-
-        for (service_name, value) in service_entries {
-            let reg: JobRegistration = serde_json::from_str(&value)?;
-            if reg.job_id == *job_id {
-                let _: i64 = self
-                    .client
-                    .hdel(REGISTRY_BY_SERVICE_KEY, service_name.as_str())
-                    .await
-                    .map_err(|e| NscaleError::Store(e.to_string()))?;
-            }
-        }
-
-        let _: i64 = self
-            .client
-            .hdel(REGISTRY_BY_JOB_KEY, job_id.0.as_str())
-            .await
-            .map_err(|e| NscaleError::Store(e.to_string()))?;
         debug!("deregistered job");
         Ok(())
     }

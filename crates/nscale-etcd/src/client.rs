@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use etcd_client::{Client, DeleteOptions, GetOptions};
+use etcd_client::{Client, GetOptions, Txn, TxnOp};
 use futures_core::Stream;
 use futures_util::stream;
 use tokio::sync::Mutex;
@@ -52,6 +52,16 @@ impl EtcdClient {
         serde_json::from_slice(bytes).map_err(|e| NscaleError::Store(e.to_string()))
     }
 
+    async fn apply_txn(&self, operations: Vec<TxnOp>) -> Result<()> {
+        let mut client = self.client.lock().await;
+        client
+            .txn(Txn::new().and_then(operations))
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn get_by_key(&self, key: String) -> Result<Option<JobRegistration>> {
         let mut client = self.client.lock().await;
         let response = client
@@ -79,6 +89,31 @@ impl EtcdClient {
             .map(|kv| Self::decode_registration(kv.value()))
             .collect()
     }
+
+    async fn service_keys_for_job(&self, job_id: &JobId) -> Result<Vec<String>> {
+        if let Some(reg) = self.get_by_job_id(job_id).await? {
+            return Ok(vec![self.service_key(&reg.service_name)]);
+        }
+
+        let mut client = self.client.lock().await;
+        let response = client
+            .get(
+                self.services_prefix(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+
+        let mut keys = Vec::new();
+        for kv in response.kvs() {
+            let reg = Self::decode_registration(kv.value())?;
+            if reg.job_id == *job_id {
+                keys.push(String::from_utf8_lossy(kv.key()).into_owned());
+            }
+        }
+
+        Ok(keys)
+    }
 }
 
 #[async_trait]
@@ -89,62 +124,24 @@ impl DurableRegistry for EtcdClient {
         let job_key = self.job_key(&reg.job_id);
         let service_key = self.service_key(&reg.service_name);
 
-        let mut client = self.client.lock().await;
-        client
-            .put(job_key, encoded.clone(), None)
-            .await
-            .map_err(|e| NscaleError::Store(e.to_string()))?;
-        client
-            .put(service_key, encoded, None)
-            .await
-            .map_err(|e| NscaleError::Store(e.to_string()))?;
-
-        Ok(())
+        self.apply_txn(vec![
+            TxnOp::put(job_key, encoded.clone(), None),
+            TxnOp::put(service_key, encoded, None),
+        ])
+        .await
     }
 
     #[instrument(skip(self), fields(job_id = %job_id))]
     async fn remove_registration(&self, job_id: &JobId) -> Result<()> {
-        let existing = self.get_by_job_id(job_id).await?;
-        let job_key = self.job_key(job_id);
+        let mut operations = self
+            .service_keys_for_job(job_id)
+            .await?
+            .into_iter()
+            .map(|key| TxnOp::delete(key, None))
+            .collect::<Vec<_>>();
+        operations.push(TxnOp::delete(self.job_key(job_id), None));
 
-        let mut client = self.client.lock().await;
-        client
-            .delete(job_key, None)
-            .await
-            .map_err(|e| NscaleError::Store(e.to_string()))?;
-
-        if let Some(reg) = existing {
-            client
-                .delete(self.service_key(&reg.service_name), None)
-                .await
-                .map_err(|e| NscaleError::Store(e.to_string()))?;
-        } else {
-            let response = client
-                .get(
-                    self.services_prefix(),
-                    Some(GetOptions::new().with_prefix()),
-                )
-                .await
-                .map_err(|e| NscaleError::Store(e.to_string()))?;
-
-            let keys_to_delete = response
-                .kvs()
-                .iter()
-                .filter_map(|kv| match Self::decode_registration(kv.value()) {
-                    Ok(reg) if reg.job_id == *job_id => Some(kv.key().to_vec()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            for key in keys_to_delete {
-                client
-                    .delete(key, Some(DeleteOptions::new()))
-                    .await
-                    .map_err(|e| NscaleError::Store(e.to_string()))?;
-            }
-        }
-
-        Ok(())
+        self.apply_txn(operations).await
     }
 
     #[instrument(skip(self), fields(job_id = %job_id))]
@@ -196,8 +193,14 @@ mod tests {
 
     #[test]
     fn normalizes_prefix() {
-        assert_eq!(normalize_prefix("/nscale/registrations/".to_string()), "/nscale/registrations");
-        assert_eq!(normalize_prefix("nscale/registrations".to_string()), "/nscale/registrations");
+        assert_eq!(
+            normalize_prefix("/nscale/registrations/".to_string()),
+            "/nscale/registrations"
+        );
+        assert_eq!(
+            normalize_prefix("nscale/registrations".to_string()),
+            "/nscale/registrations"
+        );
         assert_eq!(normalize_prefix("   ".to_string()), "/nscale/registrations");
     }
 

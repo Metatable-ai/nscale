@@ -76,6 +76,7 @@ Enable durable registry mode with:
 durable_enabled = true
 etcd_endpoints = "http://etcd:2379"
 etcd_key_prefix = "/nscale/registrations"
+# Reserved for future watch/reconcile wiring; currently unused.
 etcd_watch_backoff_secs = 5
 ```
 
@@ -84,7 +85,7 @@ Equivalent environment variables:
 - `NSCALE_REGISTRY__DURABLE_ENABLED=true`
 - `NSCALE_REGISTRY__ETCD_ENDPOINTS=http://etcd:2379`
 - `NSCALE_REGISTRY__ETCD_KEY_PREFIX=/nscale/registrations`
-- `NSCALE_REGISTRY__ETCD_WATCH_BACKOFF_SECS=5`
+- `NSCALE_REGISTRY__ETCD_WATCH_BACKOFF_SECS=5` (reserved for future watch/reconcile wiring; currently unused)
 
 ## When to use it
 
