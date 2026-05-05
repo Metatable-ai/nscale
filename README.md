@@ -600,6 +600,7 @@ clears the coordinator cache — enabling instant state transitions without poll
 │   ├── nscale-store/       # Redis activity store + job registry
 │   ├── nscale-proxy/       # Reverse proxy + activity middleware
 │   ├── nscale-waker/       # Wake coordinator (state machine)
+│   ├── nscale-etcd/        # etcd client for durable registry mode
 │   └── nscale-scaler/      # Scale-down controller + traffic probe
 ├── config/
 │   └── default.toml        # Default configuration
