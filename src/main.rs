@@ -123,7 +123,9 @@ async fn main() {
             .collect::<Vec<_>>();
 
         if endpoints.is_empty() {
-            error!("durable registry enabled but NSCALE_REGISTRY__ETCD_ENDPOINTS is empty");
+            error!(
+                "durable registry enabled but registry.etcd_endpoints (NSCALE_REGISTRY__ETCD_ENDPOINTS) is empty"
+            );
             std::process::exit(1);
         }
 

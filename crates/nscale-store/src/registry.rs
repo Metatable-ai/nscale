@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fred::prelude::*;
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument};
 
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::job::{JobId, JobRegistration, ServiceName};
@@ -107,10 +107,25 @@ impl JobRegistry {
 
     #[instrument(skip(self), fields(job_id = %job_id))]
     pub async fn deregister(&self, job_id: &JobId) -> Result<()> {
-        self.remove_cached_registration(job_id).await?;
+        let existing = self.get(job_id).await?;
 
         if let Some(durable) = &self.durable {
             durable.remove_registration(job_id).await?;
+
+            if let Err(err) = self.remove_cached_registration(job_id).await {
+                if let Some(reg) = existing.as_ref() && let Err(restore_err) = durable.store_registration(reg).await {
+                        error!(
+                            job_id = %job_id,
+                            error = %restore_err,
+                            "failed to restore durable registration after Redis cache eviction error"
+                        );
+                    }
+                
+
+                return Err(err);
+            }
+        } else {
+            self.remove_cached_registration(job_id).await?;
         }
         debug!("deregistered job");
         Ok(())

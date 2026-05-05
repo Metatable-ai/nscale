@@ -91,10 +91,6 @@ impl EtcdClient {
     }
 
     async fn service_keys_for_job(&self, job_id: &JobId) -> Result<Vec<String>> {
-        if let Some(reg) = self.get_by_job_id(job_id).await? {
-            return Ok(vec![self.service_key(&reg.service_name)]);
-        }
-
         let mut client = self.client.lock().await;
         let response = client
             .get(
