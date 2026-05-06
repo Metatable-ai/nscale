@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nscale.fullname" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+spec:
+  replicas: {{ int .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nscale.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: app
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.secrets.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "nscale.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: app
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "nscale.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.registry.durable.enabled .Values.etcd.enabled .Values.etcd.waitForReady.enabled }}
+      initContainers:
+        - name: wait-for-etcd
+          image: {{ printf "%s:%s" .Values.etcd.waitForReady.image.repository .Values.etcd.waitForReady.image.tag }}
+          imagePullPolicy: {{ .Values.etcd.waitForReady.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://{{ include "nscale.etcdServiceName" . }}-0.{{ include "nscale.etcdServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ int .Values.etcd.service.clientPort }}/health >/dev/null 2>&1; do
+                echo "waiting for etcd";
+                sleep 2;
+              done
+      {{- end }}
+      containers:
+        - name: nscale
+          image: {{ printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: proxy
+              containerPort: {{ int .Values.ports.proxy }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ int .Values.ports.admin }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.logging.rustLog | quote }}
+            - name: NSCALE_LOG_FORMAT
+              value: {{ .Values.config.logging.format | quote }}
+            {{- if or .Values.secrets.existingSecret (and .Values.secrets.create .Values.secrets.nomadToken) }}
+            - name: NSCALE_NOMAD__TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nscale.secretName" . }}
+                  key: {{ .Values.secrets.secretKeys.nomadToken }}
+            {{- end }}
+            {{- if or .Values.secrets.existingSecret (and .Values.secrets.create .Values.secrets.consulToken) }}
+            - name: NSCALE_CONSUL__TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nscale.secretName" . }}
+                  key: {{ .Values.secrets.secretKeys.consulToken }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: {{ int .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: {{ int .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "nscale.fullname" . }}-config
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

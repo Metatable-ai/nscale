@@ -1,0 +1,12 @@
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nscale.redisConfigMapName" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+data:
+  redis.conf: |
+{{ .Values.redis.config | indent 4 }}
+{{- end }}

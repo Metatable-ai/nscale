@@ -202,6 +202,49 @@ docker build -t nscale .
 docker run -p 8080:8080 -p 9090:9090 nscale
 ```
 
+## Helm Installation
+
+A Helm chart is available under [`charts/nscale/`](./charts/nscale/) for Kubernetes deployments.
+The chart always deploys `nscale`, supports external Nomad and Consul endpoints, and can
+optionally bundle Redis and etcd for durable-registry mode.
+
+### Prerequisites
+
+- a Kubernetes cluster with network reachability to Nomad and Consul
+- Traefik configured separately so both cold-path and warm-path traffic route through `nscale`
+- Redis available either externally or via `redis.enabled=true`
+- optional: etcd available externally or via `etcd.enabled=true` when durable registry mode is enabled
+
+### Install with bundled Redis
+
+```bash
+helm install nscale ./charts/nscale \
+  --namespace nscale \
+  --create-namespace \
+  --set redis.enabled=true \
+  --set externalServices.nomad.addr=http://nomad.default.svc.cluster.local:4646 \
+  --set externalServices.consul.addr=http://consul.default.svc.cluster.local:8500
+```
+
+### Enable durable registry mode
+
+```bash
+helm install nscale ./charts/nscale \
+  --namespace nscale \
+  --create-namespace \
+  --set redis.enabled=true \
+  --set registry.durable.enabled=true \
+  --set etcd.enabled=true \
+  --set externalServices.nomad.addr=http://nomad.default.svc.cluster.local:4646 \
+  --set externalServices.consul.addr=http://consul.default.svc.cluster.local:8500
+```
+
+If you already run Redis or etcd elsewhere, keep the bundled services disabled and point the chart
+at your existing endpoints instead.
+
+For the full values reference, secret handling, and additional examples, see
+[`charts/nscale/README.md`](./charts/nscale/README.md).
+
 ## Configuration
 
 nscale uses [Figment](https://docs.rs/figment) for layered configuration:
@@ -591,6 +634,8 @@ clears the coordinator cache — enabling instant state transitions without poll
 
 ```
 ├── Cargo.toml              # Workspace + binary definition
+├── charts/
+│   └── nscale/             # Helm chart for Kubernetes deployments
 ├── docs/                   # Operator-facing guides and configuration docs
 ├── src/main.rs             # Binary entrypoint
 ├── crates/

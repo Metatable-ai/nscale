@@ -1,0 +1,127 @@
+{{- if .Values.etcd.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "nscale.etcdServiceName" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: etcd
+spec:
+  serviceName: {{ include "nscale.etcdServiceName" . }}
+  replicas: {{ int .Values.etcd.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "nscale.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: etcd
+  template:
+    metadata:
+      labels:
+        {{- include "nscale.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: etcd
+      annotations:
+        serviceName: {{ include "nscale.etcdServiceName" . }}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/component
+                    operator: In
+                    values:
+                      - etcd
+                  - key: app.kubernetes.io/instance
+                    operator: In
+                    values:
+                      - {{ .Release.Name }}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: etcd
+          image: {{ printf "%s:%s" .Values.etcd.image.repository .Values.etcd.image.tag }}
+          imagePullPolicy: {{ .Values.etcd.image.pullPolicy }}
+          ports:
+            - name: etcd-client
+              containerPort: {{ int .Values.etcd.service.clientPort }}
+              protocol: TCP
+            - name: etcd-server
+              containerPort: {{ int .Values.etcd.service.peerPort }}
+              protocol: TCP
+            - name: etcd-metrics
+              containerPort: {{ int .Values.etcd.service.metricsPort }}
+              protocol: TCP
+          env:
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SERVICE_NAME
+              value: {{ include "nscale.etcdServiceName" . }}
+            - name: ETCDCTL_ENDPOINTS
+              value: $(HOSTNAME).$(SERVICE_NAME).$(K8S_NAMESPACE).svc.cluster.local:{{ int .Values.etcd.service.clientPort }}
+            - name: URI_SCHEME
+              value: http
+          command:
+            - /usr/local/bin/etcd
+          args:
+            - --name=$(HOSTNAME)
+            - --data-dir=/data
+            - --wal-dir=/data/wal
+            - --listen-peer-urls=$(URI_SCHEME)://0.0.0.0:{{ int .Values.etcd.service.peerPort }}
+            - --listen-client-urls=$(URI_SCHEME)://0.0.0.0:{{ int .Values.etcd.service.clientPort }}
+            - --advertise-client-urls=$(URI_SCHEME)://$(HOSTNAME).$(SERVICE_NAME).$(K8S_NAMESPACE).svc.cluster.local:{{ int .Values.etcd.service.clientPort }}
+            - --initial-cluster-state=new
+            - --initial-cluster-token=etcd-$(K8S_NAMESPACE)
+            - --initial-cluster={{ include "nscale.etcdInitialCluster" . }}
+            - --initial-advertise-peer-urls=$(URI_SCHEME)://$(HOSTNAME).$(SERVICE_NAME).$(K8S_NAMESPACE).svc.cluster.local:{{ int .Values.etcd.service.peerPort }}
+            - --listen-metrics-urls=http://0.0.0.0:{{ int .Values.etcd.service.metricsPort }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: etcd-metrics
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: etcd-metrics
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.etcd.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: etcd-data
+              mountPath: /data
+      {{- if not .Values.etcd.persistence.enabled }}
+      volumes:
+        - name: etcd-data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.etcd.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: etcd-data
+      spec:
+        accessModes:
+          {{- toYaml .Values.etcd.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.etcd.persistence.size }}
+        {{- with .Values.etcd.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,167 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/metatable-ai/nscale
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+ports:
+  proxy: 8080
+  admin: 9090
+
+service:
+  proxy:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+  admin:
+    type: ClusterIP
+    port: 9090
+    annotations: {}
+
+config:
+  listenAddr: ""
+  adminAddr: ""
+  nomad:
+    concurrency: 50
+  scaling:
+    idleTimeoutSecs: 300
+    wakeTimeoutSecs: 60
+    scaleDownIntervalSecs: 30
+    minScaleDownAgeSecs: 120
+  proxy:
+    requestTimeoutSecs: 30
+    requestBufferSize: 1000
+  routing:
+    fileProviderService: s2z-nscale@file
+  logging:
+    rustLog: info,nscale=debug
+    format: compact
+
+externalServices:
+  nomad:
+    addr: http://nomad.default.svc.cluster.local:4646
+  consul:
+    addr: http://consul.default.svc.cluster.local:8500
+  traefik:
+    metricsUrl: ""
+    provider: consulcatalog
+
+registry:
+  durable:
+    enabled: false
+  etcd:
+    keyPrefix: /nscale/registrations
+    watchBackoffSecs: 5
+
+secrets:
+  existingSecret: ""
+  create: false
+  name: ""
+  nomadToken: ""
+  consulToken: ""
+  secretKeys:
+    nomadToken: nomad_token
+    consulToken: consul_token
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 3
+    timeoutSeconds: 2
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+redis:
+  enabled: false
+  externalUrl: redis://redis.default.svc.cluster.local:6379
+  image:
+    repository: redis
+    tag: 7.2.1
+    pullPolicy: IfNotPresent
+  service:
+    port: 6379
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+  persistence:
+    enabled: false
+    accessModes:
+      - ReadWriteOnce
+    size: 2Gi
+    storageClassName: ""
+  config: |
+    # Cache-only Redis: etcd is the durable registry source of truth.
+    # Keep Redis bounded and disposable so cache loss does not block writes.
+    dir /tmp
+    appendonly no
+    save ""
+    maxmemory 100mb
+    maxmemory-policy allkeys-lru
+    protected-mode no
+
+etcd:
+  enabled: false
+  externalEndpoints: ""
+  image:
+    repository: quay.io/coreos/etcd
+    tag: v3.6.0
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    clientPort: 2379
+    peerPort: 2380
+    metricsPort: 8080
+  waitForReady:
+    enabled: true
+    image:
+      repository: busybox
+      tag: "1.36"
+      pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    accessModes:
+      - ReadWriteOnce
+    size: 1Gi
+    storageClassName: ""
+  resources: {}

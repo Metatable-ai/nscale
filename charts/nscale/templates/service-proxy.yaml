@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nscale.proxyServiceName" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+  {{- with .Values.service.proxy.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.proxy.type }}
+  selector:
+    {{- include "nscale.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+  ports:
+    - name: proxy
+      port: {{ int .Values.service.proxy.port }}
+      targetPort: proxy
+      protocol: TCP

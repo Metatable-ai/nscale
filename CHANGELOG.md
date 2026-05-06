@@ -12,12 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [2.2.0] - 2026-05-06
+
 ### Added
 - Added HTTPS support in the local Traefik integration and hybrid Kubernetes stacks by exposing `:443`, loading a local self-signed certificate for `localhost` / `*.localhost`, and adding TLS-aware fallback routers so dormant services can still wake on HTTPS requests.
 - Added HTTPS coverage to the end-to-end integration scripts (`integration/test.sh`, `integration/test-acl.sh`, and `nscale-kubernetes/test-hybrid.sh`) so both warm-path routing and cold-start wake-up are exercised over TLS.
+- Added an etcd-backed durable registry mode with a new `nscale-etcd` crate so `JobRegistration` data can survive Redis cache loss and be shared across replicas.
+- Added durable-registry integration coverage with `integration/docker-compose.durable.yml`, `integration/test-durable.sh`, and `integration/test-durable-multi-replica.sh` to verify Redis cache recovery and multi-replica read-through behavior.
+- Added operator documentation for durable registry mode in `docs/durable-registry.md`, plus index references from `docs/README.md`, `README.md`, and related operator guides.
 
 ### Changed
 - Updated the sample submit fixtures and echo job fixtures to advertise `entryPoints=http,https` with `tls=true`, matching production-style Traefik job tags while still routing through `s2z-nscale@file`.
+- Updated the configuration surface with `[default.registry]` / `NSCALE_REGISTRY__*` settings for durable-registry enablement, etcd endpoints, key prefix, and reserved watch backoff wiring.
+- Updated Docker and release build dependencies to install `protobuf-compiler`, which is required by the new etcd client build chain.
+- Updated the README project structure and operator documentation to describe Redis as a cache layer and etcd as the durable registration source of truth when durable mode is enabled.
 
 ### Deprecated
 
@@ -25,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Fixed the cold HTTPS path where Traefik previously returned `404` for dormant services because the file-provider fallback route only existed on the plain `http` entrypoint.
+- Fixed registry recovery after Redis cache loss by reading through to etcd, repopulating Redis automatically, and preserving service-name-based lookup across replicas.
+- Improved durable-registry startup validation and deregistration error handling when etcd endpoint configuration is empty or cache eviction fails mid-update.
 
 ### Security
 
@@ -99,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **idle-scaler/**: Idle scaler agent binary
 - **activity-store/**: Shared store library for Consul KV and Redis
 
-[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.2.0
 [2.1.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.1.0
 [2.0.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.0.0
 [0.1.0]: https://github.com/Metatable-ai/nscale/releases/tag/v0.1.0

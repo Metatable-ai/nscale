@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nscale.adminServiceName" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+  {{- with .Values.service.admin.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.admin.type }}
+  selector:
+    {{- include "nscale.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+  ports:
+    - name: admin
+      port: {{ int .Values.service.admin.port }}
+      targetPort: admin
+      protocol: TCP

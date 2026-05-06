@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nscale.fullname" . }}-config
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+data:
+  default.toml: |
+    [default]
+    listen_addr = {{ include "nscale.configListenAddr" . | quote }}
+    admin_addr = {{ include "nscale.configAdminAddr" . | quote }}
+
+    [default.nomad]
+    addr = {{ .Values.externalServices.nomad.addr | quote }}
+    concurrency = {{ int .Values.config.nomad.concurrency }}
+
+    [default.consul]
+    addr = {{ .Values.externalServices.consul.addr | quote }}
+
+    [default.redis]
+    url = {{ include "nscale.redisUrl" . | quote }}
+
+    [default.scaling]
+    idle_timeout_secs = {{ int .Values.config.scaling.idleTimeoutSecs }}
+    wake_timeout_secs = {{ int .Values.config.scaling.wakeTimeoutSecs }}
+    scale_down_interval_secs = {{ int .Values.config.scaling.scaleDownIntervalSecs }}
+    min_scale_down_age_secs = {{ int .Values.config.scaling.minScaleDownAgeSecs }}
+
+    [default.proxy]
+    request_timeout_secs = {{ int .Values.config.proxy.requestTimeoutSecs }}
+    request_buffer_size = {{ int .Values.config.proxy.requestBufferSize }}
+
+    [default.registry]
+    durable_enabled = {{ .Values.registry.durable.enabled }}
+    etcd_endpoints = {{ include "nscale.etcdEndpoints" . | quote }}
+    etcd_key_prefix = {{ .Values.registry.etcd.keyPrefix | quote }}
+    etcd_watch_backoff_secs = {{ int .Values.registry.etcd.watchBackoffSecs }}
+
+    [default.routing]
+    file_provider_service = {{ .Values.config.routing.fileProviderService | quote }}
+{{- if .Values.externalServices.traefik.metricsUrl }}
+
+    [default.traefik]
+    metrics_url = {{ .Values.externalServices.traefik.metricsUrl | quote }}
+    provider = {{ .Values.externalServices.traefik.provider | quote }}
+{{- end }}

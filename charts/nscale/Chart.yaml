@@ -1,0 +1,16 @@
+apiVersion: v2
+name: nscale
+description: Deploy nscale, a Nomad scale-to-zero proxy for Traefik-routed services
+type: application
+version: 2.2.0
+appVersion: "2.2.0"
+home: https://github.com/Metatable-ai/nscale
+sources:
+  - https://github.com/Metatable-ai/nscale
+keywords:
+  - nomad
+  - consul
+  - traefik
+  - redis
+  - etcd
+  - scale-to-zero

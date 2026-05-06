@@ -1,0 +1,28 @@
+{{- if .Values.etcd.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nscale.etcdServiceName" . }}
+  labels:
+    {{- include "nscale.labels" . | nindent 4 }}
+    app.kubernetes.io/component: etcd
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "nscale.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: etcd
+  ports:
+    - name: etcd-client
+      port: {{ int .Values.etcd.service.clientPort }}
+      targetPort: etcd-client
+      protocol: TCP
+    - name: etcd-server
+      port: {{ int .Values.etcd.service.peerPort }}
+      targetPort: etcd-server
+      protocol: TCP
+    - name: etcd-metrics
+      port: {{ int .Values.etcd.service.metricsPort }}
+      targetPort: etcd-metrics
+      protocol: TCP
+{{- end }}
