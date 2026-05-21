@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.1] - 2026-05-21
+
+### Added
+- Added `DELETE /admin/jobs/{job_id}` so operators can stop, purge, and deregister a managed Nomad job from nscale, with `force=true` support for explicit destructive cleanup.
+- Added shared Redis-backed missing-job tracking plus `scaling.auto_deregister` / `NSCALE_SCALING__AUTO_DEREGISTER__*` configuration so stale registrations can be automatically forgotten after repeated Nomad `job not found` responses.
+- Added end-to-end coverage for the new deregistration flows in `integration/test.sh` and `integration/test-durable-multi-replica.sh`, including in-flight purge protection and shared multi-replica threshold handling.
+
+### Fixed
+- Fixed admin API startup on current `axum` routing by using `{job_id}` path capture syntax instead of the removed `:job_id` segment style.
+- Fixed wake-path error propagation so `JobNotFound` reaches the proxy/scaler cleanup logic instead of being flattened into a generic wake failure.
+- Fixed durable multi-replica stale-registration cleanup so the shared auto-deregister threshold now returns `404` and removes the registration from both Redis and etcd.
+- Improved Nomad deployment waiting in the integration harnesses so transient active-deployment scale conflicts do not make the end-to-end tests flaky.
+
+---
+
 ## [2.2.0] - 2026-05-06
 
 ### Added
@@ -111,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **idle-scaler/**: Idle scaler agent binary
 - **activity-store/**: Shared store library for Consul KV and Redis
 
-[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/Metatable-ai/nscale/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/Metatable-ai/nscale/releases/tag/v2.2.1
 [2.2.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.2.0
 [2.1.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.1.0
 [2.0.0]: https://github.com/Metatable-ai/nscale/releases/tag/v2.0.0
