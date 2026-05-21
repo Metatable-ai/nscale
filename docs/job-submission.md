@@ -175,6 +175,17 @@ Use `/admin/registry` or `/admin/registry/sync` when:
 - the job already contains the correct routing tags
 - you only need to teach `nscale` about an existing service
 
+Use `DELETE /admin/jobs/:job_id` when:
+
+- the Nomad job should be stopped and purged
+- you want `nscale` to clear cached wake state, activity, and registrations for that job
+- you want a safety guard that rejects the purge while requests are in flight unless you pass `?force=true`
+
+`nscale` also has an automatic stale-registration cleanup policy under
+`scaling.auto_deregister`. When Nomad reports a registered job missing
+repeatedly, `nscale` increments a shared Redis counter and removes the
+registration once the configured `not_found_threshold` is reached.
+
 ## Nomad HCL limitations
 
 Nomad variables work inside attribute values, but not in block labels.

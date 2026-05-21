@@ -9,9 +9,10 @@ use axum::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
+use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
-use nscale_core::traits::ActivityStore;
+use nscale_core::traits::{ActivityStore, MissingJobTracker};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
 
@@ -35,8 +36,11 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub in_flight: InFlightTracker,
     pub activity_store: Arc<dyn ActivityStore>,
+    pub missing_job_tracker: Arc<dyn MissingJobTracker>,
     /// Interval for refreshing activity during long-running proxied requests.
     pub heartbeat_interval: Duration,
+    pub auto_deregister_enabled: bool,
+    pub auto_deregister_threshold: u32,
 }
 
 fn replayable_method(method: &Method) -> Option<Method> {
@@ -53,6 +57,101 @@ fn build_retry_request(method: &Method, uri: &str) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .expect("retry request should reuse a valid method and URI")
+}
+
+async fn clear_missing_job_counter(state: &AppState, job_id: &JobId) {
+    if !state.auto_deregister_enabled {
+        return;
+    }
+
+    if let Err(e) = state.missing_job_tracker.clear_not_found(job_id).await {
+        warn!(job_id = %job_id, error = %e, "failed to clear missing-job counter");
+    }
+}
+
+async fn cleanup_missing_job_state(state: &AppState, job_id: &JobId) -> Result<()> {
+    state.coordinator.mark_dormant(job_id);
+
+    if let Err(e) = state.activity_store.remove_activity(job_id).await {
+        warn!(job_id = %job_id, error = %e, "failed to remove activity during auto-deregister cleanup");
+    }
+
+    state.registry.deregister(job_id).await?;
+
+    if let Err(e) = state.missing_job_tracker.clear_not_found(job_id).await {
+        warn!(job_id = %job_id, error = %e, "failed to clear missing-job counter after auto-deregister");
+    }
+
+    Ok(())
+}
+
+async fn handle_missing_job(state: &AppState, job_id: &JobId, source: &'static str) -> Response {
+    if !state.auto_deregister_enabled {
+        warn!(job_id = %job_id, source, "registered job missing in Nomad but auto-deregister is disabled");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("service missing in Nomad during {source}"),
+        )
+            .into_response();
+    }
+
+    let count = match state.missing_job_tracker.increment_not_found(job_id).await {
+        Ok(count) => count,
+        Err(e) => {
+            error!(job_id = %job_id, source, error = %e, "failed to increment missing-job counter");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable while tracking stale registration",
+            )
+                .into_response();
+        }
+    };
+
+    if count >= state.auto_deregister_threshold {
+        match cleanup_missing_job_state(state, job_id).await {
+            Ok(()) => {
+                warn!(
+                    job_id = %job_id,
+                    source,
+                    count,
+                    threshold = state.auto_deregister_threshold,
+                    "auto-deregistered stale job after repeated Nomad missing-job responses"
+                );
+                (StatusCode::NOT_FOUND, "service not registered").into_response()
+            }
+            Err(e) => {
+                error!(
+                    job_id = %job_id,
+                    source,
+                    count,
+                    threshold = state.auto_deregister_threshold,
+                    error = %e,
+                    "failed to auto-deregister stale job after missing-job threshold"
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("service missing in Nomad and cleanup failed: {e}"),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        warn!(
+            job_id = %job_id,
+            source,
+            count,
+            threshold = state.auto_deregister_threshold,
+            "registered job missing in Nomad"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "service missing in Nomad ({count}/{})",
+                state.auto_deregister_threshold
+            ),
+        )
+            .into_response()
+    }
 }
 
 /// Main request handler.
@@ -85,11 +184,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     tracing::Span::current().record("host", service_key.as_str());
 
     // --- 2. Look up job registration ---
-    let job_id = JobId(service_key.clone());
-    let registration = match state.registry.get(&job_id).await {
+    let lookup_id = JobId(service_key.clone());
+    let registration = match state.registry.get(&lookup_id).await {
         Ok(Some(reg)) => reg,
         Ok(None) => {
-            warn!(job_id = %job_id, "job not found in registry");
+            warn!(job_id = %lookup_id, "job not found in registry");
             return (StatusCode::NOT_FOUND, "service not registered").into_response();
         }
         Err(e) => {
@@ -97,10 +196,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             return (StatusCode::INTERNAL_SERVER_ERROR, "registry error").into_response();
         }
     };
+    let job_id = registration.job_id.clone();
 
     // --- 3. Ensure running (wake if dormant) ---
     let endpoint = match state.coordinator.ensure_running(&registration).await {
-        Ok(ep) => ep,
+        Ok(ep) => {
+            clear_missing_job_counter(&state, &job_id).await;
+            ep
+        }
+        Err(NscaleError::JobNotFound(_)) => {
+            return handle_missing_job(&state, &job_id, "wake").await;
+        }
         Err(e) => {
             error!(job_id = %job_id, error = %e, "wake failed");
             return (StatusCode::SERVICE_UNAVAILABLE, format!("wake error: {e}")).into_response();
@@ -224,6 +330,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 .await
             {
                 Ok(EndpointRefresh::Confirmed(_)) => {
+                    clear_missing_job_counter(&state, &job_id).await;
                     error!(
                         job_id = %job_id,
                         endpoint = %endpoint,
@@ -237,6 +344,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     return err.status_code().into_response();
                 }
                 Ok(EndpointRefresh::Updated(refreshed_endpoint)) => {
+                    clear_missing_job_counter(&state, &job_id).await;
                     warn!(
                         job_id = %job_id,
                         old_endpoint = %endpoint,
@@ -270,7 +378,14 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     );
 
                     let endpoint = match state.coordinator.ensure_running(&registration).await {
-                        Ok(ep) => ep,
+                        Ok(ep) => {
+                            clear_missing_job_counter(&state, &job_id).await;
+                            ep
+                        }
+                        Err(NscaleError::JobNotFound(_)) => {
+                            heartbeat_cancel.cancel();
+                            return handle_missing_job(&state, &job_id, "rewake").await;
+                        }
                         Err(e) => {
                             error!(job_id = %job_id, error = %e, "retry wake failed");
                             heartbeat_cancel.cancel();
@@ -304,6 +419,10 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                             rewake_err.status_code().into_response()
                         }
                     }
+                }
+                Err(NscaleError::JobNotFound(_)) => {
+                    heartbeat_cancel.cancel();
+                    return handle_missing_job(&state, &job_id, "refresh").await;
                 }
                 Err(e) => {
                     error!(

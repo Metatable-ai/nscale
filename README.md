@@ -273,6 +273,10 @@ wake_timeout_secs        = 60
 scale_down_interval_secs = 30
 min_scale_down_age_secs  = 120
 
+[default.scaling.auto_deregister]
+enabled             = true
+not_found_threshold = 5
+
 [default.proxy]
 request_timeout_secs = 30
 request_buffer_size  = 1000
@@ -304,6 +308,8 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_SCALING__WAKE_TIMEOUT_SECS` | `60` | Max seconds to wait for a service to become healthy |
 | `NSCALE_SCALING__SCALE_DOWN_INTERVAL_SECS` | `30` | Scale-down sweep interval |
 | `NSCALE_SCALING__MIN_SCALE_DOWN_AGE_SECS` | `120` | Minimum job age before scale-down eligibility (reserved for future runtime wiring) |
+| `NSCALE_SCALING__AUTO_DEREGISTER__ENABLED` | `true` | Enable cleanup of stale registrations after repeated Nomad missing-job responses |
+| `NSCALE_SCALING__AUTO_DEREGISTER__NOT_FOUND_THRESHOLD` | `5` | Consecutive Nomad missing-job responses before `nscale` forgets a job |
 | `NSCALE_PROXY__REQUEST_TIMEOUT_SECS` | `30` | Upstream request timeout |
 | `NSCALE_PROXY__REQUEST_BUFFER_SIZE` | `1000` | Request wake buffer size (reserved for future runtime wiring) |
 | `NSCALE_ROUTING__FILE_PROVIDER_SERVICE` | `s2z-nscale@file` | Traefik service target injected into router tags during `/admin/jobs` submissions |
@@ -480,6 +486,7 @@ because nscale has no router name to target for the injected `.service=` overrid
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/readyz` | Readiness check (verifies Redis) |
 | `POST` | `/admin/jobs` | Parse HCL, inject required Traefik routing tags, submit to Nomad, auto-register managed services |
+| `DELETE` | `/admin/jobs/:job_id` | Stop and purge a Nomad job, then remove `nscale` registry/activity state for that job |
 | `POST` | `/admin/registry` | Register a single job (seeds activity) |
 | `POST` | `/admin/registry/sync` | Bulk-sync all job registrations (seeds activity) |
 
@@ -515,6 +522,24 @@ discovered by the scale-down controller.
 
 This endpoint is still useful when jobs are submitted outside nscale and you only need
 to register an already-known service.
+
+### Manual purge endpoint
+
+`DELETE /admin/jobs/:job_id`
+
+This endpoint is the inverse of manual registration when you want `nscale` to forget a job
+and Nomad to stop serving it entirely. The handler:
+
+1. sends `DELETE /v1/job/:job_id?purge=true` to Nomad
+2. clears the in-memory wake cache for that job
+3. removes activity tracking
+4. deregisters the job from Redis, and from etcd when durable registry mode is enabled
+
+By default the request is rejected with `409 Conflict` if `nscale` is actively proxying
+requests for that job. Pass `?force=true` to override that guard.
+
+Use manual purge when the job should be gone. Use `/admin/registry` or `/admin/registry/sync`
+when the job still exists but was submitted outside `nscale` and just needs to be registered.
 
 ## Testing
 
@@ -585,6 +610,12 @@ nscale will scale it down once `idle_timeout` expires if there's no traffic.
 
 If you submit jobs outside nscale, use `/admin/registry` or `/admin/registry/sync` to add
 the same registration data manually.
+
+If Nomad repeatedly reports that a registered job no longer exists, the
+`scaling.auto_deregister` policy increments a shared Redis counter. Once the
+consecutive missing-job count reaches `not_found_threshold` (default `5`),
+`nscale` automatically clears the stale registration so future requests fail fast
+with `404 Not Found` instead of repeatedly attempting wake-up.
 
 If durable registry mode is enabled, nscale writes registrations to etcd first and then refreshes
 the Redis cache. A Redis cache miss is then repaired by reading from etcd and writing the result

@@ -68,6 +68,16 @@ pub trait ActivityStore: Send + Sync {
     async fn remove_activity(&self, job_id: &JobId) -> Result<()>;
 }
 
+/// Abstraction over shared tracking for consecutive Nomad missing-job signals.
+#[async_trait]
+pub trait MissingJobTracker: Send + Sync {
+    /// Increment and return the consecutive missing-job count for a job.
+    async fn increment_not_found(&self, job_id: &JobId) -> Result<u32>;
+
+    /// Clear the consecutive missing-job count for a job.
+    async fn clear_not_found(&self, job_id: &JobId) -> Result<()>;
+}
+
 /// Change notification emitted by a durable registration store.
 #[derive(Debug, Clone)]
 pub enum RegistrationEvent {

@@ -107,6 +107,9 @@ impl WakeCoordinator {
                         Ok(Ok(WakeResult::Cancelled)) => Err(NscaleError::WakeAbandoned {
                             job_id: reg.job_id.0.clone(),
                         }),
+                        Ok(Ok(WakeResult::JobNotFound(job_id))) => {
+                            Err(NscaleError::JobNotFound(job_id))
+                        }
                         Ok(Ok(WakeResult::Failed(msg))) => {
                             Err(NscaleError::Nomad(format!("wake failed: {}", msg)))
                         }
@@ -167,6 +170,16 @@ impl WakeCoordinator {
                                     let _ = notify.send(WakeResult::Cancelled);
                                     jobs.remove(&reg_clone.job_id.0);
                                 }
+                                Err(NscaleError::JobNotFound(job_id)) => {
+                                    warn!(
+                                        job_id = %reg_clone.job_id,
+                                        missing_job = %job_id,
+                                        "wake task could not find job in Nomad"
+                                    );
+                                    state_clone.set_dormant();
+                                    let _ = notify.send(WakeResult::JobNotFound(job_id));
+                                    jobs.remove(&reg_clone.job_id.0);
+                                }
                                 Err(e) => {
                                     error!(
                                         job_id = %reg_clone.job_id,
@@ -187,6 +200,9 @@ impl WakeCoordinator {
                             Ok(Ok(WakeResult::Cancelled)) => Err(NscaleError::WakeAbandoned {
                                 job_id: reg.job_id.0.clone(),
                             }),
+                            Ok(Ok(WakeResult::JobNotFound(job_id))) => {
+                                Err(NscaleError::JobNotFound(job_id))
+                            }
                             Ok(Ok(WakeResult::Failed(msg))) => {
                                 Err(NscaleError::Nomad(format!("wake failed: {}", msg)))
                             }
@@ -344,11 +360,12 @@ mod tests {
     use super::*;
     use nscale_core::job::ServiceName;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
 
     /// Mock orchestrator that counts calls.
     struct MockOrchestrator {
         scale_up_calls: AtomicU32,
+        job_not_found_on_scale_up: AtomicBool,
         healthy_endpoint: Mutex<Option<Endpoint>>,
     }
 
@@ -356,6 +373,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 scale_up_calls: AtomicU32::new(0),
+                job_not_found_on_scale_up: AtomicBool::new(false),
                 healthy_endpoint: Mutex::new(Some(Endpoint::new("10.0.0.1", 8080))),
             }
         }
@@ -366,6 +384,11 @@ mod tests {
                 .lock()
                 .expect("healthy endpoint lock should succeed") = endpoint;
         }
+
+        fn set_job_not_found_on_scale_up(&self, enabled: bool) {
+            self.job_not_found_on_scale_up
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[async_trait::async_trait]
@@ -373,6 +396,12 @@ mod tests {
         async fn scale_up(&self, _job_id: &JobId, _group: &str, _count: u32) -> Result<()> {
             self.scale_up_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .job_not_found_on_scale_up
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(NscaleError::JobNotFound("test-job".into()));
+            }
             tokio::task::yield_now().await;
             Ok(())
         }
@@ -588,6 +617,19 @@ mod tests {
         let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
         assert!(matches!(refreshed, EndpointRefresh::Missing));
         assert!(!coord.is_ready(&reg.job_id));
+    }
+
+    #[tokio::test]
+    async fn test_job_not_found_propagates_through_wake_coordinator() {
+        let orch = Arc::new(MockOrchestrator::new());
+        orch.set_job_not_found_on_scale_up(true);
+        let disc = Arc::new(MockDiscovery);
+        let coord = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+
+        let reg = test_registration();
+        let result = coord.ensure_running(&reg).await;
+
+        assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
     }
 
     /// Mock discovery that delays health check to simulate slow container startup.

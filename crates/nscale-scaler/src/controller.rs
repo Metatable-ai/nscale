@@ -9,7 +9,7 @@ use tracing::{debug, error, info, instrument, warn};
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
-use nscale_core::traits::{ActivityStore, Orchestrator};
+use nscale_core::traits::{ActivityStore, MissingJobTracker, Orchestrator};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::WakeCoordinator;
 
@@ -30,9 +30,12 @@ pub struct ScaleDownController {
     coordinator: Arc<WakeCoordinator>,
     traffic_probe: Option<Arc<TrafficProbe>>,
     in_flight: InFlightTracker,
+    missing_job_tracker: Arc<dyn MissingJobTracker>,
     idle_threshold: Duration,
     interval: Duration,
     lock_ttl: Duration,
+    auto_deregister_enabled: bool,
+    auto_deregister_threshold: u32,
     cancel: CancellationToken,
     /// Jobs deferred due to active deployments; maps job_id → earliest retry time.
     deferred_jobs: Arc<DashMap<String, Instant>>,
@@ -47,8 +50,11 @@ impl ScaleDownController {
         coordinator: Arc<WakeCoordinator>,
         traffic_probe: Option<Arc<TrafficProbe>>,
         in_flight: InFlightTracker,
+        missing_job_tracker: Arc<dyn MissingJobTracker>,
         idle_threshold: Duration,
         interval: Duration,
+        auto_deregister_enabled: bool,
+        auto_deregister_threshold: u32,
         cancel: CancellationToken,
     ) -> Self {
         // Lock TTL should be a bit longer than the interval to avoid overlap
@@ -60,11 +66,90 @@ impl ScaleDownController {
             coordinator,
             traffic_probe,
             in_flight,
+            missing_job_tracker,
             idle_threshold,
             interval,
             lock_ttl,
+            auto_deregister_enabled,
+            auto_deregister_threshold,
             cancel,
             deferred_jobs: Arc::new(DashMap::new()),
+        }
+    }
+
+    async fn clear_missing_job_counter(&self, job_id: &JobId) {
+        if !self.auto_deregister_enabled {
+            return;
+        }
+
+        if let Err(e) = self.missing_job_tracker.clear_not_found(job_id).await {
+            warn!(job_id = %job_id, error = %e, "failed to clear missing-job counter");
+        }
+    }
+
+    async fn cleanup_missing_job_state(&self, job_id: &JobId) -> Result<()> {
+        self.coordinator.mark_dormant(job_id);
+
+        if let Err(e) = self.store.remove_activity(job_id).await {
+            warn!(job_id = %job_id, error = %e, "failed to remove activity during auto-deregister cleanup");
+        }
+
+        self.deferred_jobs.remove(&job_id.0);
+
+        if let Some(probe) = &self.traffic_probe {
+            probe.clear_baseline(job_id).await;
+        }
+
+        self.registry.deregister(job_id).await?;
+
+        if let Err(e) = self.missing_job_tracker.clear_not_found(job_id).await {
+            warn!(job_id = %job_id, error = %e, "failed to clear missing-job counter after auto-deregister");
+        }
+
+        Ok(())
+    }
+
+    async fn handle_missing_job(&self, job_id: &JobId) {
+        if !self.auto_deregister_enabled {
+            warn!(job_id = %job_id, "Nomad reported job missing during scale-down but auto-deregister is disabled");
+            return;
+        }
+
+        let count = match self.missing_job_tracker.increment_not_found(job_id).await {
+            Ok(count) => count,
+            Err(e) => {
+                error!(job_id = %job_id, error = %e, "failed to increment missing-job counter");
+                return;
+            }
+        };
+
+        if count >= self.auto_deregister_threshold {
+            match self.cleanup_missing_job_state(job_id).await {
+                Ok(()) => {
+                    warn!(
+                        job_id = %job_id,
+                        count,
+                        threshold = self.auto_deregister_threshold,
+                        "auto-deregistered stale job after repeated scale-down missing-job responses"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        job_id = %job_id,
+                        count,
+                        threshold = self.auto_deregister_threshold,
+                        error = %e,
+                        "failed to auto-deregister stale job after scale-down missing-job threshold"
+                    );
+                }
+            }
+        } else {
+            warn!(
+                job_id = %job_id,
+                count,
+                threshold = self.auto_deregister_threshold,
+                "Nomad reported registered job missing during scale-down"
+            );
         }
     }
 
@@ -208,15 +293,46 @@ impl ScaleDownController {
             .scale_down(&registration.job_id, &registration.nomad_group)
             .await;
 
-        handle_scale_down_result(
-            self.store.as_ref(),
-            self.coordinator.as_ref(),
-            self.traffic_probe.as_deref(),
-            &self.deferred_jobs,
-            job_id,
-            scale_down_result,
-        )
-        .await;
+        match scale_down_result {
+            Ok(()) => {
+                self.clear_missing_job_counter(job_id).await;
+                handle_scale_down_result(
+                    self.store.as_ref(),
+                    self.coordinator.as_ref(),
+                    self.traffic_probe.as_deref(),
+                    &self.deferred_jobs,
+                    job_id,
+                    Ok(()),
+                )
+                .await;
+            }
+            Err(NscaleError::JobNotFound(_)) => {
+                self.handle_missing_job(job_id).await;
+            }
+            Err(err @ NscaleError::DeploymentInProgress { .. }) => {
+                self.clear_missing_job_counter(job_id).await;
+                handle_scale_down_result(
+                    self.store.as_ref(),
+                    self.coordinator.as_ref(),
+                    self.traffic_probe.as_deref(),
+                    &self.deferred_jobs,
+                    job_id,
+                    Err(err),
+                )
+                .await;
+            }
+            Err(e) => {
+                handle_scale_down_result(
+                    self.store.as_ref(),
+                    self.coordinator.as_ref(),
+                    self.traffic_probe.as_deref(),
+                    &self.deferred_jobs,
+                    job_id,
+                    Err(e),
+                )
+                .await;
+            }
+        }
     }
 }
 

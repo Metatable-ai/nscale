@@ -13,12 +13,16 @@
 #      service_name != job_id
 #   6. Scale the job to zero → request again → verify wake-up still works
 #   7. Wait for idle scale-down → verify the job can scale itself back to zero
+#   8. Submit slow-service → verify DELETE /admin/jobs/:job_id rejects purge
+#      while a proxied request is in flight
+#   9. Purge slow-service with force=true → verify Nomad and nscale both forget it
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 JOB_FILE="$SCRIPT_DIR/jobs/echo-submit.nomad"
+SLOW_JOB_FILE="$SCRIPT_DIR/jobs/slow-service.nomad"
 TRAEFIK_CERT_SCRIPT="$SCRIPT_DIR/traefik/certs/generate.sh"
 
 NOMAD_ADDR="http://localhost:4646"
@@ -33,6 +37,11 @@ SERVICE_GROUP="${SERVICE_GROUP:-main}"
 ROUTER_HOST="${ROUTER_HOST:-${SERVICE_NAME}.localhost}"
 HOST_HEADER="${HOST_HEADER:-${ROUTER_HOST}}"
 EXPECTED_TRAEFIK_SERVICE_TAG="traefik.http.routers.${SERVICE_NAME}.service=s2z-nscale@file"
+
+SLOW_JOB_ID="slow-service"
+SLOW_SERVICE_NAME="slow-service"
+SLOW_HOST_HEADER="slow-service.localhost"
+SLOW_DELAY_SECS="${SLOW_DELAY_SECS:-15}"
 
 # Timeouts
 INFRA_TIMEOUT=120
@@ -61,6 +70,16 @@ request_https() {
         --max-time "$max_time"
 }
 
+request_http_host_path() {
+    local host_header="$1"
+    local path="$2"
+    local max_time="${3:-30}"
+    curl -s -w "\n%{http_code}" \
+        -H "Host: $host_header" \
+        "${NSCALE_PROXY}${path}" \
+        --max-time "$max_time"
+}
+
 cleanup() {
     info "Cleaning up..."
     cd "$SCRIPT_DIR"
@@ -77,6 +96,74 @@ EOF
 )
 
     jq -n --rawfile hcl "$JOB_FILE" --arg variables "$variables" '{hcl: $hcl, variables: $variables}'
+}
+
+wait_for_job_running_id() {
+    local job_id="$1"
+    local timeout="${2:-$WAKE_TIMEOUT}"
+    local elapsed=0
+
+    while true; do
+        if [ "$elapsed" -ge "$timeout" ]; then
+            fail "Job ${job_id} did not start within ${timeout}s"
+            curl -s "$NOMAD_ADDR/v1/job/${job_id}/allocations" | jq .
+            exit 1
+        fi
+
+        local status alloc_status
+        status=$(curl -s "$NOMAD_ADDR/v1/job/${job_id}" | jq -r '.Status // "unknown"' 2>/dev/null || echo "unknown")
+        alloc_status=$(curl -s "$NOMAD_ADDR/v1/job/${job_id}/allocations" | jq -r '.[0].ClientStatus // "pending"' 2>/dev/null || echo "pending")
+        if [ "$status" = "running" ] && [ "$alloc_status" = "running" ]; then
+            return 0
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+wait_for_service_healthy_name() {
+    local service_name="$1"
+    local timeout="${2:-$WAKE_TIMEOUT}"
+    local elapsed=0
+
+    while true; do
+        if [ "$elapsed" -ge "$timeout" ]; then
+            fail "Service ${service_name} not healthy in Consul within ${timeout}s"
+            exit 1
+        fi
+
+        local healthy_count
+        healthy_count=$(curl -s "$CONSUL_ADDR/v1/health/service/${service_name}?passing=true" | jq 'length')
+        if [ "$healthy_count" -gt 0 ]; then
+            return 0
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+wait_for_nomad_job_missing() {
+    local job_id="$1"
+    local timeout="${2:-30}"
+    local elapsed=0
+
+    while true; do
+        if [ "$elapsed" -ge "$timeout" ]; then
+            fail "Nomad job ${job_id} was not purged within ${timeout}s"
+            exit 1
+        fi
+
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" "$NOMAD_ADDR/v1/job/${job_id}")
+        if [ "$code" = "404" ]; then
+            return 0
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
 }
 
 trap cleanup EXIT
@@ -252,11 +339,12 @@ elapsed=0
 while true; do
     if [ "$elapsed" -ge 60 ]; then
         fail "Deployment did not complete within 60s"
+        curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" | jq .
         exit 1
     fi
 
-    DEP_STATUS=$(curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" | jq -r '.[0].Status // "unknown"')
-    if [ "$DEP_STATUS" = "successful" ] || [ "$DEP_STATUS" = "null" ]; then
+    if curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" \
+        | jq -e 'length == 0 or all(.[]; (.Status // "unknown") == "successful" or (.Status // "unknown") == "failed" or (.Status // "unknown") == "cancelled")' >/dev/null; then
         break
     fi
 
@@ -389,6 +477,127 @@ else
     info "The scale-down controller may need more time. Continuing..."
 fi
 
+# ── 7. Test manual purge with in-flight protection ──────
+info "Submitting slow-service through nscale admin API for purge endpoint checks..."
+SLOW_SUBMIT_PAYLOAD=$(jq -n --rawfile hcl "$SLOW_JOB_FILE" '{hcl: $hcl}')
+SLOW_SUBMIT_RESP=$(curl -sS -w "\n%{http_code}" -X POST "$NSCALE_ADMIN/admin/jobs" \
+    -H "Content-Type: application/json" \
+    -d "$SLOW_SUBMIT_PAYLOAD")
+SLOW_SUBMIT_CODE=$(echo "$SLOW_SUBMIT_RESP" | tail -1)
+SLOW_SUBMIT_BODY=$(echo "$SLOW_SUBMIT_RESP" | sed '$d')
+
+if [ "$SLOW_SUBMIT_CODE" != "201" ]; then
+    fail "slow-service submission failed: HTTP $SLOW_SUBMIT_CODE"
+    echo "$SLOW_SUBMIT_BODY"
+    exit 1
+fi
+pass "slow-service submitted via /admin/jobs"
+
+info "Waiting for slow-service to be running..."
+wait_for_job_running_id "$SLOW_JOB_ID" "$WAKE_TIMEOUT"
+pass "slow-service is running"
+
+info "Waiting for slow-service to be healthy in Consul..."
+wait_for_service_healthy_name "$SLOW_SERVICE_NAME" "$WAKE_TIMEOUT"
+pass "slow-service is healthy in Consul"
+
+info "Warming slow-service through the proxy before in-flight purge checks..."
+SLOW_WARM_RESP=$(request_http_host_path "$SLOW_HOST_HEADER" "/" 30)
+SLOW_WARM_CODE=$(echo "$SLOW_WARM_RESP" | tail -1)
+SLOW_WARM_BODY=$(echo "$SLOW_WARM_RESP" | sed '$d')
+if [ "$SLOW_WARM_CODE" = "200" ]; then
+    pass "slow-service warm-path request succeeded: HTTP $SLOW_WARM_CODE — $SLOW_WARM_BODY"
+else
+    fail "slow-service warm-path request failed: HTTP $SLOW_WARM_CODE — $SLOW_WARM_BODY"
+    docker compose -f "$COMPOSE_FILE" logs nscale traefik
+    exit 1
+fi
+
+info "Starting long-running slow-service request (/cgi-bin/slow?delay=${SLOW_DELAY_SECS})..."
+SLOW_RESP_FILE=$(mktemp)
+curl -s -w "\n%{http_code}" \
+    -H "Host: $SLOW_HOST_HEADER" \
+    "${NSCALE_PROXY}/cgi-bin/slow?delay=${SLOW_DELAY_SECS}" \
+    --max-time "$((SLOW_DELAY_SECS + 30))" >"$SLOW_RESP_FILE" &
+SLOW_PID=$!
+
+sleep 2
+if ! kill -0 "$SLOW_PID" 2>/dev/null; then
+    fail "slow-service request finished before purge guard could be checked"
+    cat "$SLOW_RESP_FILE"
+    rm -f "$SLOW_RESP_FILE"
+    exit 1
+fi
+
+info "Calling DELETE /admin/jobs/${SLOW_JOB_ID} without force while request is in flight..."
+PURGE_BLOCKED_RESP=$(curl -sS -w "\n%{http_code}" -X DELETE "$NSCALE_ADMIN/admin/jobs/${SLOW_JOB_ID}")
+PURGE_BLOCKED_CODE=$(echo "$PURGE_BLOCKED_RESP" | tail -1)
+PURGE_BLOCKED_BODY=$(echo "$PURGE_BLOCKED_RESP" | sed '$d')
+
+if [ "$PURGE_BLOCKED_CODE" != "409" ]; then
+    fail "Expected purge guard to return 409, got HTTP $PURGE_BLOCKED_CODE"
+    echo "$PURGE_BLOCKED_BODY"
+    rm -f "$SLOW_RESP_FILE"
+    exit 1
+fi
+
+if echo "$PURGE_BLOCKED_BODY" | jq -e --arg job_id "$SLOW_JOB_ID" '.job_id == $job_id and ((.in_flight // 0) >= 1)' >/dev/null; then
+    pass "Purge endpoint rejected in-flight deletion without force"
+else
+    fail "Unexpected blocked purge response body"
+    echo "$PURGE_BLOCKED_BODY" | jq .
+    rm -f "$SLOW_RESP_FILE"
+    exit 1
+fi
+
+wait "$SLOW_PID"
+SLOW_REQUEST_CODE=$(tail -1 "$SLOW_RESP_FILE")
+SLOW_REQUEST_BODY=$(sed '$d' "$SLOW_RESP_FILE")
+rm -f "$SLOW_RESP_FILE"
+
+if [ "$SLOW_REQUEST_CODE" = "200" ] && grep -q "Done after ${SLOW_DELAY_SECS}s delay" <<<"$SLOW_REQUEST_BODY"; then
+    pass "In-flight request completed successfully after blocked purge: HTTP $SLOW_REQUEST_CODE — $SLOW_REQUEST_BODY"
+else
+    fail "In-flight request did not survive blocked purge: HTTP $SLOW_REQUEST_CODE — $SLOW_REQUEST_BODY"
+    docker compose -f "$COMPOSE_FILE" logs nscale traefik
+    exit 1
+fi
+
+info "Purging slow-service with force=true after the request completes..."
+FORCE_PURGE_RESP=$(curl -sS -w "\n%{http_code}" -X DELETE "$NSCALE_ADMIN/admin/jobs/${SLOW_JOB_ID}?force=true")
+FORCE_PURGE_CODE=$(echo "$FORCE_PURGE_RESP" | tail -1)
+FORCE_PURGE_BODY=$(echo "$FORCE_PURGE_RESP" | sed '$d')
+
+if [ "$FORCE_PURGE_CODE" != "200" ]; then
+    fail "force purge failed: HTTP $FORCE_PURGE_CODE"
+    echo "$FORCE_PURGE_BODY"
+    exit 1
+fi
+
+if echo "$FORCE_PURGE_BODY" | jq -e --arg job_id "$SLOW_JOB_ID" '.job_id == $job_id and .force == true' >/dev/null; then
+    pass "force=true purge succeeded"
+else
+    fail "Unexpected force purge response body"
+    echo "$FORCE_PURGE_BODY" | jq .
+    exit 1
+fi
+
+info "Waiting for Nomad to report slow-service as purged..."
+wait_for_nomad_job_missing "$SLOW_JOB_ID" 30
+pass "Nomad no longer knows about slow-service"
+
+info "Verifying slow-service is no longer registered in nscale..."
+POST_PURGE_RESP=$(request_http_host_path "$SLOW_HOST_HEADER" "/" 15)
+POST_PURGE_CODE=$(echo "$POST_PURGE_RESP" | tail -1)
+POST_PURGE_BODY=$(echo "$POST_PURGE_RESP" | sed '$d')
+if [ "$POST_PURGE_CODE" = "404" ]; then
+    pass "Purged slow-service now fails fast through nscale: HTTP $POST_PURGE_CODE — $POST_PURGE_BODY"
+else
+    fail "Expected purged slow-service to return 404, got HTTP $POST_PURGE_CODE — $POST_PURGE_BODY"
+    docker compose -f "$COMPOSE_FILE" logs nscale traefik
+    exit 1
+fi
+
 # ── Summary ───────────────────────────────────────────────
 echo ""
 echo "========================================"
@@ -404,4 +613,6 @@ echo "  5. nscale wakes the dormant job on incoming HTTPS request"
 if $scaled_down; then
     echo "  6. Automatic scale-down after idle timeout"
 fi
+echo "  7. DELETE /admin/jobs/:job_id rejects purge while proxied work is in flight"
+echo "  8. force=true purges slow-service from both Nomad and nscale state"
 echo ""

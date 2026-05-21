@@ -38,6 +38,22 @@ impl NomadClient {
         format!("{}{}", self.base_url, path)
     }
 
+    fn classify_job_error(
+        status: reqwest::StatusCode,
+        body: &str,
+        method: &str,
+        path: &str,
+        job_id: &JobId,
+    ) -> NscaleError {
+        if status == reqwest::StatusCode::NOT_FOUND
+            || body.to_ascii_lowercase().contains("job not found")
+        {
+            return NscaleError::JobNotFound(job_id.0.clone());
+        }
+
+        NscaleError::Nomad(format!("{} {} returned {}: {}", method, path, status, body))
+    }
+
     async fn ensure_success(
         &self,
         resp: reqwest::Response,
@@ -54,6 +70,24 @@ impl NomadClient {
             "{} {} returned {}: {}",
             method, path, status, body
         )))
+    }
+
+    async fn ensure_job_success(
+        &self,
+        resp: reqwest::Response,
+        method: &str,
+        path: &str,
+        job_id: &JobId,
+    ) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(Self::classify_job_error(
+            status, &body, method, path, job_id,
+        ))
     }
 
     #[instrument(skip(self, hcl, variables), fields(has_variables = variables.is_some()))]
@@ -89,39 +123,30 @@ impl NomadClient {
     }
 
     pub async fn get_job(&self, job_id: &JobId) -> Result<Job> {
-        let resp = self
-            .client
-            .get(self.url(&format!("/v1/job/{}", job_id)))
-            .send()
-            .await?;
+        let path = format!("/v1/job/{}", job_id);
+        let resp = self.client.get(self.url(&path)).send().await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(NscaleError::Nomad(format!(
-                "GET /v1/job/{} returned {}: {}",
-                job_id, status, body
-            )));
-        }
+        let resp = self.ensure_job_success(resp, "GET", &path, job_id).await?;
 
         Ok(resp.json().await?)
     }
 
     pub async fn get_allocations(&self, job_id: &JobId) -> Result<Vec<Allocation>> {
-        let resp = self
-            .client
-            .get(self.url(&format!("/v1/job/{}/allocations", job_id)))
-            .send()
-            .await?;
+        let path = format!("/v1/job/{}/allocations", job_id);
+        let resp = self.client.get(self.url(&path)).send().await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(NscaleError::Nomad(format!(
-                "GET /v1/job/{}/allocations returned {}: {}",
-                job_id, status, body
-            )));
-        }
+        let resp = self.ensure_job_success(resp, "GET", &path, job_id).await?;
+
+        Ok(resp.json().await?)
+    }
+
+    #[instrument(skip(self), fields(job_id = %job_id))]
+    pub async fn stop_and_purge_job(&self, job_id: &JobId) -> Result<JobStopResponse> {
+        let path = format!("/v1/job/{}?purge=true", job_id);
+        let resp = self.client.delete(self.url(&path)).send().await?;
+        let resp = self
+            .ensure_job_success(resp, "DELETE", &path, job_id)
+            .await?;
 
         Ok(resp.json().await?)
     }
@@ -167,6 +192,8 @@ impl Orchestrator for NomadClient {
     async fn scale_up(&self, job_id: &JobId, group: &str, count: u32) -> Result<()> {
         debug!("scaling up job");
 
+        let path = format!("/v1/job/{}/scale", job_id);
+
         let req = ScaleRequest {
             count: Some(count),
             target: ScaleTarget {
@@ -175,12 +202,7 @@ impl Orchestrator for NomadClient {
             message: Some("nscale: scaling up on demand".to_string()),
         };
 
-        let resp = self
-            .client
-            .post(self.url(&format!("/v1/job/{}/scale", job_id)))
-            .json(&req)
-            .send()
-            .await?;
+        let resp = self.client.post(self.url(&path)).json(&req).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -196,10 +218,9 @@ impl Orchestrator for NomadClient {
                 info!(job_id = %job_id, "scale-up blocked by active deployment, proceeding to wait");
                 return Ok(());
             }
-            return Err(NscaleError::Nomad(format!(
-                "POST /v1/job/{}/scale returned {}: {}",
-                job_id, status, body
-            )));
+            return Err(Self::classify_job_error(
+                status, &body, "POST", &path, job_id,
+            ));
         }
 
         let scale_resp: ScaleResponse = resp.json().await?;
@@ -214,6 +235,8 @@ impl Orchestrator for NomadClient {
     async fn scale_down(&self, job_id: &JobId, group: &str) -> Result<()> {
         debug!("scaling down job");
 
+        let path = format!("/v1/job/{}/scale", job_id);
+
         let req = ScaleRequest {
             count: Some(0),
             target: ScaleTarget {
@@ -222,12 +245,7 @@ impl Orchestrator for NomadClient {
             message: Some("nscale: scaling to zero after idle".to_string()),
         };
 
-        let resp = self
-            .client
-            .post(self.url(&format!("/v1/job/{}/scale", job_id)))
-            .json(&req)
-            .send()
-            .await?;
+        let resp = self.client.post(self.url(&path)).json(&req).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -243,10 +261,9 @@ impl Orchestrator for NomadClient {
                     operation: "scale down",
                 });
             }
-            return Err(NscaleError::Nomad(format!(
-                "POST /v1/job/{}/scale (down) returned {}: {}",
-                job_id, status, body
-            )));
+            return Err(Self::classify_job_error(
+                status, &body, "POST", &path, job_id,
+            ));
         }
 
         Ok(())
@@ -284,7 +301,7 @@ impl Orchestrator for NomadClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -413,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scale_down_other_400_error_fails() {
+    async fn test_scale_down_job_not_found_returns_job_not_found() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -427,7 +444,24 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
-        assert!(result.is_err(), "other 400 errors should still fail");
+
+        assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
+    }
+
+    #[tokio::test]
+    async fn test_scale_down_invalid_group_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid group"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client.scale_down(&"test-job".into(), "web").await;
+        assert!(matches!(result, Err(NscaleError::Nomad(_))));
     }
 
     #[tokio::test]
@@ -530,7 +564,7 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.get_job(&"missing-job".into()).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "missing-job"));
     }
 
     #[tokio::test]
@@ -556,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scale_up_other_400_error_fails() {
+    async fn test_scale_up_job_not_found_returns_job_not_found() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -570,6 +604,64 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
-        assert!(result.is_err(), "other 400 errors should still fail");
+        assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
+    }
+
+    #[tokio::test]
+    async fn test_scale_up_invalid_group_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid group"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client.scale_up(&"test-job".into(), "web", 1).await;
+        assert!(matches!(result, Err(NscaleError::Nomad(_))));
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_purge_job() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/v1/job/test-job"))
+            .and(query_param("purge", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "EvalID": "eval-stop-123",
+                "EvalCreateIndex": 99,
+                "JobModifyIndex": 42
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let response = client.stop_and_purge_job(&"test-job".into()).await.unwrap();
+
+        assert_eq!(response.eval_id, "eval-stop-123");
+        assert_eq!(response.eval_create_index, 99);
+        assert_eq!(response.job_modify_index, 42);
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_purge_missing_job_returns_job_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/v1/job/test-job"))
+            .and(query_param("purge", "true"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("job not found"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client.stop_and_purge_job(&"test-job".into()).await;
+
+        assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
     }
 }

@@ -67,6 +67,16 @@ pub struct ScalingConfig {
     pub scale_down_interval_secs: u64,
     #[serde(default = "default_min_scale_down_age")]
     pub min_scale_down_age_secs: u64,
+    #[serde(default)]
+    pub auto_deregister: AutoDeregisterConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDeregisterConfig {
+    #[serde(default = "default_auto_deregister_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_deregister_not_found_threshold")]
+    pub not_found_threshold: u32,
 }
 
 impl ScalingConfig {
@@ -84,6 +94,15 @@ impl ScalingConfig {
 
     pub fn min_scale_down_age(&self) -> Duration {
         Duration::from_secs(self.min_scale_down_age_secs)
+    }
+}
+
+impl Default for AutoDeregisterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_deregister_enabled(),
+            not_found_threshold: default_auto_deregister_not_found_threshold(),
+        }
     }
 }
 
@@ -150,6 +169,12 @@ fn default_scale_down_interval() -> u64 {
 fn default_min_scale_down_age() -> u64 {
     120
 }
+fn default_auto_deregister_enabled() -> bool {
+    true
+}
+fn default_auto_deregister_not_found_threshold() -> u32 {
+    5
+}
 fn default_request_timeout() -> u64 {
     30
 }
@@ -194,6 +219,7 @@ impl Default for Config {
                 wake_timeout_secs: default_wake_timeout(),
                 scale_down_interval_secs: default_scale_down_interval(),
                 min_scale_down_age_secs: default_min_scale_down_age(),
+                auto_deregister: AutoDeregisterConfig::default(),
             },
             proxy: ProxyConfig {
                 request_timeout_secs: default_request_timeout(),
@@ -231,6 +257,8 @@ mod tests {
         assert_eq!(cfg.nomad.concurrency, 50);
         assert_eq!(cfg.scaling.idle_timeout_secs, 300);
         assert_eq!(cfg.scaling.wake_timeout().as_secs(), 60);
+        assert!(cfg.scaling.auto_deregister.enabled);
+        assert_eq!(cfg.scaling.auto_deregister.not_found_threshold, 5);
         assert_eq!(cfg.proxy.request_timeout().as_secs(), 30);
         assert!(!cfg.registry.durable_enabled);
         assert_eq!(cfg.registry.etcd_endpoints, "http://localhost:2379");

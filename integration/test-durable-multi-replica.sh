@@ -8,6 +8,9 @@
 #   4. Delete shared Redis registry hashes
 #   5. Send request directly to replica B proxy (:18080) and verify it reloads from etcd
 #   6. Scale the job to zero, purge Redis again, and verify replica B can wake it via etcd fallback
+#   7. Delete the Nomad job directly while leaving the durable nscale registration intact
+#   8. Send repeated requests across replica A and replica B and verify the shared
+#      missing-job counter auto-deregisters the stale registration at the threshold
 
 set -euo pipefail
 
@@ -20,6 +23,7 @@ COMPOSE_ARGS=(-f "$COMPOSE_BASE" -f "$COMPOSE_DURABLE")
 
 NOMAD_ADDR="http://localhost:4646"
 NSCALE_ADMIN_A="http://localhost:9090"
+NSCALE_PROXY_A="http://localhost:80"
 NSCALE_PROXY_B="http://localhost:18080"
 ETCD_PREFIX="${ETCD_PREFIX:-/nscale/registrations}"
 
@@ -33,6 +37,7 @@ ETCD_SERVICE_KEY="${ETCD_PREFIX}/services/${SERVICE_NAME}"
 
 INFRA_TIMEOUT=150
 WAKE_TIMEOUT=60
+AUTO_DEREGISTER_THRESHOLD="${AUTO_DEREGISTER_THRESHOLD:-5}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,6 +55,11 @@ dc() {
 request_replica_b() {
     local max_time="${1:-30}"
     curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY_B/" --max-time "$max_time"
+}
+
+request_replica_a() {
+    local max_time="${1:-30}"
+    curl -s -w "\n%{http_code}" -H "Host: $HOST_HEADER" "$NSCALE_PROXY_A/" --max-time "$max_time"
 }
 
 build_submit_payload() {
@@ -112,6 +122,28 @@ assert_redis_registry_empty() {
     fi
 }
 
+assert_redis_registration_absent() {
+    local job_json service_json
+    job_json=$(dc exec -T redis redis-cli --raw HGET nscale:jobs "$JOB_ID" | tr -d '\r')
+    service_json=$(dc exec -T redis redis-cli --raw HGET nscale:jobs:services "$SERVICE_NAME" | tr -d '\r')
+
+    if [[ -n "$job_json" || -n "$service_json" ]]; then
+        fail "Expected Redis registration entries to be removed"
+        exit 1
+    fi
+}
+
+assert_etcd_registration_absent() {
+    local job_json service_json
+    job_json=$(dc exec -T etcd /usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 get "$ETCD_JOB_KEY" --print-value-only | tr -d '\r')
+    service_json=$(dc exec -T etcd /usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 get "$ETCD_SERVICE_KEY" --print-value-only | tr -d '\r')
+
+    if [[ -n "$job_json" || -n "$service_json" ]]; then
+        fail "Expected etcd registration entries to be removed"
+        exit 1
+    fi
+}
+
 wait_for_job_running() {
     local elapsed=0
     while true; do
@@ -138,17 +170,53 @@ wait_for_deployment_complete() {
     while true; do
         if [ "$elapsed" -ge 60 ]; then
             fail "Deployment did not complete within 60s"
+            curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" | jq .
             exit 1
         fi
 
-        local deployment_status
-        deployment_status=$(curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" | jq -r '.[0].Status // "null"')
-        if [ "$deployment_status" = "successful" ] || [ "$deployment_status" = "null" ]; then
+        if curl -s "$NOMAD_ADDR/v1/job/${JOB_ID}/deployments" \
+            | jq -e 'length == 0 or all(.[]; (.Status // "unknown") == "successful" or (.Status // "unknown") == "failed" or (.Status // "unknown") == "cancelled")' >/dev/null; then
             return 0
         fi
 
         sleep 2
         elapsed=$((elapsed + 2))
+    done
+}
+
+scale_job_to_zero() {
+    local failure_label="$1"
+    local message="$2"
+    local retry_timeout="${3:-30}"
+    local elapsed=0
+
+    while true; do
+        wait_for_deployment_complete
+
+        local scale_resp scale_code scale_body
+        scale_resp=$(curl -s -w "\n%{http_code}" -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
+            -H "Content-Type: application/json" \
+            -d "{\"Count\":0,\"Target\":{\"Group\":\"${SERVICE_GROUP}\"},\"Message\":\"${message}\"}")
+        scale_code=$(echo "$scale_resp" | tail -1)
+        scale_body=$(echo "$scale_resp" | sed '$d')
+
+        if [[ "$scale_code" =~ ^2 ]]; then
+            return 0
+        fi
+
+        if [[ "$scale_code" = "400" ]] && grep -qi "deployment" <<<"$scale_body"; then
+            if [ "$elapsed" -ge "$retry_timeout" ]; then
+                fail "${failure_label}: HTTP $scale_code — $scale_body"
+                exit 1
+            fi
+
+            sleep 2
+            elapsed=$((elapsed + 2))
+            continue
+        fi
+
+        fail "${failure_label}: HTTP $scale_code — $scale_body"
+        exit 1
     done
 }
 
@@ -265,15 +333,9 @@ assert_redis_registration_present
 pass "Replica B reloaded the registry from etcd and repopulated shared Redis"
 
 info "Scaling job to zero before replica B cold-start fallback check..."
-wait_for_deployment_complete
-SCALE_RESP=$(curl -s -w "\n%{http_code}" -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
-    -H "Content-Type: application/json" \
-    -d "{\"Count\":0,\"Target\":{\"Group\":\"${SERVICE_GROUP}\"},\"Message\":\"multi-replica durable integration test: force scale-down\"}")
-SCALE_CODE=$(echo "$SCALE_RESP" | tail -1)
-if [[ ! "$SCALE_CODE" =~ ^2 ]]; then
-    fail "Scale-down before replica B cold-start check failed: HTTP $SCALE_CODE"
-    exit 1
-fi
+scale_job_to_zero \
+    "Scale-down before replica B cold-start check failed" \
+    "multi-replica durable integration test: force scale-down"
 wait_for_job_zero
 pass "Job scaled to zero"
 
@@ -294,6 +356,74 @@ fi
 assert_redis_registration_present
 pass "Replica B cold-start etcd fallback succeeded and repopulated shared Redis"
 
+info "Scaling job to zero again before stale-registration auto-deregister checks..."
+scale_job_to_zero \
+    "Scale-down before stale-registration check failed" \
+    "multi-replica durable integration test: prepare stale registration"
+wait_for_job_zero
+pass "Job scaled to zero before stale-registration check"
+
+info "Deleting the Nomad job directly while leaving nscale registrations intact..."
+PURGE_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$NOMAD_ADDR/v1/job/${JOB_ID}?purge=true")
+PURGE_CODE=$(echo "$PURGE_RESP" | tail -1)
+PURGE_BODY=$(echo "$PURGE_RESP" | sed '$d')
+if [[ ! "$PURGE_CODE" =~ ^2 ]]; then
+    fail "Direct Nomad purge failed: HTTP $PURGE_CODE — $PURGE_BODY"
+    exit 1
+fi
+assert_redis_registration_present
+assert_etcd_registration_present
+pass "Nomad job was removed while nscale still retained the durable registration"
+
+info "Sending repeated requests across replica A and replica B to hit the shared auto-deregister threshold..."
+for attempt in 1 2; do
+    RESP=$(request_replica_a 15)
+    HTTP_CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$HTTP_CODE" != "503" ]; then
+        fail "Replica A stale-job attempt ${attempt}/${AUTO_DEREGISTER_THRESHOLD} expected 503, got HTTP $HTTP_CODE — $BODY"
+        dc logs nscale nscale-2
+        exit 1
+    fi
+    pass "Replica A stale-job attempt ${attempt}/${AUTO_DEREGISTER_THRESHOLD} returned 503"
+done
+
+for attempt in 3 4; do
+    RESP=$(request_replica_b 15)
+    HTTP_CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    if [ "$HTTP_CODE" != "503" ]; then
+        fail "Replica B stale-job attempt ${attempt}/${AUTO_DEREGISTER_THRESHOLD} expected 503, got HTTP $HTTP_CODE — $BODY"
+        dc logs nscale nscale-2
+        exit 1
+    fi
+    pass "Replica B stale-job attempt ${attempt}/${AUTO_DEREGISTER_THRESHOLD} returned 503"
+done
+
+RESP=$(request_replica_b 15)
+HTTP_CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$HTTP_CODE" != "404" ]; then
+    fail "Replica B threshold attempt ${AUTO_DEREGISTER_THRESHOLD}/${AUTO_DEREGISTER_THRESHOLD} expected 404, got HTTP $HTTP_CODE — $BODY"
+    dc logs nscale nscale-2
+    exit 1
+fi
+pass "Replica B reached the shared auto-deregister threshold and returned 404"
+
+assert_redis_registration_absent
+assert_etcd_registration_absent
+pass "Auto-deregister removed the stale registration from both Redis and etcd"
+
+RESP=$(request_replica_a 15)
+HTTP_CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [ "$HTTP_CODE" != "404" ]; then
+    fail "Replica A did not observe the shared auto-deregister cleanup: HTTP $HTTP_CODE — $BODY"
+    dc logs nscale nscale-2
+    exit 1
+fi
+pass "Replica A also returns 404 after the shared auto-deregister cleanup"
+
 echo ""
 echo "========================================"
 echo -e "${GREEN}  Multi-replica durable integration test completed!${NC}"
@@ -305,4 +435,6 @@ echo "  2. replica B can serve requests after shared Redis registry loss by fall
 echo "  3. replica B can wake a scaled-to-zero service after shared Redis registry loss"
 echo "  4. shared Redis registry cache is repopulated after replica B fallback"
 echo "  5. service_name (${SERVICE_NAME}) lookup still works when job_id is ${JOB_ID}"
+echo "  6. repeated Nomad missing-job responses are counted across replica A and replica B"
+echo "  7. the shared auto-deregister threshold removes the stale registration from Redis and etcd"
 echo ""

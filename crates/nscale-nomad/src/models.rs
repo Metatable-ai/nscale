@@ -30,6 +30,18 @@ pub struct JobSubmitResponse {
     pub warnings: Option<String>,
 }
 
+/// Response from DELETE /v1/job/{id}?purge=true.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct JobStopResponse {
+    #[serde(rename = "EvalID")]
+    pub eval_id: String,
+    #[serde(default)]
+    pub eval_create_index: u64,
+    #[serde(default)]
+    pub job_modify_index: u64,
+}
+
 /// Request body for PUT /v1/job/{id}/scale.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]

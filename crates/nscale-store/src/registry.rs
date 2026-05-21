@@ -113,14 +113,15 @@ impl JobRegistry {
             durable.remove_registration(job_id).await?;
 
             if let Err(err) = self.remove_cached_registration(job_id).await {
-                if let Some(reg) = existing.as_ref() && let Err(restore_err) = durable.store_registration(reg).await {
-                        error!(
-                            job_id = %job_id,
-                            error = %restore_err,
-                            "failed to restore durable registration after Redis cache eviction error"
-                        );
-                    }
-                
+                if let Some(reg) = existing.as_ref()
+                    && let Err(restore_err) = durable.store_registration(reg).await
+                {
+                    error!(
+                        job_id = %job_id,
+                        error = %restore_err,
+                        "failed to restore durable registration after Redis cache eviction error"
+                    );
+                }
 
                 return Err(err);
             }

@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -20,7 +20,7 @@ use nscale_core::config::Config;
 use nscale_core::error::NscaleError;
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::{JobId, JobRegistration};
-use nscale_core::traits::ActivityStore;
+use nscale_core::traits::{ActivityStore, MissingJobTracker};
 use nscale_etcd::EtcdClient;
 use nscale_nomad::client::NomadClient;
 use nscale_nomad::events::{EventStreamConfig, start_event_stream};
@@ -31,6 +31,7 @@ use nscale_scaler::controller::ScaleDownController;
 use nscale_scaler::event_processor::EventProcessor;
 use nscale_scaler::traffic_probe::TrafficProbe;
 use nscale_store::activity::RedisActivityStore;
+use nscale_store::auto_deregister::RedisMissingJobTracker;
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::WakeCoordinator;
 
@@ -138,7 +139,10 @@ async fn main() {
                 }),
         );
 
-        let registry = Arc::new(JobRegistry::with_durable(redis_client, durable_registry));
+        let registry = Arc::new(JobRegistry::with_durable(
+            redis_client.clone(),
+            durable_registry,
+        ));
         match registry.sync_from_durable().await {
             Ok(restored) => {
                 info!(restored, "hydrated Redis registry cache from etcd");
@@ -149,8 +153,10 @@ async fn main() {
         }
         registry
     } else {
-        Arc::new(JobRegistry::new(redis_client))
+        Arc::new(JobRegistry::new(redis_client.clone()))
     };
+    let missing_job_tracker: Arc<dyn MissingJobTracker> =
+        Arc::new(RedisMissingJobTracker::new(redis_client.clone()));
     info!("connected to Redis");
 
     // ── Build subsystems ─────────────────────────────────
@@ -190,6 +196,9 @@ async fn main() {
         in_flight: in_flight.clone(),
         activity_store: activity_store.clone(),
         heartbeat_interval,
+        missing_job_tracker: missing_job_tracker.clone(),
+        auto_deregister_enabled: config.scaling.auto_deregister.enabled,
+        auto_deregister_threshold: config.scaling.auto_deregister.not_found_threshold,
     };
 
     let cancel = CancellationToken::new();
@@ -208,8 +217,11 @@ async fn main() {
         coordinator.clone(),
         traffic_probe,
         in_flight.clone(),
+        missing_job_tracker.clone(),
         config.scaling.idle_timeout(),
         config.scaling.scale_down_interval(),
+        config.scaling.auto_deregister.enabled,
+        config.scaling.auto_deregister.not_found_threshold,
         cancel.clone(),
     );
     let scaler_handle = tokio::spawn(scaler.run());
@@ -245,6 +257,9 @@ async fn main() {
         registry: registry.clone(),
         activity_store: activity_store.clone(),
         nomad_client: nomad_client.clone(),
+        coordinator: coordinator.clone(),
+        in_flight: in_flight.clone(),
+        missing_job_tracker: missing_job_tracker.clone(),
         file_provider_service: config.routing.file_provider_service.clone(),
     };
 
@@ -252,6 +267,7 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/admin/jobs", post(admin_submit_job))
+        .route("/admin/jobs/{job_id}", delete(admin_purge_job))
         .route("/admin/registry", post(admin_register))
         .route("/admin/registry/sync", post(admin_sync))
         .with_state(admin_state);
@@ -298,6 +314,9 @@ struct AdminState {
     registry: Arc<JobRegistry>,
     activity_store: Arc<dyn ActivityStore>,
     nomad_client: Arc<NomadClient>,
+    coordinator: Arc<WakeCoordinator>,
+    in_flight: InFlightTracker,
+    missing_job_tracker: Arc<dyn MissingJobTracker>,
     file_provider_service: String,
 }
 
@@ -326,6 +345,12 @@ struct SubmitJobResponse {
     registration_failures: Vec<RegistrationFailure>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DeleteJobQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -342,6 +367,104 @@ async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
         Ok(_) => (StatusCode::OK, "ready").into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}")).into_response(),
     }
+}
+
+async fn cleanup_admin_job_state(
+    state: &AdminState,
+    job_id: &JobId,
+) -> Result<Vec<String>, NscaleError> {
+    let mut warnings = Vec::new();
+
+    state.coordinator.mark_dormant(job_id);
+
+    if let Err(e) = state.activity_store.remove_activity(job_id).await {
+        warnings.push(format!("failed to remove activity: {e}"));
+    }
+
+    state.registry.deregister(job_id).await?;
+
+    if let Err(e) = state.missing_job_tracker.clear_not_found(job_id).await {
+        warnings.push(format!("failed to clear missing-job counter: {e}"));
+    }
+
+    Ok(warnings)
+}
+
+async fn admin_purge_job(
+    State(state): State<AdminState>,
+    Path(job_id): Path<String>,
+    Query(query): Query<DeleteJobQuery>,
+) -> impl IntoResponse {
+    let job_id = JobId(job_id);
+    let in_flight = state.in_flight.count(&job_id.0);
+
+    if in_flight > 0 && !query.force {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "job has in-flight proxied requests; retry with force=true to purge anyway",
+                "job_id": job_id,
+                "in_flight": in_flight,
+            })),
+        )
+            .into_response();
+    }
+
+    let (purged, eval_id) = match state.nomad_client.stop_and_purge_job(&job_id).await {
+        Ok(response) => (true, Some(response.eval_id)),
+        Err(NscaleError::JobNotFound(_)) => {
+            info!(job_id = %job_id, "Nomad job already missing during purge; cleaning up nscale state only");
+            (false, None)
+        }
+        Err(e) => {
+            error!(job_id = %job_id, error = %e, "failed to stop and purge Nomad job");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": e.to_string(),
+                    "job_id": job_id,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let warnings = match cleanup_admin_job_state(&state, &job_id).await {
+        Ok(warnings) => warnings,
+        Err(e) => {
+            error!(job_id = %job_id, error = %e, "failed to clean up nscale state after Nomad purge");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": e.to_string(),
+                    "job_id": job_id,
+                    "purged": purged,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    info!(
+        job_id = %job_id,
+        force = query.force,
+        purged,
+        in_flight,
+        "purged job via admin API"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "job_id": job_id,
+            "purged": purged,
+            "force": query.force,
+            "in_flight": in_flight,
+            "eval_id": eval_id,
+            "warnings": warnings,
+        })),
+    )
+        .into_response()
 }
 
 async fn admin_submit_job(

@@ -17,6 +17,7 @@ pub struct WakeState {
 #[derive(Debug, Clone)]
 pub enum WakeResult {
     Ready(Endpoint),
+    JobNotFound(String),
     Failed(String),
     /// All request handlers disconnected before the wake completed.
     Cancelled,

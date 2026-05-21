@@ -18,6 +18,10 @@ wake_timeout_secs = 60
 scale_down_interval_secs = 5
 min_scale_down_age_secs = 10
 
+[default.scaling.auto_deregister]
+enabled = true
+not_found_threshold = 5
+
 [default.proxy]
 request_timeout_secs = 90
 request_buffer_size = 1000
