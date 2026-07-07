@@ -15,6 +15,10 @@ fn lock_key(key: &str) -> String {
     format!("nscale:lock:{}", key)
 }
 
+fn cooldown_key(key: &str) -> String {
+    format!("nscale:cooldown:{}", key)
+}
+
 fn now_epoch_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -97,6 +101,16 @@ impl ActivityStore for RedisActivityStore {
         Ok(score.is_some())
     }
 
+    #[instrument(skip(self), fields(job_id = %job_id))]
+    async fn idle_age(&self, job_id: &JobId) -> Result<Option<Duration>> {
+        let score: Option<f64> = self
+            .client
+            .zscore(ACTIVITY_KEY, job_id.0.as_str())
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(score.map(|last| Duration::from_secs_f64((now_epoch_secs() - last).max(0.0))))
+    }
+
     #[instrument(skip(self), fields(key = key, ttl = ?ttl))]
     async fn try_acquire_lock(&self, key: &str, ttl: Duration) -> Result<bool> {
         let lock = lock_key(key);
@@ -140,6 +154,29 @@ impl ActivityStore for RedisActivityStore {
             .map_err(|e| NscaleError::Store(e.to_string()))?;
 
         Ok(())
+    }
+
+    #[instrument(skip(self), fields(key = key, ttl = ?ttl))]
+    async fn set_cooldown(&self, key: &str, ttl: Duration) -> Result<()> {
+        let ck = cooldown_key(key);
+        let ttl_ms = ttl.as_millis() as i64;
+        let _: () = self
+            .client
+            .set(&ck, "1", Some(Expiration::PX(ttl_ms)), None, false)
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(key = key))]
+    async fn in_cooldown(&self, key: &str) -> Result<bool> {
+        let ck = cooldown_key(key);
+        let count: i64 = self
+            .client
+            .exists(ck)
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(count > 0)
     }
 
     #[instrument(skip(self), fields(job_id = %job_id))]

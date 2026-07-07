@@ -3,6 +3,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Upper bound on a per-job autoscale decision window. Must stay `<=` the proxy's
+/// in-memory sample retention (`nscale-proxy` `MAX_SAMPLE_AGE`) so proxy-native
+/// p95/counts are never silently computed over a truncated window.
+pub const MAX_DECISION_WINDOW_SECS: u64 = 1800;
+
 /// Unique identifier for a Nomad job.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobId(pub String);
@@ -137,11 +142,39 @@ impl JobAutoscalingPolicy {
             return Err("autoscaling decision_window_secs must be greater than zero".into());
         }
 
+        if let Some(window) = self.decision_window_secs
+            && window > MAX_DECISION_WINDOW_SECS
+        {
+            return Err(format!(
+                "autoscaling decision_window_secs must be <= {MAX_DECISION_WINDOW_SECS}"
+            ));
+        }
+
         if self.target_requests_per_second_per_instance.is_none()
             && self.target_p95_latency_ms.is_none()
             && self.max_error_rate.is_none()
         {
             return Err("autoscaling policy must define at least one metric target".into());
+        }
+
+        if let Some(rps) = self.target_requests_per_second_per_instance
+            && (!rps.is_finite() || rps <= 0.0)
+        {
+            return Err(
+                "autoscaling target_requests_per_second_per_instance must be finite and > 0".into(),
+            );
+        }
+
+        if let Some(latency) = self.target_p95_latency_ms
+            && (!latency.is_finite() || latency <= 0.0)
+        {
+            return Err("autoscaling target_p95_latency_ms must be finite and > 0".into());
+        }
+
+        if let Some(error_rate) = self.max_error_rate
+            && (!error_rate.is_finite() || error_rate <= 0.0 || error_rate > 1.0)
+        {
+            return Err("autoscaling max_error_rate must be finite and within (0.0, 1.0]".into());
         }
 
         Ok(())
@@ -366,5 +399,63 @@ mod tests {
         };
 
         assert!(policy.validate().is_err());
+
+        let policy = JobAutoscalingPolicy {
+            decision_window_secs: Some(MAX_DECISION_WINDOW_SECS + 1),
+            ..policy
+        };
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn autoscaling_policy_validation_rejects_out_of_range_targets() {
+        let base = JobAutoscalingPolicy {
+            enabled: true,
+            min_count: 1,
+            max_count: 3,
+            scale_to_zero: true,
+            scale_up_step: 1,
+            scale_down_step: 1,
+            target_requests_per_second_per_instance: Some(10.0),
+            target_p95_latency_ms: Some(500.0),
+            max_error_rate: Some(0.05),
+            cooldown_secs: None,
+            decision_window_secs: None,
+        };
+        assert!(base.validate().is_ok());
+
+        assert!(
+            JobAutoscalingPolicy {
+                target_requests_per_second_per_instance: Some(0.0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobAutoscalingPolicy {
+                target_p95_latency_ms: Some(-1.0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobAutoscalingPolicy {
+                max_error_rate: Some(1.5),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobAutoscalingPolicy {
+                target_p95_latency_ms: Some(f64::NAN),
+                ..base
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

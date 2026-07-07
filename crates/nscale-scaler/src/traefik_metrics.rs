@@ -8,6 +8,10 @@ use nscale_core::job::JobRegistration;
 use crate::autoscale_policy::MetricSnapshot;
 use crate::metrics_provider::MetricsProvider;
 
+/// Drop a label key entirely once its newest sample is older than this bound
+/// (e.g. the job was deregistered). Independent of any per-call window.
+const STALE_KEY_TTL: Duration = Duration::from_secs(1800);
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct TraefikCounters {
     pub total: u64,
@@ -44,6 +48,10 @@ impl TraefikMetricsProvider {
 
 #[async_trait]
 impl MetricsProvider for TraefikMetricsProvider {
+    fn name(&self) -> &'static str {
+        "traefik"
+    }
+
     async fn snapshot(
         &self,
         registration: &JobRegistration,
@@ -80,9 +88,18 @@ impl MetricsProvider for TraefikMetricsProvider {
         };
 
         let mut last = self.last_samples.lock().await;
+        let now = Instant::now();
+        // Evict keys for jobs that have gone fully silent (e.g. deregistered)
+        // without trimming still-active keys by another job's (possibly shorter)
+        // window. Only whole, stale keys are dropped here.
+        last.retain(|_, samples| {
+            samples
+                .last()
+                .is_some_and(|sample| now.duration_since(sample.observed_at) <= STALE_KEY_TTL)
+        });
+        let retention = window.saturating_mul(2).max(Duration::from_secs(1));
         let samples = last.entry(sample_key).or_default();
         samples.push(current);
-        let retention = window.saturating_mul(2).max(Duration::from_secs(1));
         samples
             .retain(|sample| current.observed_at.duration_since(sample.observed_at) <= retention);
 

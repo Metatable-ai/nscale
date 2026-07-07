@@ -61,11 +61,20 @@ pub trait ActivityStore: Send + Sync {
     /// Check whether a job has an activity record (any score at all).
     async fn has_activity(&self, job_id: &JobId) -> Result<bool>;
 
+    /// Duration since a job was last active, if it has an activity record.
+    async fn idle_age(&self, job_id: &JobId) -> Result<Option<Duration>>;
+
     /// Attempt to acquire a distributed lock. Returns `true` if acquired.
     async fn try_acquire_lock(&self, key: &str, ttl: Duration) -> Result<bool>;
 
     /// Release a distributed lock.
     async fn release_lock(&self, key: &str) -> Result<()>;
+
+    /// Mark `key` as being in cooldown for `ttl`, visible to all replicas.
+    async fn set_cooldown(&self, key: &str, ttl: Duration) -> Result<()>;
+
+    /// Return whether `key` currently has an active cooldown.
+    async fn in_cooldown(&self, key: &str) -> Result<bool>;
 
     /// Remove activity tracking for a job (after scale-down).
     async fn remove_activity(&self, job_id: &JobId) -> Result<()>;

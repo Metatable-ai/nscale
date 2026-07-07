@@ -24,6 +24,17 @@ pub struct Config {
     pub traefik: Option<TraefikConfig>,
     #[serde(default)]
     pub prometheus: Option<PrometheusConfig>,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// Administration/observability endpoint settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// Optional bearer token required for privileged `/admin/*` endpoints.
+    /// When unset, the admin API is unauthenticated (bind `admin_addr` to a trusted network).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +260,7 @@ impl Default for Config {
             },
             traefik: None,
             prometheus: None,
+            admin: AdminConfig::default(),
         }
     }
 }

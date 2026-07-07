@@ -15,6 +15,9 @@ pub trait MetricsProvider: Send + Sync {
         registration: &JobRegistration,
         window: Duration,
     ) -> Result<MetricSnapshot>;
+
+    /// Stable identifier used for diagnostics and provider-ordering tests.
+    fn name(&self) -> &'static str;
 }
 
 pub struct CompositeMetricsProvider {
@@ -29,6 +32,10 @@ impl CompositeMetricsProvider {
 
 #[async_trait]
 impl MetricsProvider for CompositeMetricsProvider {
+    fn name(&self) -> &'static str {
+        "composite"
+    }
+
     async fn snapshot(
         &self,
         registration: &JobRegistration,

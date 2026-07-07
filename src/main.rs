@@ -5,16 +5,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Path, Query, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{any, delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -295,15 +296,33 @@ async fn main() {
         prometheus_handle,
     };
 
-    let admin_router = Router::new()
+    let admin_token = normalize_admin_token(config.admin.token.clone());
+    if admin_token.is_none() {
+        warn!(
+            "admin API authentication is DISABLED (set a non-empty admin.token / \
+             NSCALE_ADMIN__TOKEN); ensure admin_addr is bound to a trusted network"
+        );
+    }
+    let admin_auth = AdminAuth { token: admin_token };
+
+    let public_admin_router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics));
+
+    let protected_admin_router = Router::new()
         .route("/admin/autoscaling", get(admin_autoscaling))
         .route("/admin/jobs", post(admin_submit_job))
         .route("/admin/jobs/{job_id}", delete(admin_purge_job))
         .route("/admin/registry", post(admin_register))
         .route("/admin/registry/sync", post(admin_sync))
+        .route_layer(middleware::from_fn_with_state(
+            admin_auth,
+            require_admin_auth,
+        ));
+
+    let admin_router = public_admin_router
+        .merge(protected_admin_router)
         .with_state(admin_state);
 
     // ── Start listeners ──────────────────────────────────
@@ -360,20 +379,51 @@ struct ProxyNativeMetricsProvider {
     metrics: ProxyMetrics,
 }
 
-#[cfg(test)]
-fn autoscale_metric_provider_labels(
-    prometheus: Option<&PrometheusConfig>,
-    traefik: Option<&TraefikConfig>,
-) -> Vec<&'static str> {
-    let mut labels = Vec::new();
-    if prometheus.is_some() {
-        labels.push("prometheus");
+#[derive(Clone)]
+struct AdminAuth {
+    token: Option<Arc<String>>,
+}
+
+/// Require a valid bearer token on privileged `/admin/*` routes. When no token
+/// is configured the guard is a pass-through (unauthenticated) and a warning was
+/// logged at startup.
+async fn require_admin_auth(State(auth): State<AdminAuth>, req: Request, next: Next) -> Response {
+    let Some(expected) = auth.token.as_deref() else {
+        return next.run(req).await;
+    };
+
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+            next.run(req).await
+        }
+        _ => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     }
-    if traefik.is_some() {
-        labels.push("traefik");
+}
+
+/// Normalize a configured admin token: a missing, empty, or whitespace-only
+/// value is treated as "no token" so it takes the loud unauthenticated path
+/// instead of silently accepting an empty bearer token.
+fn normalize_admin_token(raw: Option<String>) -> Option<Arc<String>> {
+    raw.filter(|token| !token.trim().is_empty()).map(Arc::new)
+}
+
+/// Length-then-content constant-time comparison to avoid leaking the token via
+/// early-exit timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    labels.push("proxy-native");
-    labels
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn build_autoscale_metric_providers(
@@ -409,6 +459,10 @@ fn build_autoscale_metric_providers(
 
 #[async_trait]
 impl MetricsProvider for ProxyNativeMetricsProvider {
+    fn name(&self) -> &'static str {
+        "proxy-native"
+    }
+
     async fn snapshot(
         &self,
         registration: &JobRegistration,
@@ -715,10 +769,16 @@ async fn admin_submit_job(
         .map(|registration| registration.nomad_group.clone())
         .collect::<BTreeSet<_>>();
     if unique_groups.len() > 1 {
+        let has_autoscaling = managed_services
+            .iter()
+            .any(|registration| registration.autoscaling.is_some());
         error!(
             job_id = %managed_services[0].job_id,
             groups = ?unique_groups,
-            "multiple groups detected for submitted job; scale-down will use the last registered group"
+            autoscaling = has_autoscaling,
+            "multiple groups detected for submitted job; scale-down and scale-to-zero track \
+             only the last registered group. Autoscaling scales each group independently, but \
+             idle groups other than the last will not scale to zero"
         );
     }
 
@@ -898,19 +958,106 @@ mod autoscaling_admin_tests {
     }
 
     #[test]
-    fn autoscale_metric_provider_labels_puts_prometheus_before_fallback_providers() {
-        let prometheus = PrometheusConfig {
-            url: "http://prometheus:9090".to_string(),
-            timeout_secs: 5,
-        };
-        let traefik = TraefikConfig {
-            metrics_url: "http://traefik:8082".to_string(),
-            provider: "consulcatalog".to_string(),
+    fn build_autoscale_metric_providers_orders_prometheus_before_fallbacks() {
+        let config = Config {
+            prometheus: Some(PrometheusConfig {
+                url: "http://prometheus:9090".to_string(),
+                timeout_secs: 5,
+            }),
+            traefik: Some(TraefikConfig {
+                metrics_url: "http://traefik:8082".to_string(),
+                provider: "consulcatalog".to_string(),
+            }),
+            ..Default::default()
         };
 
+        let providers = build_autoscale_metric_providers(&config, ProxyMetrics::new());
+        let names: Vec<_> = providers.iter().map(|p| p.name()).collect();
+        assert_eq!(names, vec!["prometheus", "traefik", "proxy-native"]);
+    }
+
+    #[test]
+    fn build_autoscale_metric_providers_defaults_to_proxy_native_only() {
+        let config = Config::default();
+        let providers = build_autoscale_metric_providers(&config, ProxyMetrics::new());
+        let names: Vec<_> = providers.iter().map(|p| p.name()).collect();
+        assert_eq!(names, vec!["proxy-native"]);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_tokens() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn normalize_admin_token_treats_blank_as_unset() {
+        assert!(normalize_admin_token(None).is_none());
+        assert!(normalize_admin_token(Some(String::new())).is_none());
+        assert!(normalize_admin_token(Some("   \t".to_string())).is_none());
         assert_eq!(
-            autoscale_metric_provider_labels(Some(&prometheus), Some(&traefik)),
-            vec!["prometheus", "traefik", "proxy-native"]
+            normalize_admin_token(Some("s3cret".to_string())).as_deref(),
+            Some(&"s3cret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_auth_middleware_guards_protected_routes_only() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        fn build_app(token: Option<&str>) -> Router {
+            let auth = AdminAuth {
+                token: token.map(|t| Arc::new(t.to_string())),
+            };
+            Router::new()
+                .route("/admin/x", get(|| async { "ok" }))
+                .route_layer(middleware::from_fn_with_state(auth, require_admin_auth))
+                .merge(Router::new().route("/metrics", get(|| async { "m" })))
+        }
+
+        let send = |app: Router, uri: &str, bearer: Option<&str>| {
+            let mut req = Request::builder().uri(uri);
+            if let Some(b) = bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // Token configured: protected route requires a valid bearer token.
+        let app = build_app(Some("secret"));
+        assert_eq!(
+            send(app.clone(), "/admin/x", None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(app.clone(), "/admin/x", Some("wrong"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(app.clone(), "/admin/x", Some("secret"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Public route stays open regardless of token.
+        assert_eq!(
+            send(app, "/metrics", None).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // No token configured: guard is a documented pass-through.
+        let open = build_app(None);
+        assert_eq!(
+            send(open, "/admin/x", None).await.unwrap().status(),
+            StatusCode::OK
         );
     }
 }

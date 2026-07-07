@@ -18,6 +18,11 @@ use crate::traffic_probe::TrafficProbe;
 const SCALE_DOWN_LOCK_KEY: &str = "nscale:lock:scale-down";
 /// Initial backoff when scale-down is blocked by an active deployment.
 const DEPLOYMENT_BACKOFF: Duration = Duration::from_secs(30);
+/// Upper bound on how long scale-to-zero may be deferred while waiting for the
+/// autoscaler to bring an idle job down to `min_count`. Prevents a permanent
+/// strand when the autoscaler has no downscale signal (e.g. proxy-native only
+/// and the job is fully idle).
+const AUTOSCALE_SCALE_TO_ZERO_GRACE: Duration = Duration::from_secs(600);
 
 /// Background controller that detects idle jobs and scales them to zero.
 ///
@@ -302,15 +307,32 @@ impl ScaleDownController {
                 Ok(current_count)
                     if autoscaling_should_defer_scale_to_zero(&registration, current_count) =>
                 {
-                    info!(
+                    // Derive the grace from the activity store's real idle age
+                    // (which resets whenever the job is active), so a job that
+                    // was recently busy still gets its full grace window.
+                    let idle_age = self.store.idle_age(job_id).await.ok().flatten();
+                    if !scale_to_zero_grace_elapsed(
+                        idle_age,
+                        self.idle_threshold,
+                        AUTOSCALE_SCALE_TO_ZERO_GRACE,
+                    ) {
+                        info!(
+                            current_count,
+                            min_count = registration
+                                .autoscaling
+                                .as_ref()
+                                .map(|policy| policy.min_count),
+                            idle_secs = idle_age.map(|age| age.as_secs()),
+                            "autoscaled job is above min_count; waiting for autoscaler to downscale before scale-to-zero"
+                        );
+                        return;
+                    }
+
+                    warn!(
                         current_count,
-                        min_count = registration
-                            .autoscaling
-                            .as_ref()
-                            .map(|policy| policy.min_count),
-                        "autoscaled job is above min_count; waiting for autoscaler to downscale before scale-to-zero"
+                        grace_secs = AUTOSCALE_SCALE_TO_ZERO_GRACE.as_secs(),
+                        "autoscaler did not reach min_count within grace period; forcing scale-to-zero of idle job"
                     );
-                    return;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -376,6 +398,17 @@ fn scale_to_zero_disabled(registration: &nscale_core::job::JobRegistration) -> b
         .autoscaling
         .as_ref()
         .is_some_and(|policy| !policy.scale_to_zero)
+}
+
+/// Whether an idle autoscaled job has been idle beyond the normal idle threshold
+/// plus a grace period, so scale-to-zero can be forced even when the autoscaler
+/// never brought it down to min_count (e.g. no downscale signal available).
+fn scale_to_zero_grace_elapsed(
+    idle_age: Option<Duration>,
+    idle_threshold: Duration,
+    grace: Duration,
+) -> bool {
+    idle_age.is_some_and(|age| age >= idle_threshold.saturating_add(grace))
 }
 
 fn autoscaling_should_defer_scale_to_zero(
@@ -517,12 +550,21 @@ mod tests {
             self.lock_acquired.store(false, Ordering::Relaxed);
             Ok(())
         }
+        async fn set_cooldown(&self, _: &str, _: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn in_cooldown(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
         async fn remove_activity(&self, _: &JobId) -> Result<()> {
             self.remove_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn has_activity(&self, job_id: &JobId) -> Result<bool> {
             Ok(self.idle_jobs.iter().any(|j| j == job_id))
+        }
+        async fn idle_age(&self, _: &JobId) -> Result<Option<Duration>> {
+            Ok(None)
         }
     }
 
@@ -599,6 +641,27 @@ mod tests {
 
         registration.autoscaling.as_mut().unwrap().enabled = false;
         assert!(!autoscaling_should_defer_scale_to_zero(&registration, 3));
+    }
+
+    #[test]
+    fn scale_to_zero_grace_elapsed_requires_idle_beyond_threshold_plus_grace() {
+        let idle_threshold = Duration::from_secs(300);
+        let grace = Duration::from_secs(600);
+
+        // No activity record → cannot force (fail-safe: keep deferring).
+        assert!(!scale_to_zero_grace_elapsed(None, idle_threshold, grace));
+        // Idle only past the threshold, still within grace → keep deferring.
+        assert!(!scale_to_zero_grace_elapsed(
+            Some(Duration::from_secs(400)),
+            idle_threshold,
+            grace
+        ));
+        // Idle past threshold + grace → force scale-to-zero.
+        assert!(scale_to_zero_grace_elapsed(
+            Some(Duration::from_secs(901)),
+            idle_threshold,
+            grace
+        ));
     }
 
     #[tokio::test]

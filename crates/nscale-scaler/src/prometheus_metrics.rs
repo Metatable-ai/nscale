@@ -57,6 +57,10 @@ impl PrometheusMetricsProvider {
 
 #[async_trait]
 impl MetricsProvider for PrometheusMetricsProvider {
+    fn name(&self) -> &'static str {
+        "prometheus"
+    }
+
     async fn snapshot(
         &self,
         registration: &JobRegistration,
@@ -75,10 +79,18 @@ impl MetricsProvider for PrometheusMetricsProvider {
             "histogram_quantile(0.95, sum by (le) (rate(nscale_proxy_request_duration_seconds_bucket{{job_id=\"{escaped_job}\"}}[{range}]))) * 1000"
         );
 
+        // The three queries are independent; run them concurrently to keep the
+        // per-job autoscale tick fast when many jobs are evaluated.
+        let (request_rate_rps, p95_latency_ms, error_rate) = tokio::try_join!(
+            self.query(&request_rate_query),
+            self.query(&latency_query),
+            self.query(&error_rate_query),
+        )?;
+
         Ok(MetricSnapshot {
-            request_rate_rps: self.query(&request_rate_query).await?,
-            p95_latency_ms: self.query(&latency_query).await?,
-            error_rate: self.query(&error_rate_query).await?,
+            request_rate_rps,
+            p95_latency_ms,
+            error_rate,
             in_flight: None,
         })
     }

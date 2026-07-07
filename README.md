@@ -303,6 +303,7 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 |----------|---------|-------------|
 | `NSCALE_LISTEN_ADDR` | `0.0.0.0:8080` | Proxy listen address |
 | `NSCALE_ADMIN_ADDR` | `0.0.0.0:9090` | Admin/health listen address |
+| `NSCALE_ADMIN__TOKEN` | — | Bearer token required for privileged `/admin/*` endpoints (optional; unauthenticated when unset) |
 | `NSCALE_NOMAD__ADDR` | `http://localhost:4646` | Nomad API address |
 | `NSCALE_NOMAD__TOKEN` | — | Nomad ACL token (optional) |
 | `NSCALE_NOMAD__CONCURRENCY` | `50` | Max concurrent Nomad operations |
@@ -506,6 +507,12 @@ because nscale has no router name to target for the injected `.service=` overrid
 | `POST` | `/admin/registry` | Register a single job (seeds activity) |
 | `POST` | `/admin/registry/sync` | Bulk-sync all job registrations (seeds activity) |
 
+The privileged `/admin/*` endpoints can be protected with a bearer token via
+`admin.token` (`NSCALE_ADMIN__TOKEN`). When set, requests must send
+`Authorization: Bearer <token>`; `/healthz`, `/readyz`, and `/metrics` stay open
+for probes and scraping. When unset the admin API is unauthenticated and nscale
+logs a startup warning — bind `admin_addr` to a trusted network in that case.
+
 ### Job submission payload
 
 ```json
@@ -579,8 +586,8 @@ Policy fields:
 | `scale_to_zero` | `true` | Whether idle scale-down may still scale this job to zero |
 | `scale_up_step` | `1` | Maximum instances added in one autoscale decision |
 | `scale_down_step` | `1` | Maximum instances removed in one autoscale decision |
-| `cooldown_secs` | `120` | Optional per-job cooldown after a successful autoscale decision |
-| `decision_window_secs` | `60` | Optional per-job metrics window used for autoscale decisions |
+| `cooldown_secs` | `120` | Optional per-job cooldown after a successful autoscale decision (shared across replicas) |
+| `decision_window_secs` | `60` | Optional per-job metrics window used for autoscale decisions (max `1800`) |
 | `target_requests_per_second_per_instance` | optional | Traefik request-rate target per instance |
 | `target_p95_latency_ms` | optional | nscale-native p95 proxy latency target |
 | `max_error_rate` | optional | Error-rate threshold used as a downscale guard and scale-up signal |
@@ -588,6 +595,11 @@ Policy fields:
 Traefik metrics provide the cluster-wide request-rate signal when `NSCALE_TRAEFIK__METRICS_URL` is
 configured. nscale-native metrics provide request latency and local error-rate signals through the
 admin `/metrics` endpoint.
+
+> **Multi-group jobs:** the autoscaler scales each `(job, group)` independently, but idle
+> scale-down and scale-to-zero currently track a single group per job id. For a job that exposes
+> more than one task group, only the last-registered group scales to zero when idle; nscale logs an
+> error at submission time in that case.
 
 ### Manual purge endpoint
 

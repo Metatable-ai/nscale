@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use dashmap::DashMap;
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::{JobAutoscalingPolicy, JobRegistration};
@@ -32,7 +31,6 @@ pub struct AutoscaleController {
     registry: Arc<JobRegistry>,
     metrics: Arc<dyn MetricsProvider>,
     in_flight: InFlightTracker,
-    cooldown_until: DashMap<String, Instant>,
     cancel: CancellationToken,
 }
 
@@ -51,7 +49,6 @@ impl AutoscaleController {
             registry,
             metrics,
             in_flight,
-            cooldown_until: DashMap::new(),
             cancel,
         }
     }
@@ -120,14 +117,24 @@ impl AutoscaleController {
             return;
         }
 
-        if let Some(entry) = self.cooldown_until.get(&registration.job_id.0) {
-            if Instant::now() < *entry {
+        // Cooldown is stored in the shared activity store (Redis) so that it is
+        // honored across all HA replicas, not just the instance that scaled.
+        let cooldown_key = format!(
+            "autoscale:{}:{}",
+            registration.job_id.0, registration.nomad_group
+        );
+        match self.store.in_cooldown(&cooldown_key).await {
+            Ok(true) => {
                 debug!(job_id = %registration.job_id, "autoscaling cooldown active, skipping");
                 record_skip(registration, "cooldown");
                 return;
             }
-            drop(entry);
-            self.cooldown_until.remove(&registration.job_id.0);
+            Ok(false) => {}
+            Err(err) => {
+                warn!(job_id = %registration.job_id, error = %err, "failed to check autoscaling cooldown, skipping");
+                record_skip(registration, "cooldown-error");
+                return;
+            }
         }
 
         let current_count = match self
@@ -215,18 +222,22 @@ impl AutoscaleController {
                     reason = %decision.reason,
                     "autoscaled job"
                 );
-                self.cooldown_until.insert(
-                    registration.job_id.0.clone(),
-                    Instant::now() + policy_cooldown(policy),
-                );
+                self.store
+                    .set_cooldown(&cooldown_key, policy_cooldown(policy))
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!(job_id = %registration.job_id, error = %err, "failed to record autoscaling cooldown");
+                    });
             }
             Err(NscaleError::DeploymentInProgress { .. }) => {
                 info!(job_id = %registration.job_id, "autoscale blocked by active deployment, backing off");
                 record_skip(registration, "deployment-in-progress");
-                self.cooldown_until.insert(
-                    registration.job_id.0.clone(),
-                    Instant::now() + DEPLOYMENT_BACKOFF,
-                );
+                self.store
+                    .set_cooldown(&cooldown_key, DEPLOYMENT_BACKOFF)
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!(job_id = %registration.job_id, error = %err, "failed to record autoscaling deployment backoff");
+                    });
             }
             Err(err) => {
                 error!(job_id = %registration.job_id, error = %err, "failed to autoscale job");
@@ -247,7 +258,10 @@ fn record_skip(registration: &JobRegistration, reason: &str) {
 }
 
 fn unique_autoscaling_registrations(registrations: Vec<JobRegistration>) -> Vec<JobRegistration> {
-    let mut by_job: BTreeMap<String, JobRegistration> = BTreeMap::new();
+    // Key by (job_id, nomad_group): a job may legitimately have several task
+    // groups, each scaled independently. Only a genuinely divergent policy for
+    // the *same* (job, group) is treated as a conflict.
+    let mut by_group: BTreeMap<(String, String), JobRegistration> = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
 
     for registration in registrations {
@@ -255,25 +269,27 @@ fn unique_autoscaling_registrations(registrations: Vec<JobRegistration>) -> Vec<
             continue;
         }
 
-        let key = registration.job_id.0.clone();
-        if let Some(existing) = by_job.get(&key) {
-            if existing.autoscaling != registration.autoscaling
-                || existing.nomad_group != registration.nomad_group
-            {
+        let key = (
+            registration.job_id.0.clone(),
+            registration.nomad_group.clone(),
+        );
+        if let Some(existing) = by_group.get(&key) {
+            if existing.autoscaling != registration.autoscaling {
                 conflicts.insert(key);
             }
         } else {
-            by_job.insert(key, registration);
+            by_group.insert(key, registration);
         }
     }
 
-    by_job
+    by_group
         .into_iter()
-        .filter_map(|(job_id, registration)| {
-            if conflicts.contains(&job_id) {
+        .filter_map(|(key, registration)| {
+            if conflicts.contains(&key) {
                 warn!(
-                    job_id,
-                    "conflicting autoscaling policies for job, skipping autoscale evaluation"
+                    job_id = key.0,
+                    group = key.1,
+                    "conflicting autoscaling policies for job group, skipping autoscale evaluation"
                 );
                 None
             } else {
@@ -388,5 +404,24 @@ mod tests {
         first.service_name = ServiceName("api-c".into());
         let unique = unique_autoscaling_registrations(vec![first.clone(), first]);
         assert_eq!(unique.len(), 1);
+    }
+
+    #[test]
+    fn unique_autoscaling_registrations_keeps_distinct_groups_for_same_job() {
+        use nscale_core::job::{JobId, ServiceName};
+
+        let web = JobRegistration {
+            job_id: JobId("api".into()),
+            service_name: ServiceName("api-web".into()),
+            nomad_group: "web".into(),
+            autoscaling: Some(policy()),
+            traefik_routers: Vec::new(),
+        };
+        let mut worker = web.clone();
+        worker.service_name = ServiceName("api-worker".into());
+        worker.nomad_group = "worker".into();
+
+        let unique = unique_autoscaling_registrations(vec![web, worker]);
+        assert_eq!(unique.len(), 2);
     }
 }
