@@ -184,14 +184,16 @@ impl NomadClient {
 
         None
     }
-}
 
-#[async_trait]
-impl Orchestrator for NomadClient {
-    #[instrument(skip(self), fields(job_id = %job_id, group = %group, count = count))]
-    async fn scale_up(&self, job_id: &JobId, group: &str, count: u32) -> Result<()> {
-        debug!("scaling up job");
-
+    async fn scale_job(
+        &self,
+        job_id: &JobId,
+        group: &str,
+        count: u32,
+        reason: &str,
+        operation: &'static str,
+        active_deployment_is_ok: bool,
+    ) -> Result<()> {
         let path = format!("/v1/job/{}/scale", job_id);
 
         let req = ScaleRequest {
@@ -199,7 +201,7 @@ impl Orchestrator for NomadClient {
             target: ScaleTarget {
                 group: group.to_string(),
             },
-            message: Some("nscale: scaling up on demand".to_string()),
+            message: Some(reason.to_string()),
         };
 
         let resp = self.client.post(self.url(&path)).json(&req).send().await?;
@@ -207,16 +209,21 @@ impl Orchestrator for NomadClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // Nomad returns 400 when a deployment is already in progress.
-            // This means the job is already scaling up — just proceed to
-            // wait for the healthy endpoint (matches Go activator behavior).
             if status.as_u16() == 400
                 && body
                     .to_lowercase()
                     .contains("scaling blocked due to active deployment")
             {
-                info!(job_id = %job_id, "scale-up blocked by active deployment, proceeding to wait");
-                return Ok(());
+                if active_deployment_is_ok {
+                    info!(job_id = %job_id, operation, "scaling blocked by active deployment, proceeding");
+                    return Ok(());
+                }
+
+                info!(job_id = %job_id, operation, "scaling blocked by active deployment, deferring");
+                return Err(NscaleError::DeploymentInProgress {
+                    job_id: job_id.0.clone(),
+                    operation,
+                });
             }
             return Err(Self::classify_job_error(
                 status, &body, "POST", &path, job_id,
@@ -225,48 +232,48 @@ impl Orchestrator for NomadClient {
 
         let scale_resp: ScaleResponse = resp.json().await?;
         if !scale_resp.warnings.is_empty() {
-            warn!(warnings = %scale_resp.warnings, "scale-up returned warnings");
+            warn!(warnings = %scale_resp.warnings, "scale returned warnings");
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Orchestrator for NomadClient {
+    #[instrument(skip(self), fields(job_id = %job_id, group = %group, count = count))]
+    async fn scale_up(&self, job_id: &JobId, group: &str, count: u32) -> Result<()> {
+        debug!("scaling up job");
+        self.scale_job(
+            job_id,
+            group,
+            count,
+            "nscale: scaling up on demand",
+            "scale up",
+            true,
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(job_id = %job_id, group = %group))]
     async fn scale_down(&self, job_id: &JobId, group: &str) -> Result<()> {
         debug!("scaling down job");
+        self.scale_job(
+            job_id,
+            group,
+            0,
+            "nscale: scaling to zero after idle",
+            "scale down",
+            false,
+        )
+        .await
+    }
 
-        let path = format!("/v1/job/{}/scale", job_id);
-
-        let req = ScaleRequest {
-            count: Some(0),
-            target: ScaleTarget {
-                group: group.to_string(),
-            },
-            message: Some("nscale: scaling to zero after idle".to_string()),
-        };
-
-        let resp = self.client.post(self.url(&path)).json(&req).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 400
-                && body
-                    .to_lowercase()
-                    .contains("scaling blocked due to active deployment")
-            {
-                info!(job_id = %job_id, "scale-down blocked by active deployment, deferring scale-down");
-                return Err(NscaleError::DeploymentInProgress {
-                    job_id: job_id.0.clone(),
-                    operation: "scale down",
-                });
-            }
-            return Err(Self::classify_job_error(
-                status, &body, "POST", &path, job_id,
-            ));
-        }
-
-        Ok(())
+    #[instrument(skip(self, reason), fields(job_id = %job_id, group = %group, count = count))]
+    async fn scale_to(&self, job_id: &JobId, group: &str, count: u32, reason: &str) -> Result<()> {
+        debug!("scaling job to explicit count");
+        self.scale_job(job_id, group, count, reason, "autoscale", false)
+            .await
     }
 
     #[instrument(skip(self), fields(job_id = %job_id, group = %group))]
@@ -400,6 +407,37 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scale_to_sends_count_group_and_reason() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .and(body_json(serde_json::json!({
+                "Count": 3,
+                "Target": { "Group": "web" },
+                "Message": "nscale: autoscale request-rate"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"Warnings": ""})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client
+            .scale_to(
+                &"test-job".into(),
+                "web",
+                3,
+                "nscale: autoscale request-rate",
+            )
+            .await;
+
         assert!(result.is_ok());
     }
 

@@ -408,6 +408,15 @@ mod tests {
         async fn scale_down(&self, _job_id: &JobId, _group: &str) -> Result<()> {
             Ok(())
         }
+        async fn scale_to(
+            &self,
+            _job_id: &JobId,
+            _group: &str,
+            _count: u32,
+            _reason: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
         async fn get_job_count(&self, _job_id: &JobId, _group: &str) -> Result<u32> {
             Ok(1)
         }
@@ -446,6 +455,7 @@ mod tests {
             job_id: JobId("test-job".into()),
             service_name: ServiceName("test-svc".into()),
             nomad_group: "web".into(),
+            autoscaling: None,
         }
     }
 
@@ -724,11 +734,13 @@ mod tests {
             job_id: JobId("job-1".into()),
             service_name: ServiceName("svc-1".into()),
             nomad_group: "web".into(),
+            autoscaling: None,
         };
         let reg2 = JobRegistration {
             job_id: JobId("job-2".into()),
             service_name: ServiceName("svc-2".into()),
             nomad_group: "web".into(),
+            autoscaling: None,
         };
 
         // Start both wakes concurrently with only 1 semaphore permit.

@@ -156,6 +156,7 @@ fn inject_service_tags(
                 job_id: JobId(job_id.to_string()),
                 service_name: ServiceName(service_name),
                 nomad_group: group_name.to_string(),
+                autoscaling: None,
             });
         }
     }

@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -15,20 +17,26 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use nscale_consul::client::ConsulClient;
 use nscale_core::config::Config;
-use nscale_core::error::NscaleError;
+use nscale_core::error::{NscaleError, Result as NscaleResult};
 use nscale_core::inflight::InFlightTracker;
-use nscale_core::job::{JobId, JobRegistration};
-use nscale_core::traits::{ActivityStore, MissingJobTracker};
+use nscale_core::job::{JobAutoscalingPolicy, JobId, JobRegistration};
+use nscale_core::traits::{ActivityStore, MissingJobTracker, Orchestrator};
 use nscale_etcd::EtcdClient;
 use nscale_nomad::client::NomadClient;
 use nscale_nomad::events::{EventStreamConfig, start_event_stream};
 use nscale_nomad::job_mutator::inject_nscale_tags;
 use nscale_proxy::handler::{AppState, proxy_handler};
+use nscale_proxy::metrics::ProxyMetrics;
 use nscale_proxy::middleware::ActivityLayer;
+use nscale_scaler::autoscale::AutoscaleController;
+use nscale_scaler::autoscale_policy::MetricSnapshot;
 use nscale_scaler::controller::ScaleDownController;
 use nscale_scaler::event_processor::EventProcessor;
+use nscale_scaler::metrics_provider::{CompositeMetricsProvider, MetricsProvider};
+use nscale_scaler::traefik_metrics::TraefikMetricsProvider;
 use nscale_scaler::traffic_probe::TrafficProbe;
 use nscale_store::activity::RedisActivityStore;
 use nscale_store::auto_deregister::RedisMissingJobTracker;
@@ -83,6 +91,10 @@ async fn main() {
     }
 
     info!("nscale — Nomad Scale-to-Zero starting");
+
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus metrics recorder");
 
     // ── Config ───────────────────────────────────────────
     let config = Config::load().unwrap_or_else(|e| {
@@ -185,6 +197,7 @@ async fn main() {
 
     // ── In-flight request tracker (shared between proxy and scaler) ──
     let in_flight = InFlightTracker::new();
+    let proxy_metrics = ProxyMetrics::new();
 
     // Heartbeat interval: refresh activity every idle_timeout / 3 during long requests
     let heartbeat_interval = config.scaling.idle_timeout() / 3;
@@ -195,6 +208,7 @@ async fn main() {
         http_client,
         in_flight: in_flight.clone(),
         activity_store: activity_store.clone(),
+        proxy_metrics: proxy_metrics.clone(),
         heartbeat_interval,
         missing_job_tracker: missing_job_tracker.clone(),
         auto_deregister_enabled: config.scaling.auto_deregister.enabled,
@@ -208,6 +222,18 @@ async fn main() {
         info!(metrics_url = %tc.metrics_url, provider = %tc.provider, "Traefik traffic probe enabled");
         Arc::new(TrafficProbe::new(&tc.metrics_url, &tc.provider))
     });
+
+    let mut autoscale_metric_providers: Vec<Arc<dyn MetricsProvider>> = Vec::new();
+    if let Some(tc) = config.traefik.as_ref() {
+        autoscale_metric_providers.push(Arc::new(TraefikMetricsProvider::new(
+            &tc.metrics_url,
+            &tc.provider,
+        )));
+    }
+    autoscale_metric_providers.push(Arc::new(ProxyNativeMetricsProvider {
+        metrics: proxy_metrics.clone(),
+    }));
+    let autoscale_metrics = Arc::new(CompositeMetricsProvider::new(autoscale_metric_providers));
 
     // ── Scale-down controller ────────────────────────────
     let scaler = ScaleDownController::new(
@@ -225,6 +251,16 @@ async fn main() {
         cancel.clone(),
     );
     let scaler_handle = tokio::spawn(scaler.run());
+
+    let autoscaler = AutoscaleController::new(
+        nomad_client.clone(),
+        activity_store.clone(),
+        registry.clone(),
+        autoscale_metrics,
+        in_flight.clone(),
+        cancel.clone(),
+    );
+    let autoscaler_handle = tokio::spawn(autoscaler.run());
 
     // ── Nomad event stream ───────────────────────────────
     let event_rx = start_event_stream(
@@ -261,11 +297,14 @@ async fn main() {
         in_flight: in_flight.clone(),
         missing_job_tracker: missing_job_tracker.clone(),
         file_provider_service: config.routing.file_provider_service.clone(),
+        prometheus_handle,
     };
 
     let admin_router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .route("/admin/autoscaling", get(admin_autoscaling))
         .route("/admin/jobs", post(admin_submit_job))
         .route("/admin/jobs/{job_id}", delete(admin_purge_job))
         .route("/admin/registry", post(admin_register))
@@ -303,6 +342,7 @@ async fn main() {
 
     // Wait for background tasks to finish
     let _ = scaler_handle.await;
+    let _ = autoscaler_handle.await;
     let _ = event_handle.await;
     info!("nscale shut down");
 }
@@ -318,6 +358,32 @@ struct AdminState {
     in_flight: InFlightTracker,
     missing_job_tracker: Arc<dyn MissingJobTracker>,
     file_provider_service: String,
+    prometheus_handle: PrometheusHandle,
+}
+
+struct ProxyNativeMetricsProvider {
+    metrics: ProxyMetrics,
+}
+
+#[async_trait]
+impl MetricsProvider for ProxyNativeMetricsProvider {
+    async fn snapshot(
+        &self,
+        registration: &JobRegistration,
+        window: Duration,
+    ) -> NscaleResult<MetricSnapshot> {
+        let snapshot = self.metrics.snapshot(&registration.job_id, window);
+        Ok(MetricSnapshot {
+            request_rate_rps: None,
+            p95_latency_ms: snapshot.p95_latency_ms,
+            error_rate: if snapshot.request_count == 0 {
+                None
+            } else {
+                Some(snapshot.error_count as f64 / snapshot.request_count as f64)
+            },
+            in_flight: None,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +391,8 @@ struct SubmitJobRequest {
     hcl: String,
     #[serde(default)]
     variables: Option<String>,
+    #[serde(default)]
+    autoscaling: Option<JobAutoscalingPolicy>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +413,22 @@ struct SubmitJobResponse {
     registration_failures: Vec<RegistrationFailure>,
 }
 
+#[derive(Debug, Serialize)]
+struct AutoscalingStatusResponse {
+    jobs: Vec<AutoscalingJobStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoscalingJobStatus {
+    job_id: String,
+    service_name: String,
+    nomad_group: String,
+    current_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_error: Option<String>,
+    policy: Option<JobAutoscalingPolicy>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct DeleteJobQuery {
     #[serde(default)]
@@ -355,10 +439,40 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    state.prometheus_handle.render()
+}
+
 fn admin_error_status(error: &NscaleError) -> StatusCode {
     match error {
         NscaleError::Http(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn validate_registration_autoscaling(reg: &JobRegistration) -> std::result::Result<(), String> {
+    if let Some(policy) = &reg.autoscaling {
+        policy.validate()?;
+    }
+    Ok(())
+}
+
+fn autoscaling_status_from_registration(
+    registration: &JobRegistration,
+    count: NscaleResult<u32>,
+) -> AutoscalingJobStatus {
+    let (current_count, count_error) = match count {
+        Ok(count) => (Some(count), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
+    AutoscalingJobStatus {
+        job_id: registration.job_id.0.clone(),
+        service_name: registration.service_name.0.clone(),
+        nomad_group: registration.nomad_group.clone(),
+        current_count,
+        count_error,
+        policy: registration.autoscaling.clone(),
     }
 }
 
@@ -367,6 +481,31 @@ async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
         Ok(_) => (StatusCode::OK, "ready").into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}")).into_response(),
     }
+}
+
+async fn admin_autoscaling(State(state): State<AdminState>) -> impl IntoResponse {
+    let registrations = match state.registry.list_all().await {
+        Ok(registrations) => registrations,
+        Err(e) => {
+            error!(error = %e, "failed to list registrations for autoscaling admin endpoint");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response();
+        }
+    };
+
+    let mut jobs = Vec::new();
+    for registration in registrations {
+        if registration.autoscaling.is_none() {
+            continue;
+        }
+
+        let count = state
+            .nomad_client
+            .get_job_count(&registration.job_id, &registration.nomad_group)
+            .await;
+        jobs.push(autoscaling_status_from_registration(&registration, count));
+    }
+
+    Json(AutoscalingStatusResponse { jobs }).into_response()
 }
 
 async fn cleanup_admin_job_state(
@@ -487,17 +626,18 @@ async fn admin_submit_job(
         }
     };
 
-    let managed_services = match inject_nscale_tags(&mut parsed_job, &state.file_provider_service) {
-        Ok(services) => services,
-        Err(e) => {
-            error!(error = %e, "failed to inject nscale routing tags into parsed job");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let mut managed_services =
+        match inject_nscale_tags(&mut parsed_job, &state.file_provider_service) {
+            Ok(services) => services,
+            Err(e) => {
+                error!(error = %e, "failed to inject nscale routing tags into parsed job");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        };
 
     if managed_services.is_empty() {
         return (
@@ -507,6 +647,25 @@ async fn admin_submit_job(
             })),
         )
             .into_response();
+    }
+
+    if let Some(policy) = request.autoscaling {
+        for registration in &mut managed_services {
+            registration.autoscaling = Some(policy.clone());
+        }
+    }
+
+    for registration in &managed_services {
+        if let Err(error) = validate_registration_autoscaling(registration) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "job_id": registration.job_id,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let unique_groups = managed_services
@@ -594,6 +753,10 @@ async fn admin_register(
     State(state): State<AdminState>,
     Json(reg): Json<JobRegistration>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_registration_autoscaling(&reg) {
+        return (StatusCode::BAD_REQUEST, format!("error: {error}")).into_response();
+    }
+
     match state.registry.register(&reg).await {
         Ok(()) => {
             // Seed activity so the scaler can detect this job as idle later.
@@ -618,6 +781,12 @@ async fn admin_sync(
     let mut failed = 0u32;
 
     for reg in &registrations {
+        if let Err(e) = validate_registration_autoscaling(reg) {
+            error!(job_id = %reg.job_id, error = %e, "invalid autoscaling policy during sync");
+            failed += 1;
+            continue;
+        }
+
         match state.registry.register(reg).await {
             Ok(()) => {
                 if let Err(e) = state.activity_store.record_activity(&reg.job_id).await {
@@ -647,4 +816,41 @@ async fn admin_sync(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod autoscaling_admin_tests {
+    use super::*;
+    use nscale_core::job::{JobAutoscalingPolicy, ServiceName};
+
+    #[test]
+    fn autoscaling_status_from_registration_includes_policy_and_count() {
+        let registration = JobRegistration {
+            job_id: JobId("api".to_string()),
+            service_name: ServiceName("api-service".to_string()),
+            nomad_group: "web".to_string(),
+            autoscaling: Some(JobAutoscalingPolicy {
+                enabled: true,
+                min_count: 1,
+                max_count: 3,
+                scale_to_zero: true,
+                scale_up_step: 1,
+                scale_down_step: 1,
+                target_requests_per_second_per_instance: Some(2.0),
+                target_p95_latency_ms: None,
+                max_error_rate: None,
+                cooldown_secs: Some(15),
+                decision_window_secs: Some(20),
+            }),
+        };
+
+        let status = autoscaling_status_from_registration(&registration, Ok(2));
+
+        assert_eq!(status.job_id, "api");
+        assert_eq!(status.service_name, "api-service");
+        assert_eq!(status.nomad_group, "web");
+        assert_eq!(status.current_count, Some(2));
+        assert!(status.count_error.is_none());
+        assert_eq!(status.policy.unwrap().max_count, 3);
+    }
 }

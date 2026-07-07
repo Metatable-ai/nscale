@@ -206,6 +206,7 @@ mod tests {
             job_id: JobId("job-a".to_string()),
             service_name: ServiceName("svc-a".to_string()),
             nomad_group: "main".to_string(),
+            autoscaling: None,
         };
 
         let encoded = EtcdClient::encode_registration(&reg).expect("encode registration");

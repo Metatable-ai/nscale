@@ -485,6 +485,8 @@ because nscale has no router name to target for the injected `.service=` overrid
 |--------|------|-------------|
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/readyz` | Readiness check (verifies Redis) |
+| `GET` | `/metrics` | Prometheus metrics for nscale request, wake, and autoscaling signals |
+| `GET` | `/admin/autoscaling` | List autoscaling-enabled registrations with current Nomad counts and policy details |
 | `POST` | `/admin/jobs` | Parse HCL, inject required Traefik routing tags, submit to Nomad, auto-register managed services |
 | `DELETE` | `/admin/jobs/:job_id` | Stop and purge a Nomad job, then remove `nscale` registry/activity state for that job |
 | `POST` | `/admin/registry` | Register a single job (seeds activity) |
@@ -495,13 +497,29 @@ because nscale has no router name to target for the injected `.service=` overrid
 ```json
 {
   "hcl": "job \"echo-submit-job\" { ... }",
-  "variables": "service_name = \"echo-s2z\"\nhost_name = \"echo-s2z.localhost\""
+  "variables": "service_name = \"echo-s2z\"\nhost_name = \"echo-s2z.localhost\"",
+  "autoscaling": {
+    "max_count": 5,
+    "min_count": 1,
+    "scale_to_zero": true,
+    "scale_up_step": 1,
+    "scale_down_step": 1,
+    "cooldown_secs": 20,
+    "decision_window_secs": 30,
+    "target_requests_per_second_per_instance": 25.0,
+    "target_p95_latency_ms": 500.0,
+    "max_error_rate": 0.05
+  }
 }
 ```
 
 `variables` is optional. When present, it is passed straight through to Nomad's HCL parser.
 Keep variable interpolation inside attribute values — Nomad does not allow template expressions
 inside block labels such as `job "${var.name}"`.
+
+`autoscaling` is optional and applies to every managed registration produced by the submitted job.
+When present, `max_count` is required. Jobs without this object keep the existing scale-to-zero-only
+behavior.
 
 Successful responses include the Nomad evaluation information plus the set of managed services that
 nscale registered automatically.
@@ -512,7 +530,11 @@ nscale registered automatically.
 {
   "job_id": "my-service",
   "service_name": "my-service",
-  "nomad_group": "main"
+  "nomad_group": "main",
+  "autoscaling": {
+    "max_count": 5,
+    "target_requests_per_second_per_instance": 25.0
+  }
 }
 ```
 
@@ -522,6 +544,36 @@ discovered by the scale-down controller.
 
 This endpoint is still useful when jobs are submitted outside nscale and you only need
 to register an already-known service.
+
+### Per-job autoscaling
+
+Autoscaling is configured only on individual job registrations. There is no global autoscaling
+policy in `config/default.toml`.
+
+If a registration has an `autoscaling` policy, the autoscaler evaluates that job periodically and
+scales its Nomad task group between `min_count` and `max_count`. The autoscaler does not wake jobs
+from zero and does not scale jobs to zero; wake-on-request and idle scale-down keep owning the
+`0 ↔ 1` transitions.
+
+Policy fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_count` | required | Hard cap for this job's autoscaled task-group count |
+| `enabled` | `true` | Disable this job's autoscaling policy without removing it |
+| `min_count` | `1` | Minimum nonzero count while autoscaling a running job |
+| `scale_to_zero` | `true` | Whether idle scale-down may still scale this job to zero |
+| `scale_up_step` | `1` | Maximum instances added in one autoscale decision |
+| `scale_down_step` | `1` | Maximum instances removed in one autoscale decision |
+| `cooldown_secs` | `120` | Optional per-job cooldown after a successful autoscale decision |
+| `decision_window_secs` | `60` | Optional per-job metrics window used for autoscale decisions |
+| `target_requests_per_second_per_instance` | optional | Traefik request-rate target per instance |
+| `target_p95_latency_ms` | optional | nscale-native p95 proxy latency target |
+| `max_error_rate` | optional | Error-rate threshold used as a downscale guard and scale-up signal |
+
+Traefik metrics provide the cluster-wide request-rate signal when `NSCALE_TRAEFIK__METRICS_URL` is
+configured. nscale-native metrics provide request latency and local error-rate signals through the
+admin `/metrics` endpoint.
 
 ### Manual purge endpoint
 
@@ -571,6 +623,50 @@ cd integration
 The main integration script now submits `jobs/echo-submit.nomad` through `/admin/jobs`, verifies
 that nscale injected the Traefik service override tag in Consul, confirms lookup still works when
 `service_name` differs from `job_id`, and then exercises wake-up and automatic scale-down.
+
+### Per-job autoscaling flow
+
+```bash
+cd integration
+./test-autoscaling.sh
+```
+
+The autoscaling integration suite submits policies through `/admin/jobs`; it does not use any global
+autoscaling config file. It verifies invalid policy rejection, Traefik request-rate scale-up,
+`max_count` caps under pressure, variable traffic scale-up/down, default `scale_to_zero = true`,
+`scale_to_zero = false`, and nscale-native latency-driven scale-up. The suite requires Docker,
+Docker Compose, curl, jq, and openssl.
+
+For the full operational lifecycle test, run:
+
+```bash
+cd integration
+./test-autoscaling-realworld.sh
+```
+
+This starts fast and slow services from zero, drives live traffic while polling Nomad counts,
+verifies they scale to their per-job caps (`2` and `3`), then verifies both return to zero after
+traffic stops. It also runs concurrent fast/slow pressure to check per-job isolation.
+
+For many-job autoscaling stress, run:
+
+```bash
+cd integration
+./autoscaling-stress-test.sh --start --job-count=10 --duration=180
+```
+
+The stress runner generates independent Nomad jobs from the autoscale echo fixture, submits per-job
+autoscaling policies, starts all jobs from zero, drives concurrent pressure, verifies each job reaches
+its cap, and then verifies each job steps down to `min_count` before returning to zero.
+
+Autoscaling emits these Prometheus series on `/metrics`:
+
+| Metric | Description |
+|--------|-------------|
+| `nscale_autoscale_current_count` | Last observed Nomad count per autoscaled job |
+| `nscale_autoscale_desired_count` | Desired count from successful autoscale decisions |
+| `nscale_autoscale_decisions_total` | Count of successful autoscale decisions by direction/reason |
+| `nscale_autoscale_skips_total` | Count of skipped autoscale evaluations by reason |
 
 ### Durable registry mode
 

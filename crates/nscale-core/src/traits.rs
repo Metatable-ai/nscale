@@ -16,6 +16,9 @@ pub trait Orchestrator: Send + Sync {
     /// Scale a job down to zero.
     async fn scale_down(&self, job_id: &JobId, group: &str) -> Result<()>;
 
+    /// Scale a job's task group to an explicit count.
+    async fn scale_to(&self, job_id: &JobId, group: &str, count: u32, reason: &str) -> Result<()>;
+
     /// Get the current count for a job's task group.
     async fn get_job_count(&self, job_id: &JobId, group: &str) -> Result<u32>;
 

@@ -1,0 +1,5 @@
+target/
+.git/
+.DS_Store
+integration/traefik/certs/*.key
+integration/traefik/certs/*.crt

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -16,6 +16,7 @@ use nscale_core::traits::{ActivityStore, MissingJobTracker};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
 
+use crate::metrics::ProxyMetrics;
 use crate::proxy::forward_request;
 
 const TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [100, 250];
@@ -37,6 +38,7 @@ pub struct AppState {
     pub in_flight: InFlightTracker,
     pub activity_store: Arc<dyn ActivityStore>,
     pub missing_job_tracker: Arc<dyn MissingJobTracker>,
+    pub proxy_metrics: ProxyMetrics,
     /// Interval for refreshing activity during long-running proxied requests.
     pub heartbeat_interval: Duration,
     pub auto_deregister_enabled: bool,
@@ -197,17 +199,41 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
     };
     let job_id = registration.job_id.clone();
+    let request_started = Instant::now();
+
+    if let Err(e) = state.activity_store.record_activity(&job_id).await {
+        warn!(job_id = %job_id, error = %e, "failed to record canonical job activity at request start");
+    }
 
     // --- 3. Ensure running (wake if dormant) ---
+    let wake_started = Instant::now();
     let endpoint = match state.coordinator.ensure_running(&registration).await {
         Ok(ep) => {
+            state.proxy_metrics.record_wake(
+                &job_id,
+                &registration.service_name,
+                "success",
+                wake_started.elapsed(),
+            );
             clear_missing_job_counter(&state, &job_id).await;
             ep
         }
         Err(NscaleError::JobNotFound(_)) => {
+            state.proxy_metrics.record_wake(
+                &job_id,
+                &registration.service_name,
+                "job-not-found",
+                wake_started.elapsed(),
+            );
             return handle_missing_job(&state, &job_id, "wake").await;
         }
         Err(e) => {
+            state.proxy_metrics.record_wake(
+                &job_id,
+                &registration.service_name,
+                "error",
+                wake_started.elapsed(),
+            );
             error!(job_id = %job_id, error = %e, "wake failed");
             return (StatusCode::SERVICE_UNAVAILABLE, format!("wake error: {e}")).into_response();
         }
@@ -440,6 +466,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 
     // Stop the heartbeat — request processing is done.
     heartbeat_cancel.cancel();
+
+    state.proxy_metrics.record_request(
+        &job_id,
+        &registration.service_name,
+        result.status().as_u16(),
+        request_started.elapsed(),
+    );
 
     result
 }

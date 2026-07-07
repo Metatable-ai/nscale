@@ -173,6 +173,29 @@ Without the probe, `nscale` must rely only on its own in-flight tracking. That i
 
 `nscale` clears the traffic-probe baseline after successful scale-down so stale counters do not poison the next wake cycle.
 
+### Configure autoscaling per job, not globally
+
+Autoscaling policies live on `JobRegistration` records submitted through `/admin/jobs`,
+`/admin/registry`, or `/admin/registry/sync`. There is no global autoscaling block in
+`config/default.toml`; jobs without an `autoscaling` object keep the existing scale-to-zero-only
+behavior.
+
+For autoscaled jobs, Traefik metrics provide the cluster-wide request-rate signal and nscale-native
+metrics provide proxy latency/error signals on `/metrics`. The autoscaler only manages running jobs
+between each job's `min_count` and `max_count`; wake-on-request and idle scale-down still own the
+transition to and from zero. Set `scale_to_zero = false` in a job policy when a service should stay
+at or above `min_count` instead of becoming dormant.
+
+Use per-job `cooldown_secs` and `decision_window_secs` when a service needs faster or slower
+autoscaling decisions than the defaults. These are policy fields on the registration payload, not
+global config-file settings.
+
+For operating many autoscaled jobs, use `GET /admin/autoscaling` to inspect which registrations have
+autoscaling policies and what Nomad count nscale currently sees. Use `/metrics` to alert on
+`nscale_autoscale_skips_total` reasons such as `metrics-error`, `cooldown`, and `dormant`, and on
+`nscale_autoscale_decisions_total` to confirm scale-up and scale-down decisions are actually being
+applied.
+
 ### Use fast scale-down sweeps only when the guardrails are enabled
 
 A `scale_down_interval_secs` of `5` works well **because** `nscale` includes:

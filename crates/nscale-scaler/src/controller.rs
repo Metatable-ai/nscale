@@ -285,6 +285,41 @@ impl ScaleDownController {
             }
         };
 
+        if scale_to_zero_disabled(&registration) {
+            info!("job autoscaling policy disables scale-to-zero, refreshing activity");
+            if let Err(e) = self.store.record_activity(job_id).await {
+                warn!(error = %e, "failed to refresh activity for scale-to-zero-disabled job");
+            }
+            return;
+        }
+
+        if registration.autoscaling.is_some() {
+            match self
+                .orchestrator
+                .get_job_count(&registration.job_id, &registration.nomad_group)
+                .await
+            {
+                Ok(current_count)
+                    if autoscaling_should_defer_scale_to_zero(&registration, current_count) =>
+                {
+                    info!(
+                        current_count,
+                        min_count = registration
+                            .autoscaling
+                            .as_ref()
+                            .map(|policy| policy.min_count),
+                        "autoscaled job is above min_count; waiting for autoscaler to downscale before scale-to-zero"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "failed to get autoscaled job count before scale-to-zero");
+                    return;
+                }
+            }
+        }
+
         info!(group = %registration.nomad_group, "scaling down idle job");
 
         // Scale down via Nomad
@@ -334,6 +369,22 @@ impl ScaleDownController {
             }
         }
     }
+}
+
+fn scale_to_zero_disabled(registration: &nscale_core::job::JobRegistration) -> bool {
+    registration
+        .autoscaling
+        .as_ref()
+        .is_some_and(|policy| !policy.scale_to_zero)
+}
+
+fn autoscaling_should_defer_scale_to_zero(
+    registration: &nscale_core::job::JobRegistration,
+    current_count: u32,
+) -> bool {
+    registration.autoscaling.as_ref().is_some_and(|policy| {
+        policy.enabled && policy.scale_to_zero && current_count > policy.min_count
+    })
 }
 
 async fn handle_scale_down_result(
@@ -421,6 +472,9 @@ mod tests {
             self.scale_down_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+        async fn scale_to(&self, _: &JobId, _: &str, _: u32, _: &str) -> Result<()> {
+            Ok(())
+        }
         async fn get_job_count(&self, _: &JobId, _: &str) -> Result<u32> {
             Ok(0)
         }
@@ -492,7 +546,58 @@ mod tests {
             job_id: JobId(job_id.into()),
             service_name: ServiceName(format!("svc-{job_id}")),
             nomad_group: "web".into(),
+            autoscaling: None,
         }
+    }
+
+    #[test]
+    fn scale_to_zero_policy_defaults_to_allowed_unless_disabled() {
+        let mut registration = test_registration("policy-job");
+        assert!(!scale_to_zero_disabled(&registration));
+
+        registration.autoscaling = Some(nscale_core::job::JobAutoscalingPolicy {
+            enabled: true,
+            min_count: 1,
+            max_count: 3,
+            scale_to_zero: true,
+            scale_up_step: 1,
+            scale_down_step: 1,
+            target_requests_per_second_per_instance: Some(10.0),
+            target_p95_latency_ms: None,
+            max_error_rate: None,
+            cooldown_secs: None,
+            decision_window_secs: None,
+        });
+        assert!(!scale_to_zero_disabled(&registration));
+
+        registration.autoscaling.as_mut().unwrap().scale_to_zero = false;
+        assert!(scale_to_zero_disabled(&registration));
+    }
+
+    #[test]
+    fn autoscaled_job_above_min_count_defers_idle_scale_to_zero() {
+        let mut registration = test_registration("policy-job");
+        registration.autoscaling = Some(nscale_core::job::JobAutoscalingPolicy {
+            enabled: true,
+            min_count: 1,
+            max_count: 3,
+            scale_to_zero: true,
+            scale_up_step: 1,
+            scale_down_step: 1,
+            target_requests_per_second_per_instance: Some(10.0),
+            target_p95_latency_ms: None,
+            max_error_rate: None,
+            cooldown_secs: None,
+            decision_window_secs: None,
+        });
+
+        assert!(autoscaling_should_defer_scale_to_zero(&registration, 3));
+        assert!(autoscaling_should_defer_scale_to_zero(&registration, 2));
+        assert!(!autoscaling_should_defer_scale_to_zero(&registration, 1));
+        assert!(!autoscaling_should_defer_scale_to_zero(&registration, 0));
+
+        registration.autoscaling.as_mut().unwrap().enabled = false;
+        assert!(!autoscaling_should_defer_scale_to_zero(&registration, 3));
     }
 
     #[tokio::test]

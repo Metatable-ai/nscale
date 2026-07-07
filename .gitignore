@@ -33,6 +33,9 @@ temp/
 # Logs
 *.log
 
+# Integration test output
+integration/.autoscaling-stress-results/
+
 # Environment files
 .env
 .env.local

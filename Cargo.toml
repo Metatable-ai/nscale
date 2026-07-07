@@ -43,6 +43,8 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
 fred = { version = "10", features = ["i-keys", "i-sorted-sets", "i-hashes", "i-scripts", "i-pubsub", "partial-tracing"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+async-trait = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
