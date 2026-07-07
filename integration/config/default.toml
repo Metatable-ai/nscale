@@ -32,3 +32,7 @@ file_provider_service = "s2z-nscale@file"
 [default.traefik]
 metrics_url = "http://traefik:8082"
 provider = "consulcatalog"
+
+# Prometheus is opt-in in integration. Use docker-compose.prometheus.yml or
+# set NSCALE_PROMETHEUS__URL and NSCALE_PROMETHEUS__TIMEOUT_SECS when running
+# with an external Prometheus.

@@ -1,0 +1,25 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    networks: [nscale-net]
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  nscale:
+    environment:
+      NSCALE_PROMETHEUS__URL: http://prometheus:9090
+      NSCALE_PROMETHEUS__TIMEOUT_SECS: 5
+    depends_on:
+      prometheus:
+        condition: service_healthy

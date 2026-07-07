@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: traefik
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - traefik:8082
+
+  - job_name: nscale
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - nscale:9090

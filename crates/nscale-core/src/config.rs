@@ -22,6 +22,8 @@ pub struct Config {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub traefik: Option<TraefikConfig>,
+    #[serde(default)]
+    pub prometheus: Option<PrometheusConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +118,19 @@ pub struct TraefikConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrometheusConfig {
+    pub url: String,
+    #[serde(default = "default_prometheus_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl PrometheusConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
@@ -196,6 +211,9 @@ fn default_file_provider_service() -> String {
 fn default_traefik_provider() -> String {
     "consulcatalog".to_string()
 }
+fn default_prometheus_timeout() -> u64 {
+    5
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -230,6 +248,7 @@ impl Default for Config {
                 file_provider_service: default_file_provider_service(),
             },
             traefik: None,
+            prometheus: None,
         }
     }
 }
@@ -263,5 +282,21 @@ mod tests {
         assert!(!cfg.registry.durable_enabled);
         assert_eq!(cfg.registry.etcd_endpoints, "http://localhost:2379");
         assert_eq!(cfg.routing.file_provider_service, "s2z-nscale@file");
+    }
+
+    #[test]
+    fn default_config_has_no_prometheus() {
+        let cfg = Config::default();
+        assert!(cfg.prometheus.is_none());
+    }
+
+    #[test]
+    fn prometheus_timeout_uses_seconds() {
+        let cfg = PrometheusConfig {
+            url: "http://prometheus:9090".to_string(),
+            timeout_secs: 7,
+        };
+
+        assert_eq!(cfg.timeout().as_secs(), 7);
     }
 }

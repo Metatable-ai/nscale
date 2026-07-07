@@ -20,6 +20,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use nscale_consul::client::ConsulClient;
 use nscale_core::config::Config;
+#[cfg(test)]
+use nscale_core::config::{PrometheusConfig, TraefikConfig};
 use nscale_core::error::{NscaleError, Result as NscaleResult};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::{JobAutoscalingPolicy, JobId, JobRegistration};
@@ -36,6 +38,7 @@ use nscale_scaler::autoscale_policy::MetricSnapshot;
 use nscale_scaler::controller::ScaleDownController;
 use nscale_scaler::event_processor::EventProcessor;
 use nscale_scaler::metrics_provider::{CompositeMetricsProvider, MetricsProvider};
+use nscale_scaler::prometheus_metrics::PrometheusMetricsProvider;
 use nscale_scaler::traefik_metrics::TraefikMetricsProvider;
 use nscale_scaler::traffic_probe::TrafficProbe;
 use nscale_store::activity::RedisActivityStore;
@@ -223,17 +226,9 @@ async fn main() {
         Arc::new(TrafficProbe::new(&tc.metrics_url, &tc.provider))
     });
 
-    let mut autoscale_metric_providers: Vec<Arc<dyn MetricsProvider>> = Vec::new();
-    if let Some(tc) = config.traefik.as_ref() {
-        autoscale_metric_providers.push(Arc::new(TraefikMetricsProvider::new(
-            &tc.metrics_url,
-            &tc.provider,
-        )));
-    }
-    autoscale_metric_providers.push(Arc::new(ProxyNativeMetricsProvider {
-        metrics: proxy_metrics.clone(),
-    }));
-    let autoscale_metrics = Arc::new(CompositeMetricsProvider::new(autoscale_metric_providers));
+    let autoscale_metrics = Arc::new(CompositeMetricsProvider::new(
+        build_autoscale_metric_providers(&config, proxy_metrics.clone()),
+    ));
 
     // ── Scale-down controller ────────────────────────────
     let scaler = ScaleDownController::new(
@@ -363,6 +358,53 @@ struct AdminState {
 
 struct ProxyNativeMetricsProvider {
     metrics: ProxyMetrics,
+}
+
+#[cfg(test)]
+fn autoscale_metric_provider_labels(
+    prometheus: Option<&PrometheusConfig>,
+    traefik: Option<&TraefikConfig>,
+) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if prometheus.is_some() {
+        labels.push("prometheus");
+    }
+    if traefik.is_some() {
+        labels.push("traefik");
+    }
+    labels.push("proxy-native");
+    labels
+}
+
+fn build_autoscale_metric_providers(
+    config: &Config,
+    proxy_metrics: ProxyMetrics,
+) -> Vec<Arc<dyn MetricsProvider>> {
+    let mut autoscale_metric_providers: Vec<Arc<dyn MetricsProvider>> = Vec::new();
+    if let Some(pc) = config.prometheus.as_ref() {
+        let traefik_provider = config
+            .traefik
+            .as_ref()
+            .map(|tc| tc.provider.as_str())
+            .unwrap_or("consulcatalog");
+
+        info!(url = %pc.url, provider = %traefik_provider, "Prometheus autoscaling metrics enabled");
+        autoscale_metric_providers.push(Arc::new(PrometheusMetricsProvider::new(
+            &pc.url,
+            traefik_provider,
+            pc.timeout(),
+        )));
+    }
+    if let Some(tc) = config.traefik.as_ref() {
+        autoscale_metric_providers.push(Arc::new(TraefikMetricsProvider::new(
+            &tc.metrics_url,
+            &tc.provider,
+        )));
+    }
+    autoscale_metric_providers.push(Arc::new(ProxyNativeMetricsProvider {
+        metrics: proxy_metrics,
+    }));
+    autoscale_metric_providers
 }
 
 #[async_trait]
@@ -853,5 +895,22 @@ mod autoscaling_admin_tests {
         assert_eq!(status.current_count, Some(2));
         assert!(status.count_error.is_none());
         assert_eq!(status.policy.unwrap().max_count, 3);
+    }
+
+    #[test]
+    fn autoscale_metric_provider_labels_puts_prometheus_before_fallback_providers() {
+        let prometheus = PrometheusConfig {
+            url: "http://prometheus:9090".to_string(),
+            timeout_secs: 5,
+        };
+        let traefik = TraefikConfig {
+            metrics_url: "http://traefik:8082".to_string(),
+            provider: "consulcatalog".to_string(),
+        };
+
+        assert_eq!(
+            autoscale_metric_provider_labels(Some(&prometheus), Some(&traefik)),
+            vec!["prometheus", "traefik", "proxy-native"]
+        );
     }
 }

@@ -285,6 +285,15 @@ request_buffer_size  = 1000
 file_provider_service = "s2z-nscale@file"
 ```
 
+Prometheus is optional and is not enabled by default. To query Prometheus before the
+direct Traefik and nscale-native fallback providers, add:
+
+```toml
+[default.prometheus]
+url = "http://prometheus:9090"
+timeout_secs = 5
+```
+
 ### Environment variables
 
 All settings can be overridden with `NSCALE_` prefixed env vars.
@@ -300,6 +309,8 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_CONSUL__ADDR` | `http://localhost:8500` | Consul API address |
 | `NSCALE_CONSUL__TOKEN` | — | Consul ACL token (optional) |
 | `NSCALE_REDIS__URL` | `redis://localhost:6379` | Redis connection URL |
+| `NSCALE_PROMETHEUS__URL` | — | Prometheus API URL (optional); when configured, queried before direct providers |
+| `NSCALE_PROMETHEUS__TIMEOUT_SECS` | `5` | Prometheus query timeout |
 | `NSCALE_REGISTRY__DURABLE_ENABLED` | `false` | Enable etcd-backed durable registrations and Redis read-through cache |
 | `NSCALE_REGISTRY__ETCD_ENDPOINTS` | `http://localhost:2379` | Comma-separated etcd endpoints |
 | `NSCALE_REGISTRY__ETCD_KEY_PREFIX` | `/nscale/registrations` | etcd key prefix used for registrations |
@@ -317,6 +328,9 @@ Nested keys use **double underscores** (Figment `.split("__")`).
 | `NSCALE_TRAEFIK__PROVIDER` | — | Traefik provider name for metric labels |
 | `RUST_LOG` | `info,nscale=debug` | Tracing filter |
 | `NSCALE_LOG_FORMAT` | auto | Log output format: `compact`, `pretty`, or `json` (see below) |
+
+When `NSCALE_PROMETHEUS__URL` or `[default.prometheus]` is configured, nscale queries
+Prometheus before the direct Traefik and nscale-native fallback providers.
 
 ## Logging
 
@@ -636,6 +650,18 @@ autoscaling config file. It verifies invalid policy rejection, Traefik request-r
 `max_count` caps under pressure, variable traffic scale-up/down, default `scale_to_zero = true`,
 `scale_to_zero = false`, and nscale-native latency-driven scale-up. The suite requires Docker,
 Docker Compose, curl, jq, and openssl.
+
+To exercise the Prometheus-backed metrics provider, run the opt-in Prometheus suite:
+
+```bash
+cd integration
+./test-autoscaling-prometheus.sh
+```
+
+This uses `docker-compose.prometheus.yml` to add a Prometheus service without changing the default
+integration stack. Prometheus scrapes Traefik `/metrics` and nscale `/metrics`; nscale runs with
+`NSCALE_PROMETHEUS__URL=http://prometheus:9090`, and the test verifies autoscaling still scales up
+within `max_count` and returns to zero.
 
 For the full operational lifecycle test, run:
 

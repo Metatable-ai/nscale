@@ -96,6 +96,8 @@ Use this as a starting point when you want:
 | Scaling | `scaling.wake_timeout_secs` | `60` | Gives Nomad + Consul enough time to recover from cold starts without leaving requests hanging indefinitely. |
 | Scaling | `scaling.scale_down_interval_secs` | `5` | Keeps the controller reactive under frequent wake/sleep cycles. |
 | Proxy | `proxy.request_timeout_secs` | `90` | Covers up to 60 seconds of wake latency plus up to 30 seconds of backend work. |
+| Prometheus | `prometheus.url` | optional | Queries Prometheus before the direct Traefik and nscale-native fallback providers when configured. |
+| Prometheus | `prometheus.timeout_secs` | `5` | Bounds Prometheus query latency before falling back to direct providers. |
 | Traefik | `traefik.metrics_url` | enabled | Enables the traffic probe, which prevents scale-down when Traefik is still serving requests to a healthy service. |
 | Traefik | `traefik.provider` | `consulcatalog` | Must match the provider label used in Traefik metrics and service routing. |
 
@@ -180,11 +182,12 @@ Autoscaling policies live on `JobRegistration` records submitted through `/admin
 `config/default.toml`; jobs without an `autoscaling` object keep the existing scale-to-zero-only
 behavior.
 
-For autoscaled jobs, Traefik metrics provide the cluster-wide request-rate signal and nscale-native
-metrics provide proxy latency/error signals on `/metrics`. The autoscaler only manages running jobs
-between each job's `min_count` and `max_count`; wake-on-request and idle scale-down still own the
-transition to and from zero. Set `scale_to_zero = false` in a job policy when a service should stay
-at or above `min_count` instead of becoming dormant.
+For autoscaled jobs, Prometheus is optional. When configured, nscale queries Prometheus before the
+direct Traefik and nscale-native fallback providers. The autoscaling behavior remains per-job and
+unchanged; only the metrics source changes. The autoscaler only manages running jobs between each
+job's `min_count` and `max_count`; wake-on-request and idle scale-down still own the transition to
+and from zero. Set `scale_to_zero = false` in a job policy when a service should stay at or above
+`min_count` instead of becoming dormant.
 
 Use per-job `cooldown_secs` and `decision_window_secs` when a service needs faster or slower
 autoscaling decisions than the defaults. These are policy fields on the registration payload, not
@@ -263,6 +266,45 @@ Notes:
 - If your workloads can exceed 30 seconds of request duration, increase `responseHeaderTimeout` to match the larger request budget.
 
 Operationally, Traefik is not just the front door. It is also part of the safety system because `nscale` relies on consistent routing and, optionally, Traefik request metrics to make scale-down decisions.
+
+### Prometheus
+
+Prometheus is optional. When configured, it should scrape:
+
+```text
+Traefik /metrics
+nscale /metrics
+```
+
+Configure the API endpoint with:
+
+```text
+NSCALE_PROMETHEUS__URL=http://prometheus:9090
+NSCALE_PROMETHEUS__TIMEOUT_SECS=5
+```
+
+The equivalent TOML is:
+
+```toml
+[default.prometheus]
+url = "http://prometheus:9090"
+timeout_secs = 5
+```
+
+When Prometheus is configured, nscale queries it before direct Traefik and nscale-native fallback
+providers. Autoscaling behavior remains per-job and unchanged; only the metrics source changes.
+
+The repository includes an opt-in Prometheus integration test:
+
+```bash
+cd integration
+./test-autoscaling-prometheus.sh
+```
+
+The test uses `docker-compose.prometheus.yml` to add Prometheus to the normal integration stack,
+sets `NSCALE_PROMETHEUS__URL=http://prometheus:9090`, verifies Prometheus has Traefik and nscale
+samples, and checks that a request-rate autoscaled job scales up within `max_count` and returns to
+zero.
 
 ### Nomad
 
