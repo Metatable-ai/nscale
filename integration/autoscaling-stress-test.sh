@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # autoscaling-stress-test.sh — many-job autoscaling stress runner.
 #
-# Exercises many independent per-job autoscaling policies at once:
-#   N jobs start at 0, receive concurrent traffic, scale to max_count=2,
-#   then return to 0 after traffic stops.
+# Exercises many independent per-job autoscaling policies at once.
+#
+# Default mode is capacity-aware: N jobs start at 0, receive concurrent
+# traffic, report handled request counts and observed peak allocation counts,
+# enforce that no job exceeds its cap, then verify all jobs return to 0.
+# This is intended to expose Nomad/Consul/Traefik control-plane limits under
+# many jobs without treating local Nomad capacity as an nscale correctness bug.
+#
+# Use --require-caps for smaller deterministic runs where every job must reach
+# its configured cap.
 #
 # Usage:
 #   ./autoscaling-stress-test.sh --start

@@ -656,8 +656,11 @@ cd integration
 ```
 
 The stress runner generates independent Nomad jobs from the autoscale echo fixture, submits per-job
-autoscaling policies, starts all jobs from zero, drives concurrent pressure, verifies each job reaches
-its cap, and then verifies each job steps down to `min_count` before returning to zero.
+autoscaling policies, starts all jobs from zero, drives concurrent pressure, reports per-job handled
+requests and observed peak counts, verifies no job exceeds its cap, and then verifies each job returns
+to zero. Large runs such as `--job-count=50` are capacity benchmarks for the local Nomad/Consul/Traefik
+stack; not every job is expected to reach its cap on a constrained dev machine. Use `--require-caps`
+for smaller deterministic runs where every job must reach its configured cap.
 
 Autoscaling emits these Prometheus series on `/metrics`:
 
