@@ -40,15 +40,35 @@ export function setup() {
   const consulUrl = resolvedConsulUrl();
   const svcName   = resolvedServiceName();
   const group     = resolvedNomadGroup();
+  const setupParams = {
+    timeout: '10s',
+    responseCallback: http.expectedStatuses({ min: 200, max: 499 }),
+  };
 
   console.log(`[coldstart] Scaling ${svcName} to 0...`);
-  const scaleResp = http.post(
-    `${nomadUrl}/v1/job/${svcName}/scale`,
-    JSON.stringify({ Count: 0, Target: { Group: group } }),
-    { headers: { 'Content-Type': 'application/json' }, timeout: '10s' },
-  );
-  if (scaleResp.status < 200 || scaleResp.status >= 300) {
-    console.error(`[coldstart] Scale-down failed: HTTP ${scaleResp.status} ${scaleResp.body}`);
+  const scaleDeadline = Date.now() + 60_000;
+  let scaled = false;
+  while (Date.now() < scaleDeadline) {
+    const scaleResp = http.post(
+      `${nomadUrl}/v1/job/${svcName}/scale`,
+      JSON.stringify({ Count: 0, Target: { Group: group } }),
+      { ...setupParams, headers: { 'Content-Type': 'application/json' } },
+    );
+
+    if (scaleResp.status >= 200 && scaleResp.status < 300) {
+      scaled = true;
+      break;
+    }
+
+    if (scaleResp.status === 400 && String(scaleResp.body).toLowerCase().includes('deployment')) {
+      sleep(2);
+      continue;
+    }
+
+    throw new Error(`[coldstart] Scale-down failed: HTTP ${scaleResp.status} ${scaleResp.body}`);
+  }
+  if (!scaled) {
+    throw new Error('[coldstart] Scale-down failed: active deployment did not clear within 60s');
   }
 
   // Wait up to 20s for Consul to show 0 healthy instances.
@@ -56,7 +76,7 @@ export function setup() {
   while (Date.now() < deadline) {
     const health = http.get(
       `${consulUrl}/v1/health/service/${svcName}?passing=true`,
-      { timeout: '5s' },
+      setupParams,
     );
     const instances = JSON.parse(health.body || '[]');
     if (instances.length === 0) {

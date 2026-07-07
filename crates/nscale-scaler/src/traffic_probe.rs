@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tracing::{debug, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
-use nscale_core::job::JobId;
+use nscale_core::job::ServiceName;
 
 /// Scrapes Traefik Prometheus metrics to determine per-service request counts.
 ///
@@ -35,9 +35,9 @@ impl TrafficProbe {
 
     /// Returns `true` if Traefik has routed new requests to the given service
     /// since the last time we checked.
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    pub async fn has_active_traffic(&self, job_id: &JobId) -> Result<bool> {
-        let service_label = format!("{}@{}", job_id.0, self.provider);
+    #[instrument(skip(self), fields(service = %service))]
+    pub async fn has_active_traffic(&self, service: &ServiceName) -> Result<bool> {
+        let service_label = format!("{}@{}", service.0, self.provider);
         let current_total = self.scrape_request_count(&service_label).await?;
 
         let mut last = self.last_counts.lock().await;
@@ -65,14 +65,14 @@ impl TrafficProbe {
         }
     }
 
-    /// Remove the cached baseline for a job so the next `has_active_traffic`
+    /// Remove the cached baseline for a service so the next `has_active_traffic`
     /// check starts fresh.  Called after a successful scale-down to avoid
     /// stale counters causing a false-positive on the next wake cycle.
-    pub async fn clear_baseline(&self, job_id: &JobId) {
-        let service_label = format!("{}@{}", job_id.0, self.provider);
+    pub async fn clear_baseline(&self, service: &ServiceName) {
+        let service_label = format!("{}@{}", service.0, self.provider);
         let mut last = self.last_counts.lock().await;
         last.remove(&service_label);
-        debug!(job_id = %job_id, "cleared traffic probe baseline");
+        debug!(service = %service, "cleared traffic probe baseline");
     }
 
     /// Scrape Traefik Prometheus metrics and extract
@@ -166,8 +166,8 @@ traefik_service_requests_total{code="200",method="GET",protocol="http",service="
     #[tokio::test]
     async fn test_clear_baseline_removes_cached_count() {
         let probe = TrafficProbe::new("http://unused:8080", "consulcatalog");
-        let job_id = JobId("test-job".into());
-        let service_label = format!("{}@consulcatalog", job_id.0);
+        let service = ServiceName("mg-alpha".into());
+        let service_label = format!("{}@consulcatalog", service.0);
 
         // Seed a baseline
         {
@@ -178,8 +178,8 @@ traefik_service_requests_total{code="200",method="GET",protocol="http",service="
         // Verify it exists
         assert!(probe.last_counts.lock().await.contains_key(&service_label));
 
-        // Clear it
-        probe.clear_baseline(&job_id).await;
+        // Clear it (keyed by the group's service name, not the job id)
+        probe.clear_baseline(&service).await;
 
         // Verify it's gone
         assert!(!probe.last_counts.lock().await.contains_key(&service_label));

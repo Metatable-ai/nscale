@@ -25,7 +25,7 @@ use nscale_core::config::Config;
 use nscale_core::config::{PrometheusConfig, TraefikConfig};
 use nscale_core::error::{NscaleError, Result as NscaleResult};
 use nscale_core::inflight::InFlightTracker;
-use nscale_core::job::{JobAutoscalingPolicy, JobId, JobRegistration};
+use nscale_core::job::{JobAutoscalingPolicy, JobId, JobRegistration, ScaleUnit};
 use nscale_core::traits::{ActivityStore, MissingJobTracker, Orchestrator};
 use nscale_etcd::EtcdClient;
 use nscale_nomad::client::NomadClient;
@@ -33,7 +33,6 @@ use nscale_nomad::events::{EventStreamConfig, start_event_stream};
 use nscale_nomad::job_mutator::inject_nscale_tags;
 use nscale_proxy::handler::{AppState, proxy_handler};
 use nscale_proxy::metrics::ProxyMetrics;
-use nscale_proxy::middleware::ActivityLayer;
 use nscale_scaler::autoscale::AutoscaleController;
 use nscale_scaler::autoscale_policy::MetricSnapshot;
 use nscale_scaler::controller::ScaleDownController;
@@ -278,9 +277,10 @@ async fn main() {
     info!("nomad event stream consumer started");
 
     // ── Proxy router ─────────────────────────────────────
+    // Activity is recorded by the handler (single source of truth) so it can key
+    // by the per-group scale unit, which the Host header alone cannot resolve.
     let proxy_router = Router::new()
         .fallback(any(proxy_handler))
-        .layer(ActivityLayer::new(activity_store.clone()))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
@@ -610,9 +610,13 @@ async fn cleanup_admin_job_state(
 ) -> Result<Vec<String>, NscaleError> {
     let mut warnings = Vec::new();
 
-    state.coordinator.mark_dormant(job_id);
+    state.coordinator.mark_dormant(&ScaleUnit(job_id.0.clone()));
 
-    if let Err(e) = state.activity_store.remove_activity(job_id).await {
+    if let Err(e) = state
+        .activity_store
+        .remove_activity(&ScaleUnit(job_id.0.clone()))
+        .await
+    {
         warnings.push(format!("failed to remove activity: {e}"));
     }
 
@@ -769,16 +773,10 @@ async fn admin_submit_job(
         .map(|registration| registration.nomad_group.clone())
         .collect::<BTreeSet<_>>();
     if unique_groups.len() > 1 {
-        let has_autoscaling = managed_services
-            .iter()
-            .any(|registration| registration.autoscaling.is_some());
-        error!(
+        info!(
             job_id = %managed_services[0].job_id,
             groups = ?unique_groups,
-            autoscaling = has_autoscaling,
-            "multiple groups detected for submitted job; scale-down and scale-to-zero track \
-             only the last registered group. Autoscaling scales each group independently, but \
-             idle groups other than the last will not scale to zero"
+            "registered multi-group job; each task group scales to zero and wakes independently"
         );
     }
 
@@ -794,12 +792,12 @@ async fn admin_submit_job(
         }
     };
 
-    let mut seeded_job_ids = BTreeSet::new();
+    let mut seeded_units = BTreeSet::new();
     let mut registration_failures = Vec::new();
     for registration in &managed_services {
         match state.registry.register(registration).await {
             Ok(()) => {
-                seeded_job_ids.insert(registration.job_id.0.clone());
+                seeded_units.insert(registration.scale_unit_key().0);
                 info!(
                     job_id = %registration.job_id,
                     service_name = %registration.service_name,
@@ -822,10 +820,10 @@ async fn admin_submit_job(
         }
     }
 
-    for job_id in seeded_job_ids {
-        let job_id = JobId(job_id);
-        if let Err(e) = state.activity_store.record_activity(&job_id).await {
-            error!(job_id = %job_id, error = %e, "failed to seed activity for submitted job");
+    for unit in seeded_units {
+        let unit = ScaleUnit(unit);
+        if let Err(e) = state.activity_store.record_activity(&unit).await {
+            error!(unit = %unit, error = %e, "failed to seed activity for submitted job");
         }
     }
 
@@ -861,8 +859,12 @@ async fn admin_register(
 
     match state.registry.register(&reg).await {
         Ok(()) => {
-            // Seed activity so the scaler can detect this job as idle later.
-            if let Err(e) = state.activity_store.record_activity(&reg.job_id).await {
+            // Seed activity so the scaler can detect this unit as idle later.
+            if let Err(e) = state
+                .activity_store
+                .record_activity(&reg.scale_unit_key())
+                .await
+            {
                 error!(job_id = %reg.job_id, error = %e, "failed to seed activity");
             }
             info!(job_id = %reg.job_id, "registered job via admin API");
@@ -891,7 +893,11 @@ async fn admin_sync(
 
         match state.registry.register(reg).await {
             Ok(()) => {
-                if let Err(e) = state.activity_store.record_activity(&reg.job_id).await {
+                if let Err(e) = state
+                    .activity_store
+                    .record_activity(&reg.scale_unit_key())
+                    .await
+                {
                     error!(job_id = %reg.job_id, error = %e, "failed to seed activity during sync");
                 }
                 ok += 1;
@@ -931,6 +937,7 @@ mod autoscaling_admin_tests {
             job_id: JobId("api".to_string()),
             service_name: ServiceName("api-service".to_string()),
             nomad_group: "web".to_string(),
+            scale_unit: None,
             autoscaling: Some(JobAutoscalingPolicy {
                 enabled: true,
                 min_count: 1,

@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
-use nscale_core::job::{Endpoint, JobId, JobRegistration};
+use nscale_core::job::{Endpoint, JobRegistration, ScaleUnit};
 use nscale_core::traits::{Orchestrator, ServiceDiscovery};
 
 use crate::state::{STATE_DORMANT, STATE_READY, STATE_WAKING, WakeResult, WakeState};
@@ -52,7 +52,7 @@ impl WakeCoordinator {
     /// If ready, returns the cached endpoint immediately.
     #[instrument(skip(self, reg), fields(job_id = %reg.job_id))]
     pub async fn ensure_running(&self, reg: &JobRegistration) -> Result<Endpoint> {
-        let job_key = reg.job_id.0.clone();
+        let job_key = reg.scale_unit_key().0;
 
         // Fast path: already ready with cached endpoint
         if let Some(ep) = self.endpoints.get(&job_key) {
@@ -86,7 +86,7 @@ impl WakeCoordinator {
                     // Endpoint cache miss but state is ready — fetch from orchestrator
                     let ep = self
                         .orchestrator
-                        .get_healthy_endpoint(&reg.job_id)
+                        .get_healthy_endpoint(&reg.job_id, &reg.nomad_group)
                         .await?
                         .ok_or_else(|| {
                             NscaleError::JobNotReady(format!(
@@ -157,7 +157,8 @@ impl WakeCoordinator {
                                         endpoint = %endpoint,
                                         "job woke up successfully"
                                     );
-                                    endpoints.insert(reg_clone.job_id.0.clone(), endpoint.clone());
+                                    endpoints
+                                        .insert(reg_clone.scale_unit_key().0, endpoint.clone());
                                     state_clone.set_ready();
                                     let _ = notify.send(WakeResult::Ready(endpoint));
                                 }
@@ -168,7 +169,7 @@ impl WakeCoordinator {
                                     );
                                     state_clone.set_dormant();
                                     let _ = notify.send(WakeResult::Cancelled);
-                                    jobs.remove(&reg_clone.job_id.0);
+                                    jobs.remove(&reg_clone.scale_unit_key().0);
                                 }
                                 Err(NscaleError::JobNotFound(job_id)) => {
                                     warn!(
@@ -178,7 +179,7 @@ impl WakeCoordinator {
                                     );
                                     state_clone.set_dormant();
                                     let _ = notify.send(WakeResult::JobNotFound(job_id));
-                                    jobs.remove(&reg_clone.job_id.0);
+                                    jobs.remove(&reg_clone.scale_unit_key().0);
                                 }
                                 Err(e) => {
                                     error!(
@@ -189,7 +190,7 @@ impl WakeCoordinator {
                                     state_clone.set_dormant();
                                     let _ = notify.send(WakeResult::Failed(e.to_string()));
                                     // Remove entry so next request tries again
-                                    jobs.remove(&reg_clone.job_id.0);
+                                    jobs.remove(&reg_clone.scale_unit_key().0);
                                 }
                             }
                         });
@@ -229,25 +230,25 @@ impl WakeCoordinator {
         }
     }
 
-    /// Mark a job as dormant (called after scale-down).
-    pub fn mark_dormant(&self, job_id: &JobId) {
-        self.endpoints.remove(&job_id.0);
-        if let Some(state) = self.jobs.get(&job_id.0) {
+    /// Mark a scale-to-zero unit as dormant (called after scale-down).
+    pub fn mark_dormant(&self, unit: &ScaleUnit) {
+        self.endpoints.remove(&unit.0);
+        if let Some(state) = self.jobs.get(&unit.0) {
             state.set_dormant();
         }
-        self.jobs.remove(&job_id.0);
+        self.jobs.remove(&unit.0);
     }
 
-    /// Invalidate the cached endpoint for a job, forcing the next
+    /// Invalidate the cached endpoint for a unit, forcing the next
     /// `ensure_running` call to re-discover (and re-wake if needed).
     /// Called when the proxy detects a backend connection failure.
-    pub fn invalidate(&self, job_id: &JobId) {
-        self.endpoints.remove(&job_id.0);
-        if let Some(state) = self.jobs.get(&job_id.0) {
+    pub fn invalidate(&self, unit: &ScaleUnit) {
+        self.endpoints.remove(&unit.0);
+        if let Some(state) = self.jobs.get(&unit.0) {
             state.set_dormant();
         }
-        self.jobs.remove(&job_id.0);
-        info!(job_id = %job_id, "invalidated stale endpoint cache");
+        self.jobs.remove(&unit.0);
+        info!(unit = %unit, "invalidated stale endpoint cache");
     }
 
     /// Re-check the running endpoint for a job without forcing a scale-up.
@@ -259,9 +260,13 @@ impl WakeCoordinator {
         reg: &JobRegistration,
         current: &Endpoint,
     ) -> Result<EndpointRefresh> {
-        let job_key = reg.job_id.0.clone();
+        let job_key = reg.scale_unit_key().0;
 
-        match self.orchestrator.get_healthy_endpoint(&reg.job_id).await? {
+        match self
+            .orchestrator
+            .get_healthy_endpoint(&reg.job_id, &reg.nomad_group)
+            .await?
+        {
             Some(endpoint) => {
                 self.endpoints.insert(job_key.clone(), endpoint.clone());
                 if let Some(state) = self.jobs.get(&job_key) {
@@ -292,9 +297,9 @@ impl WakeCoordinator {
         }
     }
 
-    /// Check if a job is currently in the Ready state.
-    pub fn is_ready(&self, job_id: &JobId) -> bool {
-        self.endpoints.contains_key(&job_id.0)
+    /// Check if a unit is currently in the Ready state.
+    pub fn is_ready(&self, unit: &ScaleUnit) -> bool {
+        self.endpoints.contains_key(&unit.0)
     }
 }
 
@@ -358,7 +363,7 @@ async fn wait_until_abandoned(notify: &tokio::sync::broadcast::Sender<WakeResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nscale_core::job::ServiceName;
+    use nscale_core::job::{JobId, ServiceName};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -420,7 +425,11 @@ mod tests {
         async fn get_job_count(&self, _job_id: &JobId, _group: &str) -> Result<u32> {
             Ok(1)
         }
-        async fn get_healthy_endpoint(&self, _job_id: &JobId) -> Result<Option<Endpoint>> {
+        async fn get_healthy_endpoint(
+            &self,
+            _job_id: &JobId,
+            _group: &str,
+        ) -> Result<Option<Endpoint>> {
             Ok(self
                 .healthy_endpoint
                 .lock()
@@ -455,9 +464,42 @@ mod tests {
             job_id: JobId("test-job".into()),
             service_name: ServiceName("test-svc".into()),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: Vec::new(),
         }
+    }
+
+    fn multi_group_registration(job: &str, group: &str) -> JobRegistration {
+        JobRegistration {
+            job_id: JobId(job.into()),
+            service_name: ServiceName(format!("{job}-{group}")),
+            nomad_group: group.into(),
+            scale_unit: Some(format!("{job}/{group}")),
+            autoscaling: None,
+            traefik_routers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_groups_of_same_job_wake_independently() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coord = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+
+        let alpha = multi_group_registration("api", "alpha");
+        let beta = multi_group_registration("api", "beta");
+
+        // Waking alpha must not mark beta ready — they are distinct scale units.
+        coord.ensure_running(&alpha).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(coord.is_ready(&alpha.scale_unit_key()));
+        assert!(!coord.is_ready(&beta.scale_unit_key()));
+
+        // Marking alpha dormant leaves beta untouched (still not ready, no panic).
+        coord.mark_dormant(&alpha.scale_unit_key());
+        assert!(!coord.is_ready(&alpha.scale_unit_key()));
+        assert!(!coord.is_ready(&beta.scale_unit_key()));
     }
 
     #[tokio::test]
@@ -551,10 +593,10 @@ mod tests {
         assert_eq!(ep.host, "10.0.0.1");
         // Give the spawned wake task a chance to insert into the endpoint cache
         tokio::task::yield_now().await;
-        assert!(coord.is_ready(&reg.job_id));
+        assert!(coord.is_ready(&reg.scale_unit_key()));
 
-        coord.mark_dormant(&reg.job_id);
-        assert!(!coord.is_ready(&reg.job_id));
+        coord.mark_dormant(&reg.scale_unit_key());
+        assert!(!coord.is_ready(&reg.scale_unit_key()));
     }
 
     #[tokio::test]
@@ -573,11 +615,11 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert!(coord.is_ready(&reg.job_id));
+        assert!(coord.is_ready(&reg.scale_unit_key()));
 
         // Invalidate clears the cache and resets state to dormant
-        coord.invalidate(&reg.job_id);
-        assert!(!coord.is_ready(&reg.job_id));
+        coord.invalidate(&reg.scale_unit_key());
+        assert!(!coord.is_ready(&reg.scale_unit_key()));
 
         // Next ensure_running must trigger a fresh scale-up
         let ep2 = coord.ensure_running(&reg).await.unwrap();
@@ -627,7 +669,7 @@ mod tests {
 
         let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
         assert!(matches!(refreshed, EndpointRefresh::Missing));
-        assert!(!coord.is_ready(&reg.job_id));
+        assert!(!coord.is_ready(&reg.scale_unit_key()));
     }
 
     #[tokio::test]
@@ -704,7 +746,7 @@ mod tests {
 
         // State should be reverted to dormant (entry removed)
         assert!(
-            !coord.is_ready(&reg.job_id),
+            !coord.is_ready(&reg.scale_unit_key()),
             "abandoned wake should revert to dormant"
         );
 
@@ -735,6 +777,7 @@ mod tests {
             job_id: JobId("job-1".into()),
             service_name: ServiceName("svc-1".into()),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: Vec::new(),
         };
@@ -742,6 +785,7 @@ mod tests {
             job_id: JobId("job-2".into()),
             service_name: ServiceName("svc-2".into()),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: Vec::new(),
         };

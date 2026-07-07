@@ -236,6 +236,7 @@ mod tests {
             job_id: JobId("api".to_string()),
             service_name: ServiceName("api.v1(blue)".to_string()),
             nomad_group: "api".to_string(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: vec!["route\"north\nwest\\edge".to_string()],
         };
@@ -321,6 +322,7 @@ mod tests {
             job_id: JobId("api".to_string()),
             service_name: ServiceName("api".to_string()),
             nomad_group: "api".to_string(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: vec!["api-router".to_string()],
         }

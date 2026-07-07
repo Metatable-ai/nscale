@@ -52,6 +52,29 @@ impl From<&str> for ServiceName {
     }
 }
 
+/// Identifier of a scale-to-zero unit — a single Nomad task group.
+///
+/// For a single-group job this is just the job id, so existing single-group
+/// deployments stay byte-for-byte unchanged. For a multi-group job it is a
+/// composite of job id and task group so each group scales independently.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScaleUnit(pub String);
+
+impl ScaleUnit {
+    /// Composite unit key for one group of a multi-group job.
+    // ponytail: '/' separator assumes job ids don't contain '/'; switch to a
+    // reserved delimiter if that assumption ever breaks.
+    pub fn composite(job_id: &JobId, group: &str) -> Self {
+        Self(format!("{}/{}", job_id.0, group))
+    }
+}
+
+impl fmt::Display for ScaleUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A network endpoint for a running service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -88,10 +111,27 @@ pub struct JobRegistration {
     pub job_id: JobId,
     pub service_name: ServiceName,
     pub nomad_group: String,
+    /// Explicit scale-to-zero unit key. Absent for single-group / legacy
+    /// registrations (falls back to the job id); set to a composite for
+    /// multi-group jobs. `#[serde(default)]` keeps existing stored registrations
+    /// valid with no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscaling: Option<JobAutoscalingPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub traefik_routers: Vec<String>,
+}
+
+impl JobRegistration {
+    /// The scale-to-zero unit key for this registration, falling back to the job
+    /// id when unset (single-group and pre-multi-group registrations).
+    pub fn scale_unit_key(&self) -> ScaleUnit {
+        self.scale_unit
+            .clone()
+            .map(ScaleUnit)
+            .unwrap_or_else(|| ScaleUnit(self.job_id.0.clone()))
+    }
 }
 
 /// Per-job autoscaling policy attached to a registration.
@@ -261,6 +301,45 @@ mod tests {
         );
         assert_eq!(registration.nomad_group, "web");
         assert!(registration.autoscaling.is_none());
+    }
+
+    #[test]
+    fn scale_unit_key_falls_back_to_job_id_when_unset() {
+        let reg = JobRegistration {
+            job_id: JobId("api".into()),
+            service_name: ServiceName("api".into()),
+            nomad_group: "main".into(),
+            scale_unit: None,
+            autoscaling: None,
+            traefik_routers: Vec::new(),
+        };
+        assert_eq!(reg.scale_unit_key(), ScaleUnit("api".into()));
+    }
+
+    #[test]
+    fn scale_unit_key_uses_explicit_composite_when_set() {
+        let reg = JobRegistration {
+            job_id: JobId("api".into()),
+            service_name: ServiceName("api-web".into()),
+            nomad_group: "web".into(),
+            scale_unit: Some("api/web".into()),
+            autoscaling: None,
+            traefik_routers: Vec::new(),
+        };
+        assert_eq!(
+            reg.scale_unit_key(),
+            ScaleUnit::composite(&JobId("api".into()), "web")
+        );
+        assert_eq!(reg.scale_unit_key().0, "api/web");
+    }
+
+    #[test]
+    fn legacy_registration_without_scale_unit_deserializes_and_falls_back() {
+        // JSON produced by an older nscale version that predates multi-group.
+        let json = r#"{"job_id":"api","service_name":"api","nomad_group":"main"}"#;
+        let reg: JobRegistration = serde_json::from_str(json).unwrap();
+        assert!(reg.scale_unit.is_none());
+        assert_eq!(reg.scale_unit_key(), ScaleUnit("api".into()));
     }
 
     #[test]

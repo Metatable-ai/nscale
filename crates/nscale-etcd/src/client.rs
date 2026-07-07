@@ -206,6 +206,7 @@ mod tests {
             job_id: JobId("job-a".to_string()),
             service_name: ServiceName("svc-a".to_string()),
             nomad_group: "main".to_string(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: Vec::new(),
         };

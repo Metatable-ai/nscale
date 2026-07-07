@@ -189,6 +189,42 @@ wait_for_job_zero() {
     done
 }
 
+scale_job_to_zero() {
+    local failure_label="$1"
+    local message="$2"
+    local retry_timeout="${3:-60}"
+    local elapsed=0
+
+    while true; do
+        wait_for_deployment_complete
+
+        local scale_resp scale_code scale_body
+        scale_resp=$(curl -s -w "\n%{http_code}" -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
+            -H "Content-Type: application/json" \
+            -d "{\"Count\":0,\"Target\":{\"Group\":\"${SERVICE_GROUP}\"},\"Message\":\"${message}\"}")
+        scale_code=$(echo "$scale_resp" | tail -1)
+        scale_body=$(echo "$scale_resp" | sed '$d')
+
+        if [[ "$scale_code" =~ ^2 ]]; then
+            return 0
+        fi
+
+        if [[ "$scale_code" = "400" ]] && grep -qi "deployment" <<<"$scale_body"; then
+            if [ "$elapsed" -ge "$retry_timeout" ]; then
+                fail "${failure_label}: HTTP $scale_code — $scale_body"
+                exit 1
+            fi
+
+            sleep 2
+            elapsed=$((elapsed + 2))
+            continue
+        fi
+
+        fail "${failure_label}: HTTP $scale_code — $scale_body"
+        exit 1
+    done
+}
+
 cleanup() {
     info "Cleaning up durable integration stack..."
     cd "$SCRIPT_DIR"
@@ -294,15 +330,7 @@ assert_redis_registration_present
 pass "Warm-path etcd fallback succeeded and Redis cache was repopulated"
 
 info "Scaling job to zero to verify cold-start fallback after Redis loss..."
-wait_for_deployment_complete
-SCALE_RESP=$(curl -s -w "\n%{http_code}" -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
-    -H "Content-Type: application/json" \
-    -d "{\"Count\":0,\"Target\":{\"Group\":\"${SERVICE_GROUP}\"},\"Message\":\"durable integration test: force scale-down\"}")
-SCALE_CODE=$(echo "$SCALE_RESP" | tail -1)
-if [[ ! "$SCALE_CODE" =~ ^2 ]]; then
-    fail "Scale-down before cold-start check failed: HTTP $SCALE_CODE"
-    exit 1
-fi
+scale_job_to_zero "Scale-down before cold-start check failed" "durable integration test: force scale-down"
 wait_for_job_zero
 pass "Job scaled to zero"
 

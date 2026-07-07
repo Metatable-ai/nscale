@@ -77,6 +77,67 @@ request_https_code() {
     "https://${HOST_HEADER}/" 2>/dev/null || echo "000"
 }
 
+wait_for_proxy_code() {
+  local scheme="$1"
+  local expected="$2"
+  local timeout="${3:-60}"
+  local elapsed=0
+  local code="000"
+
+  while [ "$elapsed" -lt "$timeout" ]; do
+    if [ "$scheme" = "https" ]; then
+      code=$(request_https_code 10)
+    else
+      code=$(request_http_code 10)
+    fi
+
+    if [ "$code" = "$expected" ]; then
+      echo "$code"
+      return 0
+    fi
+
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  echo "$code"
+  return 1
+}
+
+scale_job_to_zero() {
+  local retry_timeout="${1:-60}"
+  local elapsed=0
+
+  while true; do
+    local scale_resp scale_code scale_body
+    scale_resp=$(curl -s -w "\n%{http_code}" \
+      -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
+      -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"Count\": 0, \"Target\": {\"Group\": \"${SERVICE_GROUP}\"}}")
+    scale_code=$(echo "$scale_resp" | tail -1)
+    scale_body=$(echo "$scale_resp" | sed '$d')
+
+    if [[ "$scale_code" =~ ^2 ]]; then
+      echo "$scale_code"
+      return 0
+    fi
+
+    if [ "$scale_code" = "400" ] && echo "$scale_body" | grep -qi "deployment"; then
+      if [ "$elapsed" -ge "$retry_timeout" ]; then
+        echo "$scale_code"
+        return 1
+      fi
+      sleep 2
+      elapsed=$((elapsed + 2))
+      continue
+    fi
+
+    echo "$scale_code"
+    return 1
+  done
+}
+
 TESTS_PASSED=0
 TESTS_FAILED=0
 
@@ -342,7 +403,7 @@ header "Phase 4: Test warm-path proxy (service already running)"
 # ══════════════════════════════════════════════════════════
 
 info "Sending request through Traefik → nscale (warm path)..."
-WARM_RESP=$(request_http_code 30)
+WARM_RESP=$(wait_for_proxy_code http 200 60 || true)
 
 if [ "$WARM_RESP" = "200" ]; then
   assert_pass "HTTP warm-path request succeeded (HTTP 200)"
@@ -351,7 +412,7 @@ else
 fi
 
 info "Sending HTTPS request through Traefik → nscale (warm path)..."
-WARM_TLS_RESP=$(request_https_code 30)
+WARM_TLS_RESP=$(wait_for_proxy_code https 200 60 || true)
 
 if [ "$WARM_TLS_RESP" = "200" ]; then
   assert_pass "HTTPS warm-path request succeeded (HTTP 200)"
@@ -385,11 +446,7 @@ done
 assert_pass "Deployment complete (${elapsed}s)"
 
 info "Scaling ${JOB_ID} to 0 (via Nomad API with ACL token)..."
-SCALE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X POST "$NOMAD_ADDR/v1/job/${JOB_ID}/scale" \
-  -H "X-Nomad-Token: $NOMAD_MGMT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"Count\": 0, \"Target\": {\"Group\": \"${SERVICE_GROUP}\"}}")
+SCALE_RESP=$(scale_job_to_zero 60 || true)
 
 if [ "$SCALE_RESP" = "200" ]; then
   assert_pass "Scaled job to 0 (HTTP 200)"

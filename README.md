@@ -596,10 +596,12 @@ Traefik metrics provide the cluster-wide request-rate signal when `NSCALE_TRAEFI
 configured. nscale-native metrics provide request latency and local error-rate signals through the
 admin `/metrics` endpoint.
 
-> **Multi-group jobs:** the autoscaler scales each `(job, group)` independently, but idle
-> scale-down and scale-to-zero currently track a single group per job id. For a job that exposes
-> more than one task group, only the last-registered group scales to zero when idle; nscale logs an
-> error at submission time in that case.
+> **Multi-group jobs:** a single Nomad job may expose more than one task group,
+> each with its own service/router. nscale tracks idle state, wake, in-flight
+> requests, Traefik traffic, and scale-to-zero **per task group**, so each group
+> scales independently. Internally the scale-to-zero unit is the job id for
+> single-group jobs (unchanged, no data migration) and a `job_id/group` composite
+> for multi-group jobs.
 
 ### Manual purge endpoint
 

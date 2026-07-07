@@ -8,7 +8,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
-use nscale_core::job::JobId;
+use nscale_core::job::{JobId, JobRegistration, ScaleUnit, ServiceName};
 use nscale_core::traits::{ActivityStore, MissingJobTracker, Orchestrator};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::WakeCoordinator;
@@ -93,17 +93,14 @@ impl ScaleDownController {
     }
 
     async fn cleanup_missing_job_state(&self, job_id: &JobId) -> Result<()> {
-        self.coordinator.mark_dormant(job_id);
+        let unit = ScaleUnit(job_id.0.clone());
+        self.coordinator.mark_dormant(&unit);
 
-        if let Err(e) = self.store.remove_activity(job_id).await {
+        if let Err(e) = self.store.remove_activity(&unit).await {
             warn!(job_id = %job_id, error = %e, "failed to remove activity during auto-deregister cleanup");
         }
 
         self.deferred_jobs.remove(&job_id.0);
-
-        if let Some(probe) = &self.traffic_probe {
-            probe.clear_baseline(job_id).await;
-        }
 
         self.registry.deregister(job_id).await?;
 
@@ -206,60 +203,77 @@ impl ScaleDownController {
         // events and records activity when allocations reach "running".
 
         // Find and scale down truly idle jobs
-        let idle_jobs = self.store.get_idle_jobs(self.idle_threshold).await?;
-        if idle_jobs.is_empty() {
-            debug!("no idle jobs found");
+        let idle_units = self.store.get_idle_units(self.idle_threshold).await?;
+        if idle_units.is_empty() {
+            debug!("no idle units found");
             return Ok(());
         }
 
-        info!(count = idle_jobs.len(), "found idle jobs to scale down");
+        info!(count = idle_units.len(), "found idle units to scale down");
 
-        for job_id in &idle_jobs {
+        // Resolve each idle unit to its registration (group-aware).
+        let by_unit: std::collections::HashMap<String, JobRegistration> = self
+            .registry
+            .list_all()
+            .await?
+            .into_iter()
+            .map(|reg| (reg.scale_unit_key().0, reg))
+            .collect();
+
+        for unit in &idle_units {
             if self.cancel.is_cancelled() {
                 break;
             }
-            self.scale_down_job(job_id).await;
+            match by_unit.get(&unit.0) {
+                Some(registration) => self.scale_down_unit(unit, registration).await,
+                None => {
+                    warn!(unit = %unit, "no registration for idle unit, cleaning up stale activity");
+                    let _ = self.store.remove_activity(unit).await;
+                }
+            }
         }
 
         Ok(())
     }
 
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn scale_down_job(&self, job_id: &JobId) {
-        // --- Deferred guard: skip jobs that are backing off after a blocked deployment ---
-        if let Some(entry) = self.deferred_jobs.get(&job_id.0) {
+    #[instrument(skip(self, registration), fields(unit = %unit))]
+    async fn scale_down_unit(&self, unit: &ScaleUnit, registration: &JobRegistration) {
+        let job_id = &registration.job_id;
+
+        // --- Deferred guard: skip units backing off after a blocked deployment ---
+        if let Some(entry) = self.deferred_jobs.get(&unit.0) {
             if Instant::now() < *entry {
-                debug!("job is deferred due to active deployment, skipping");
+                debug!("unit is deferred due to active deployment, skipping");
                 return;
             }
             // Backoff expired — remove and proceed
             drop(entry);
-            self.deferred_jobs.remove(&job_id.0);
+            self.deferred_jobs.remove(&unit.0);
         }
 
-        // --- In-flight guard: skip if nscale is actively proxying requests for this job ---
-        if self.in_flight.has_in_flight(&job_id.0) {
-            let count = self.in_flight.count(&job_id.0);
+        // --- In-flight guard: skip if nscale is actively proxying requests for this unit ---
+        if self.in_flight.has_in_flight(&unit.0) {
+            let count = self.in_flight.count(&unit.0);
             info!(
                 in_flight = count,
                 source = "in-flight-guard",
-                "job has in-flight proxy requests, refreshing activity"
+                "unit has in-flight proxy requests, refreshing activity"
             );
-            if let Err(e) = self.store.record_activity(job_id).await {
-                warn!(error = %e, "failed to refresh activity for in-flight job");
+            if let Err(e) = self.store.record_activity(unit).await {
+                warn!(error = %e, "failed to refresh activity for in-flight unit");
             }
             return;
         }
 
         // --- Traffic guard: skip if Traefik is actively routing to this service ---
         if let Some(probe) = &self.traffic_probe {
-            match probe.has_active_traffic(job_id).await {
+            match probe.has_active_traffic(&registration.service_name).await {
                 Ok(true) => {
                     info!(
                         source = "traffic-guard",
                         "service has active Traefik traffic, refreshing activity"
                     );
-                    if let Err(e) = self.store.record_activity(job_id).await {
+                    if let Err(e) = self.store.record_activity(unit).await {
                         warn!(error = %e, "failed to refresh activity for active service");
                     }
                     return;
@@ -269,31 +283,17 @@ impl ScaleDownController {
                 }
                 Err(e) => {
                     // Fail-open: if we can't reach Traefik metrics, skip this
-                    // job to avoid accidentally scaling down an active service.
+                    // unit to avoid accidentally scaling down an active service.
                     warn!(error = %e, "traffic probe failed, skipping scale-down to be safe");
                     return;
                 }
             }
         }
 
-        // Look up registration to get the group name
-        let registration = match self.registry.get(job_id).await {
-            Ok(Some(reg)) => reg,
-            Ok(None) => {
-                warn!("no registration found for idle job, cleaning up activity");
-                let _ = self.store.remove_activity(job_id).await;
-                return;
-            }
-            Err(e) => {
-                error!(error = %e, "failed to look up job registration");
-                return;
-            }
-        };
-
-        if scale_to_zero_disabled(&registration) {
-            info!("job autoscaling policy disables scale-to-zero, refreshing activity");
-            if let Err(e) = self.store.record_activity(job_id).await {
-                warn!(error = %e, "failed to refresh activity for scale-to-zero-disabled job");
+        if scale_to_zero_disabled(registration) {
+            info!("unit autoscaling policy disables scale-to-zero, refreshing activity");
+            if let Err(e) = self.store.record_activity(unit).await {
+                warn!(error = %e, "failed to refresh activity for scale-to-zero-disabled unit");
             }
             return;
         }
@@ -305,12 +305,12 @@ impl ScaleDownController {
                 .await
             {
                 Ok(current_count)
-                    if autoscaling_should_defer_scale_to_zero(&registration, current_count) =>
+                    if autoscaling_should_defer_scale_to_zero(registration, current_count) =>
                 {
                     // Derive the grace from the activity store's real idle age
-                    // (which resets whenever the job is active), so a job that
+                    // (which resets whenever the unit is active), so a unit that
                     // was recently busy still gets its full grace window.
-                    let idle_age = self.store.idle_age(job_id).await.ok().flatten();
+                    let idle_age = self.store.idle_age(unit).await.ok().flatten();
                     if !scale_to_zero_grace_elapsed(
                         idle_age,
                         self.idle_threshold,
@@ -331,18 +331,18 @@ impl ScaleDownController {
                     warn!(
                         current_count,
                         grace_secs = AUTOSCALE_SCALE_TO_ZERO_GRACE.as_secs(),
-                        "autoscaler did not reach min_count within grace period; forcing scale-to-zero of idle job"
+                        "autoscaler did not reach min_count within grace period; forcing scale-to-zero of idle unit"
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(error = %e, "failed to get autoscaled job count before scale-to-zero");
+                    warn!(error = %e, "failed to get autoscaled unit count before scale-to-zero");
                     return;
                 }
             }
         }
 
-        info!(group = %registration.nomad_group, "scaling down idle job");
+        info!(group = %registration.nomad_group, "scaling down idle unit");
 
         // Scale down via Nomad
         let scale_down_result = self
@@ -358,7 +358,8 @@ impl ScaleDownController {
                     self.coordinator.as_ref(),
                     self.traffic_probe.as_deref(),
                     &self.deferred_jobs,
-                    job_id,
+                    unit,
+                    &registration.service_name,
                     Ok(()),
                 )
                 .await;
@@ -373,7 +374,8 @@ impl ScaleDownController {
                     self.coordinator.as_ref(),
                     self.traffic_probe.as_deref(),
                     &self.deferred_jobs,
-                    job_id,
+                    unit,
+                    &registration.service_name,
                     Err(err),
                 )
                 .await;
@@ -384,7 +386,8 @@ impl ScaleDownController {
                     self.coordinator.as_ref(),
                     self.traffic_probe.as_deref(),
                     &self.deferred_jobs,
-                    job_id,
+                    unit,
+                    &registration.service_name,
                     Err(e),
                 )
                 .await;
@@ -425,22 +428,23 @@ async fn handle_scale_down_result(
     coordinator: &WakeCoordinator,
     traffic_probe: Option<&TrafficProbe>,
     deferred_jobs: &DashMap<String, Instant>,
-    job_id: &JobId,
+    unit: &ScaleUnit,
+    service: &ServiceName,
     scale_down_result: Result<()>,
 ) {
     match scale_down_result {
         Ok(()) => {
-            info!("job scaled to zero");
-            coordinator.mark_dormant(job_id);
-            if let Err(e) = store.remove_activity(job_id).await {
+            info!("unit scaled to zero");
+            coordinator.mark_dormant(unit);
+            if let Err(e) = store.remove_activity(unit).await {
                 warn!(error = %e, "failed to remove activity after scale-down");
             }
             // Clear stale traffic baseline so next wake starts fresh.
             if let Some(probe) = traffic_probe {
-                probe.clear_baseline(job_id).await;
+                probe.clear_baseline(service).await;
             }
             // Clear any pending deferral.
-            deferred_jobs.remove(&job_id.0);
+            deferred_jobs.remove(&unit.0);
         }
         Err(NscaleError::DeploymentInProgress { operation, .. }) => {
             info!(
@@ -448,13 +452,13 @@ async fn handle_scale_down_result(
                 "scale-down blocked by active deployment, deferring for {}s",
                 DEPLOYMENT_BACKOFF.as_secs(),
             );
-            deferred_jobs.insert(job_id.0.clone(), Instant::now() + DEPLOYMENT_BACKOFF);
-            if let Err(e) = store.record_activity(job_id).await {
+            deferred_jobs.insert(unit.0.clone(), Instant::now() + DEPLOYMENT_BACKOFF);
+            if let Err(e) = store.record_activity(unit).await {
                 warn!(error = %e, "failed to refresh activity after blocked scale-down");
             }
         }
         Err(e) => {
-            error!(error = %e, "failed to scale down job");
+            error!(error = %e, "failed to scale down unit");
         }
     }
 }
@@ -511,22 +515,22 @@ mod tests {
         async fn get_job_count(&self, _: &JobId, _: &str) -> Result<u32> {
             Ok(0)
         }
-        async fn get_healthy_endpoint(&self, _: &JobId) -> Result<Option<Endpoint>> {
+        async fn get_healthy_endpoint(&self, _: &JobId, _: &str) -> Result<Option<Endpoint>> {
             Ok(None)
         }
     }
 
     struct MockStore {
-        idle_jobs: Vec<JobId>,
+        idle_units: Vec<ScaleUnit>,
         lock_acquired: std::sync::atomic::AtomicBool,
         record_activity_calls: AtomicU32,
         remove_activity_calls: AtomicU32,
     }
 
     impl MockStore {
-        fn new(idle_jobs: Vec<JobId>) -> Self {
+        fn new(idle_units: Vec<ScaleUnit>) -> Self {
             Self {
-                idle_jobs,
+                idle_units,
                 lock_acquired: std::sync::atomic::AtomicBool::new(false),
                 record_activity_calls: AtomicU32::new(0),
                 remove_activity_calls: AtomicU32::new(0),
@@ -536,12 +540,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ActivityStore for MockStore {
-        async fn record_activity(&self, _: &JobId) -> Result<()> {
+        async fn record_activity(&self, _: &ScaleUnit) -> Result<()> {
             self.record_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-        async fn get_idle_jobs(&self, _: Duration) -> Result<Vec<JobId>> {
-            Ok(self.idle_jobs.clone())
+        async fn get_idle_units(&self, _: Duration) -> Result<Vec<ScaleUnit>> {
+            Ok(self.idle_units.clone())
         }
         async fn try_acquire_lock(&self, _: &str, _: Duration) -> Result<bool> {
             Ok(!self.lock_acquired.swap(true, Ordering::Relaxed))
@@ -556,14 +560,14 @@ mod tests {
         async fn in_cooldown(&self, _: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn remove_activity(&self, _: &JobId) -> Result<()> {
+        async fn remove_activity(&self, _: &ScaleUnit) -> Result<()> {
             self.remove_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-        async fn has_activity(&self, job_id: &JobId) -> Result<bool> {
-            Ok(self.idle_jobs.iter().any(|j| j == job_id))
+        async fn has_activity(&self, unit: &ScaleUnit) -> Result<bool> {
+            Ok(self.idle_units.iter().any(|u| u == unit))
         }
-        async fn idle_age(&self, _: &JobId) -> Result<Option<Duration>> {
+        async fn idle_age(&self, _: &ScaleUnit) -> Result<Option<Duration>> {
             Ok(None)
         }
     }
@@ -588,6 +592,7 @@ mod tests {
             job_id: JobId(job_id.into()),
             service_name: ServiceName(format!("svc-{job_id}")),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: None,
             traefik_routers: Vec::new(),
         }
@@ -667,8 +672,8 @@ mod tests {
     #[tokio::test]
     async fn test_scale_down_controller_single_tick() {
         let orch = Arc::new(MockOrchestrator::new());
-        let idle_jobs = vec![JobId("job-a".into()), JobId("job-b".into())];
-        let store: Arc<dyn ActivityStore> = Arc::new(MockStore::new(idle_jobs));
+        let idle_units = vec![ScaleUnit("job-a".into()), ScaleUnit("job-b".into())];
+        let store: Arc<dyn ActivityStore> = Arc::new(MockStore::new(idle_units));
 
         // We need a real (fred) JobRegistry for the controller, but we can't
         // use one without Redis. Instead, test the tick logic separately.
@@ -779,14 +784,15 @@ mod tests {
         let registration = test_registration("busy-job");
 
         coordinator.ensure_running(&registration).await.unwrap();
-        assert!(coordinator.is_ready(&registration.job_id));
+        assert!(coordinator.is_ready(&registration.scale_unit_key()));
 
         handle_scale_down_result(
             &store,
             &coordinator,
             None,
             &deferred,
-            &registration.job_id,
+            &registration.scale_unit_key(),
+            &registration.service_name,
             Err(NscaleError::DeploymentInProgress {
                 job_id: registration.job_id.0.clone(),
                 operation: "scale down",
@@ -796,7 +802,7 @@ mod tests {
 
         assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 1);
         assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 0);
-        assert!(coordinator.is_ready(&registration.job_id));
+        assert!(coordinator.is_ready(&registration.scale_unit_key()));
         // Job should now be deferred
         assert!(deferred.contains_key(&registration.job_id.0));
     }
@@ -811,21 +817,22 @@ mod tests {
         let registration = test_registration("idle-job");
 
         coordinator.ensure_running(&registration).await.unwrap();
-        assert!(coordinator.is_ready(&registration.job_id));
+        assert!(coordinator.is_ready(&registration.scale_unit_key()));
 
         handle_scale_down_result(
             &store,
             &coordinator,
             None,
             &deferred,
-            &registration.job_id,
+            &registration.scale_unit_key(),
+            &registration.service_name,
             Ok(()),
         )
         .await;
 
         assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 0);
         assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 1);
-        assert!(!coordinator.is_ready(&registration.job_id));
+        assert!(!coordinator.is_ready(&registration.scale_unit_key()));
     }
 
     #[tokio::test]

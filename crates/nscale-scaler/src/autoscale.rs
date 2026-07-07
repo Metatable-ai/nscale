@@ -391,6 +391,7 @@ mod tests {
             job_id: JobId("api".into()),
             service_name: ServiceName("api-a".into()),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: Some(policy()),
             traefik_routers: Vec::new(),
         };
@@ -414,6 +415,7 @@ mod tests {
             job_id: JobId("api".into()),
             service_name: ServiceName("api-web".into()),
             nomad_group: "web".into(),
+            scale_unit: None,
             autoscaling: Some(policy()),
             traefik_routers: Vec::new(),
         };

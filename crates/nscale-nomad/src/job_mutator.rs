@@ -4,7 +4,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use nscale_core::error::{NscaleError, Result};
-use nscale_core::job::{JobId, JobRegistration, ServiceName};
+use nscale_core::job::{JobId, JobRegistration, ScaleUnit, ServiceName};
 
 const TRAEFIK_ENABLE_TAG: &str = "traefik.enable=true";
 const ROUTER_PREFIX: &str = "traefik.http.routers.";
@@ -87,7 +87,25 @@ pub fn inject_nscale_tags(
         }
     }
 
+    assign_scale_units(&mut registrations);
     Ok(registrations)
+}
+
+/// Assign composite scale-to-zero unit keys when a job spans more than one task
+/// group. Single-group jobs (including multi-service single-group jobs) are left
+/// unset so they fall back to the job id — byte-identical to pre-multi-group
+/// behavior and requiring no data migration.
+fn assign_scale_units(registrations: &mut [JobRegistration]) {
+    let distinct_groups: BTreeSet<&str> = registrations
+        .iter()
+        .map(|reg| reg.nomad_group.as_str())
+        .collect();
+    if distinct_groups.len() <= 1 {
+        return;
+    }
+    for reg in registrations.iter_mut() {
+        reg.scale_unit = Some(ScaleUnit::composite(&reg.job_id, &reg.nomad_group).0);
+    }
 }
 
 fn inject_service_tags(
@@ -156,6 +174,7 @@ fn inject_service_tags(
                 job_id: JobId(job_id.to_string()),
                 service_name: ServiceName(service_name),
                 nomad_group: group_name.to_string(),
+                scale_unit: None,
                 autoscaling: None,
                 traefik_routers: router_names.into_iter().collect(),
             });
@@ -329,6 +348,60 @@ mod tests {
         assert_eq!(registrations[1].job_id.0, "multi-service-job");
         assert_eq!(registrations[0].nomad_group, "main");
         assert_eq!(registrations[1].nomad_group, "main");
+        // Single group (two services share it) → no composite unit; falls back to job id.
+        assert!(registrations.iter().all(|reg| reg.scale_unit.is_none()));
+    }
+
+    #[test]
+    fn multi_group_job_assigns_composite_scale_units() {
+        let mut job = json!({
+            "ID": "multi-grp",
+            "TaskGroups": [
+                {
+                    "Name": "alpha",
+                    "Tasks": [{
+                        "Name": "a",
+                        "Services": [{
+                            "Name": "mg-alpha",
+                            "Tags": [
+                                "traefik.enable=true",
+                                "traefik.http.routers.mg-alpha.rule=Host(`a.example.com`)"
+                            ]
+                        }]
+                    }]
+                },
+                {
+                    "Name": "beta",
+                    "Tasks": [{
+                        "Name": "b",
+                        "Services": [{
+                            "Name": "mg-beta",
+                            "Tags": [
+                                "traefik.enable=true",
+                                "traefik.http.routers.mg-beta.rule=Host(`b.example.com`)"
+                            ]
+                        }]
+                    }]
+                }
+            ]
+        });
+
+        let registrations = inject_nscale_tags(&mut job, "s2z-nscale@file").unwrap();
+        assert_eq!(registrations.len(), 2);
+
+        let alpha = registrations
+            .iter()
+            .find(|reg| reg.nomad_group == "alpha")
+            .unwrap();
+        let beta = registrations
+            .iter()
+            .find(|reg| reg.nomad_group == "beta")
+            .unwrap();
+
+        assert_eq!(alpha.scale_unit.as_deref(), Some("multi-grp/alpha"));
+        assert_eq!(beta.scale_unit.as_deref(), Some("multi-grp/beta"));
+        assert_eq!(alpha.scale_unit_key().0, "multi-grp/alpha");
+        assert_eq!(beta.scale_unit_key().0, "multi-grp/beta");
     }
 
     #[test]

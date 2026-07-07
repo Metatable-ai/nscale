@@ -154,16 +154,13 @@ run_scenario() {
 
   docker compose -f "$COMPOSE_FILE" --profile stress run --rm \
     "${env_flags[@]+"${env_flags[@]}"}" \
+    --volume "$RESULTS_DIR:/results" \
     -e "K6_WEB_DASHBOARD_PERIOD=2s" \
     k6 run \
-      --out "json=/scripts/.results_${name}.json" \
+      --out "json=/results/${name}.json" \
       "/scripts/${script}" \
     && pass "$name PASSED" \
     || { fail "$name FAILED"; }
-
-  # Copy k6 JSON result out of the volume if it exists
-  local result_src="$SCRIPT_DIR/k6/.results_${name}.json"
-  [ -f "$result_src" ] && mv "$result_src" "$RESULTS_DIR/${name}.json" || true
 
   echo ""
 }

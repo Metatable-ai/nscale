@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
 use tracing::{debug, info, instrument, warn};
@@ -11,6 +13,9 @@ use crate::models::*;
 pub struct NomadClient {
     client: reqwest::Client,
     base_url: String,
+    /// Delay between scale-up retries while a scale is blocked by an active
+    /// deployment. Overridable in tests to avoid slow waits.
+    scale_retry_delay: Duration,
 }
 
 impl NomadClient {
@@ -31,6 +36,7 @@ impl NomadClient {
         Ok(Self {
             client,
             base_url: addr.trim_end_matches('/').to_string(),
+            scale_retry_delay: Duration::from_secs(2),
         })
     }
 
@@ -204,9 +210,26 @@ impl NomadClient {
             message: Some(reason.to_string()),
         };
 
-        let resp = self.client.post(self.url(&path)).json(&req).send().await?;
+        // A scale-up blocked by an active deployment may be blocked by a
+        // scale-DOWN of this or a sibling task group (Nomad allows only one
+        // deployment per job). Retry until it clears so the group actually comes
+        // up, instead of optimistically assuming the scale already happened.
+        // ponytail: fixed retry budget; make it config-driven only if wake
+        // latency under heavy multi-group churn ever needs tuning.
+        const MAX_BLOCKED_RETRIES: usize = 10;
+        let mut blocked_retries = 0usize;
 
-        if !resp.status().is_success() {
+        loop {
+            let resp = self.client.post(self.url(&path)).json(&req).send().await?;
+
+            if resp.status().is_success() {
+                let scale_resp: ScaleResponse = resp.json().await?;
+                if !scale_resp.warnings.is_empty() {
+                    warn!(warnings = %scale_resp.warnings, "scale returned warnings");
+                }
+                return Ok(());
+            }
+
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if status.as_u16() == 400
@@ -214,28 +237,34 @@ impl NomadClient {
                     .to_lowercase()
                     .contains("scaling blocked due to active deployment")
             {
-                if active_deployment_is_ok {
-                    info!(job_id = %job_id, operation, "scaling blocked by active deployment, proceeding");
-                    return Ok(());
+                if !active_deployment_is_ok {
+                    info!(job_id = %job_id, operation, "scaling blocked by active deployment, deferring");
+                    return Err(NscaleError::DeploymentInProgress {
+                        job_id: job_id.0.clone(),
+                        operation,
+                    });
                 }
 
-                info!(job_id = %job_id, operation, "scaling blocked by active deployment, deferring");
-                return Err(NscaleError::DeploymentInProgress {
-                    job_id: job_id.0.clone(),
-                    operation,
-                });
+                if blocked_retries < MAX_BLOCKED_RETRIES {
+                    blocked_retries += 1;
+                    info!(
+                        job_id = %job_id,
+                        operation,
+                        attempt = blocked_retries,
+                        "scaling blocked by active deployment, retrying"
+                    );
+                    tokio::time::sleep(self.scale_retry_delay).await;
+                    continue;
+                }
+
+                info!(job_id = %job_id, operation, "scaling still blocked by active deployment after retries, proceeding");
+                return Ok(());
             }
+
             return Err(Self::classify_job_error(
                 status, &body, "POST", &path, job_id,
             ));
         }
-
-        let scale_resp: ScaleResponse = resp.json().await?;
-        if !scale_resp.warnings.is_empty() {
-            warn!(warnings = %scale_resp.warnings, "scale returned warnings");
-        }
-
-        Ok(())
     }
 }
 
@@ -293,10 +322,12 @@ impl Orchestrator for NomadClient {
     }
 
     #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn get_healthy_endpoint(&self, job_id: &JobId) -> Result<Option<Endpoint>> {
+    async fn get_healthy_endpoint(&self, job_id: &JobId, group: &str) -> Result<Option<Endpoint>> {
         let allocs = self.get_allocations(job_id).await?;
 
-        let running = allocs.iter().find(|a| a.is_running());
+        let running = allocs
+            .iter()
+            .find(|a| a.is_running() && a.task_group == group);
 
         match running {
             Some(alloc) => Ok(Self::extract_endpoint(alloc)),
@@ -442,6 +473,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scale_up_retries_until_active_deployment_clears() {
+        let mock_server = MockServer::start().await;
+
+        // First attempt is blocked by an active deployment (e.g. a sibling
+        // group's scale-down); highest priority + consumed once.
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("Scaling blocked due to active deployment"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Once the deployment clears, the retried scale-up succeeds.
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"Warnings": ""})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        client.scale_retry_delay = Duration::from_millis(1);
+        let result = client.scale_up(&"test-job".into(), "web", 1).await;
+
+        assert!(
+            result.is_ok(),
+            "scale-up should retry past the deployment block"
+        );
+    }
+
+    #[tokio::test]
     async fn test_scale_down_active_deployment_returns_deployment_in_progress() {
         let mock_server = MockServer::start().await;
 
@@ -553,7 +622,7 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let endpoint = client
-            .get_healthy_endpoint(&"test-job".into())
+            .get_healthy_endpoint(&"test-job".into(), "web")
             .await
             .unwrap();
         assert!(endpoint.is_some());
@@ -583,7 +652,7 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let endpoint = client
-            .get_healthy_endpoint(&"test-job".into())
+            .get_healthy_endpoint(&"test-job".into(), "web")
             .await
             .unwrap();
         assert!(endpoint.is_none());
@@ -615,15 +684,16 @@ mod tests {
                 ResponseTemplate::new(400)
                     .set_body_string("job scaling blocked due to active deployment"),
             )
-            .expect(1)
+            .expect(11)
             .mount(&mock_server)
             .await;
 
-        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let mut client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        client.scale_retry_delay = Duration::from_millis(1);
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
         assert!(
             result.is_ok(),
-            "active deployment should not be treated as error"
+            "a persistently-blocked scale-up should proceed after exhausting retries"
         );
     }
 

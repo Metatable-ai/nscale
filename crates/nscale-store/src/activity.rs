@@ -6,7 +6,7 @@ use fred::types::{Expiration, SetOptions};
 use tracing::{debug, instrument};
 
 use nscale_core::error::{NscaleError, Result};
-use nscale_core::job::JobId;
+use nscale_core::job::ScaleUnit;
 use nscale_core::traits::ActivityStore;
 
 const ACTIVITY_KEY: &str = "nscale:activity";
@@ -59,8 +59,8 @@ impl RedisActivityStore {
 
 #[async_trait]
 impl ActivityStore for RedisActivityStore {
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn record_activity(&self, job_id: &JobId) -> Result<()> {
+    #[instrument(skip(self), fields(unit = %unit))]
+    async fn record_activity(&self, unit: &ScaleUnit) -> Result<()> {
         let score = now_epoch_secs();
         let _: () = self
             .client
@@ -70,7 +70,7 @@ impl ActivityStore for RedisActivityStore {
                 None,
                 false,
                 false,
-                (score, job_id.0.clone()),
+                (score, unit.0.clone()),
             )
             .await
             .map_err(|e| NscaleError::Store(e.to_string()))?;
@@ -79,7 +79,7 @@ impl ActivityStore for RedisActivityStore {
     }
 
     #[instrument(skip(self), fields(threshold = ?idle_threshold))]
-    async fn get_idle_jobs(&self, idle_threshold: Duration) -> Result<Vec<JobId>> {
+    async fn get_idle_units(&self, idle_threshold: Duration) -> Result<Vec<ScaleUnit>> {
         let cutoff = now_epoch_secs() - idle_threshold.as_secs_f64();
         let members: Vec<String> = self
             .client
@@ -87,25 +87,25 @@ impl ActivityStore for RedisActivityStore {
             .await
             .map_err(|e| NscaleError::Store(e.to_string()))?;
 
-        debug!(count = members.len(), cutoff, "found idle jobs");
-        Ok(members.into_iter().map(JobId).collect())
+        debug!(count = members.len(), cutoff, "found idle units");
+        Ok(members.into_iter().map(ScaleUnit).collect())
     }
 
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn has_activity(&self, job_id: &JobId) -> Result<bool> {
+    #[instrument(skip(self), fields(unit = %unit))]
+    async fn has_activity(&self, unit: &ScaleUnit) -> Result<bool> {
         let score: Option<f64> = self
             .client
-            .zscore(ACTIVITY_KEY, job_id.0.as_str())
+            .zscore(ACTIVITY_KEY, unit.0.as_str())
             .await
             .map_err(|e| NscaleError::Store(e.to_string()))?;
         Ok(score.is_some())
     }
 
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn idle_age(&self, job_id: &JobId) -> Result<Option<Duration>> {
+    #[instrument(skip(self), fields(unit = %unit))]
+    async fn idle_age(&self, unit: &ScaleUnit) -> Result<Option<Duration>> {
         let score: Option<f64> = self
             .client
-            .zscore(ACTIVITY_KEY, job_id.0.as_str())
+            .zscore(ACTIVITY_KEY, unit.0.as_str())
             .await
             .map_err(|e| NscaleError::Store(e.to_string()))?;
         Ok(score.map(|last| Duration::from_secs_f64((now_epoch_secs() - last).max(0.0))))
@@ -179,11 +179,11 @@ impl ActivityStore for RedisActivityStore {
         Ok(count > 0)
     }
 
-    #[instrument(skip(self), fields(job_id = %job_id))]
-    async fn remove_activity(&self, job_id: &JobId) -> Result<()> {
+    #[instrument(skip(self), fields(unit = %unit))]
+    async fn remove_activity(&self, unit: &ScaleUnit) -> Result<()> {
         let _: i64 = self
             .client
-            .zrem(ACTIVITY_KEY, job_id.0.as_str())
+            .zrem(ACTIVITY_KEY, unit.0.as_str())
             .await
             .map_err(|e| NscaleError::Store(e.to_string()))?;
         debug!("removed activity");

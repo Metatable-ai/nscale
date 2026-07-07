@@ -11,7 +11,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
-use nscale_core::job::JobId;
+use nscale_core::job::{JobId, ScaleUnit};
 use nscale_core::traits::{ActivityStore, MissingJobTracker};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
@@ -72,9 +72,13 @@ async fn clear_missing_job_counter(state: &AppState, job_id: &JobId) {
 }
 
 async fn cleanup_missing_job_state(state: &AppState, job_id: &JobId) -> Result<()> {
-    state.coordinator.mark_dormant(job_id);
+    state.coordinator.mark_dormant(&ScaleUnit(job_id.0.clone()));
 
-    if let Err(e) = state.activity_store.remove_activity(job_id).await {
+    if let Err(e) = state
+        .activity_store
+        .remove_activity(&ScaleUnit(job_id.0.clone()))
+        .await
+    {
         warn!(job_id = %job_id, error = %e, "failed to remove activity during auto-deregister cleanup");
     }
 
@@ -199,10 +203,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
     };
     let job_id = registration.job_id.clone();
+    let unit = registration.scale_unit_key();
     let request_started = Instant::now();
 
-    if let Err(e) = state.activity_store.record_activity(&job_id).await {
-        warn!(job_id = %job_id, error = %e, "failed to record canonical job activity at request start");
+    if let Err(e) = state.activity_store.record_activity(&unit).await {
+        warn!(job_id = %job_id, unit = %unit, error = %e, "failed to record unit activity at request start");
     }
 
     // --- 3. Ensure running (wake if dormant) ---
@@ -252,14 +257,14 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    // --- Track in-flight request so the scale-down controller skips this job ---
-    let _in_flight_guard = state.in_flight.track(&job_id.0);
+    // --- Track in-flight request so the scale-down controller skips this unit ---
+    let _in_flight_guard = state.in_flight.track(&unit.0);
 
     // Spawn a heartbeat that refreshes activity while the proxy request is in-flight.
-    // This prevents the scale-down controller from treating the job as idle during
+    // This prevents the scale-down controller from treating the unit as idle during
     // long-running requests.
     let heartbeat_store = state.activity_store.clone();
-    let heartbeat_job = job_id.clone();
+    let heartbeat_unit = unit.clone();
     let heartbeat_interval = state.heartbeat_interval;
     let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
     let heartbeat_cancel_clone = heartbeat_cancel.clone();
@@ -276,13 +281,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             tokio::select! {
                 _ = heartbeat_cancel_clone.cancelled() => break,
                 _ = tokio::time::sleep_until(deadline) => {
-                    warn!(job_id = %heartbeat_job, "heartbeat exceeded max duration, stopping");
+                    warn!(unit = %heartbeat_unit, "heartbeat exceeded max duration, stopping");
                     break;
                 }
                 _ = ticker.tick() => {
-                    debug!(job_id = %heartbeat_job, source = "heartbeat", "recording activity");
-                    if let Err(e) = heartbeat_store.record_activity(&heartbeat_job).await {
-                        warn!(job_id = %heartbeat_job, error = %e, "activity heartbeat failed");
+                    debug!(unit = %heartbeat_unit, source = "heartbeat", "recording activity");
+                    if let Err(e) = heartbeat_store.record_activity(&heartbeat_unit).await {
+                        warn!(unit = %heartbeat_unit, error = %e, "activity heartbeat failed");
                     }
                 }
             }
