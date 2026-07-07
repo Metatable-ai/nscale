@@ -85,10 +85,12 @@ pub struct JobRegistration {
     pub nomad_group: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscaling: Option<JobAutoscalingPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traefik_routers: Vec<String>,
 }
 
 /// Per-job autoscaling policy attached to a registration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobAutoscalingPolicy {
     #[serde(default = "default_job_autoscaling_enabled")]
     pub enabled: bool,

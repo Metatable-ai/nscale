@@ -207,6 +207,7 @@ mod tests {
             service_name: ServiceName("svc-a".to_string()),
             nomad_group: "main".to_string(),
             autoscaling: None,
+            traefik_routers: Vec::new(),
         };
 
         let encoded = EtcdClient::encode_registration(&reg).expect("encode registration");

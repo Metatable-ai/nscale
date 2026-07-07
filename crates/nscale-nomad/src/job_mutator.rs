@@ -143,8 +143,8 @@ fn inject_service_tags(
             )));
         }
 
-        for router_name in router_names {
-            upsert_router_service_tag(tags, &router_name, file_provider_service);
+        for router_name in &router_names {
+            upsert_router_service_tag(tags, router_name, file_provider_service);
         }
 
         if seen.insert((
@@ -157,6 +157,7 @@ fn inject_service_tags(
                 service_name: ServiceName(service_name),
                 nomad_group: group_name.to_string(),
                 autoscaling: None,
+                traefik_routers: router_names.into_iter().collect(),
             });
         }
     }

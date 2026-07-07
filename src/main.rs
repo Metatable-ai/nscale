@@ -842,6 +842,7 @@ mod autoscaling_admin_tests {
                 cooldown_secs: Some(15),
                 decision_window_secs: Some(20),
             }),
+            traefik_routers: Vec::new(),
         };
 
         let status = autoscaling_status_from_registration(&registration, Ok(2));

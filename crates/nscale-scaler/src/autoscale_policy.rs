@@ -42,21 +42,33 @@ pub fn decide_autoscale(
         reasons.push("request-rate");
     }
 
-    if let (Some(latency), Some(target)) = (metrics.p95_latency_ms, policy.target_p95_latency_ms)
-        && latency > target
-    {
-        raw_desired = Some(
-            raw_desired
-                .unwrap_or(current_count)
-                .max(current_count + policy.scale_up_step),
-        );
+    if let (Some(latency), Some(target)) = (metrics.p95_latency_ms, policy.target_p95_latency_ms) {
+        if latency > target {
+            raw_desired = Some(
+                raw_desired
+                    .unwrap_or(current_count)
+                    .max(current_count + policy.scale_up_step),
+            );
+        } else {
+            raw_desired = Some(
+                raw_desired
+                    .unwrap_or(policy.min_count)
+                    .max(policy.min_count),
+            );
+        }
         reasons.push("latency");
     }
 
-    if let (Some(error_rate), Some(max_error_rate)) = (metrics.error_rate, policy.max_error_rate)
-        && error_rate > max_error_rate
-    {
-        raw_desired = Some(raw_desired.unwrap_or(current_count).max(current_count + 1));
+    if let (Some(error_rate), Some(max_error_rate)) = (metrics.error_rate, policy.max_error_rate) {
+        if error_rate > max_error_rate {
+            raw_desired = Some(raw_desired.unwrap_or(current_count).max(current_count + 1));
+        } else {
+            raw_desired = Some(
+                raw_desired
+                    .unwrap_or(policy.min_count)
+                    .max(policy.min_count),
+            );
+        }
         reasons.push("error-rate");
     }
 
@@ -245,5 +257,51 @@ mod tests {
 
         assert_eq!(decision.desired_count, 2);
         assert_eq!(decision.direction, AutoscaleDirection::None);
+    }
+
+    #[test]
+    fn latency_below_target_scales_down_toward_min_count() {
+        let mut policy = policy();
+        policy.target_requests_per_second_per_instance = None;
+        policy.max_error_rate = None;
+
+        let decision = decide_autoscale(
+            &policy,
+            3,
+            &MetricSnapshot {
+                request_rate_rps: None,
+                p95_latency_ms: Some(100.0),
+                error_rate: None,
+                in_flight: None,
+            },
+            false,
+        );
+
+        assert_eq!(decision.desired_count, 2);
+        assert_eq!(decision.direction, AutoscaleDirection::Down);
+        assert!(decision.reason.contains("latency"));
+    }
+
+    #[test]
+    fn error_rate_below_target_scales_down_toward_min_count() {
+        let mut policy = policy();
+        policy.target_requests_per_second_per_instance = None;
+        policy.target_p95_latency_ms = None;
+
+        let decision = decide_autoscale(
+            &policy,
+            3,
+            &MetricSnapshot {
+                request_rate_rps: None,
+                p95_latency_ms: None,
+                error_rate: Some(0.0),
+                in_flight: None,
+            },
+            false,
+        );
+
+        assert_eq!(decision.desired_count, 2);
+        assert_eq!(decision.direction, AutoscaleDirection::Down);
+        assert!(decision.reason.contains("error-rate"));
     }
 }

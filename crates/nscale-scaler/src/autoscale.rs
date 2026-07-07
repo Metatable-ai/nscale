@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,7 +95,8 @@ impl AutoscaleController {
             key: AUTOSCALE_LOCK_KEY,
         };
 
-        for registration in self.registry.list_all().await? {
+        let registrations = unique_autoscaling_registrations(self.registry.list_all().await?);
+        for registration in registrations {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -244,6 +246,43 @@ fn record_skip(registration: &JobRegistration, reason: &str) {
     .increment(1);
 }
 
+fn unique_autoscaling_registrations(registrations: Vec<JobRegistration>) -> Vec<JobRegistration> {
+    let mut by_job: BTreeMap<String, JobRegistration> = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+
+    for registration in registrations {
+        if registration.autoscaling.is_none() {
+            continue;
+        }
+
+        let key = registration.job_id.0.clone();
+        if let Some(existing) = by_job.get(&key) {
+            if existing.autoscaling != registration.autoscaling
+                || existing.nomad_group != registration.nomad_group
+            {
+                conflicts.insert(key);
+            }
+        } else {
+            by_job.insert(key, registration);
+        }
+    }
+
+    by_job
+        .into_iter()
+        .filter_map(|(job_id, registration)| {
+            if conflicts.contains(&job_id) {
+                warn!(
+                    job_id,
+                    "conflicting autoscaling policies for job, skipping autoscale evaluation"
+                );
+                None
+            } else {
+                Some(registration)
+            }
+        })
+        .collect()
+}
+
 fn policy_decision_window(policy: &JobAutoscalingPolicy) -> Duration {
     policy.decision_window(AUTOSCALE_DECISION_WINDOW)
 }
@@ -326,5 +365,28 @@ mod tests {
             AUTOSCALE_DESIRED_COUNT_METRIC,
             "nscale_autoscale_desired_count"
         );
+    }
+
+    #[test]
+    fn unique_autoscaling_registrations_rejects_conflicting_policies_for_same_job() {
+        use nscale_core::job::{JobId, ServiceName};
+
+        let mut first = JobRegistration {
+            job_id: JobId("api".into()),
+            service_name: ServiceName("api-a".into()),
+            nomad_group: "web".into(),
+            autoscaling: Some(policy()),
+            traefik_routers: Vec::new(),
+        };
+        let mut second = first.clone();
+        second.service_name = ServiceName("api-b".into());
+        second.autoscaling.as_mut().unwrap().max_count = 9;
+
+        let unique = unique_autoscaling_registrations(vec![first.clone(), second]);
+        assert!(unique.is_empty());
+
+        first.service_name = ServiceName("api-c".into());
+        let unique = unique_autoscaling_registrations(vec![first.clone(), first]);
+        assert_eq!(unique.len(), 1);
     }
 }

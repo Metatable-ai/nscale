@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ pub struct TraefikMetricsProvider {
     client: reqwest::Client,
     metrics_url: String,
     provider: String,
-    last_samples: tokio::sync::Mutex<HashMap<String, TraefikCounterSample>>,
+    last_samples: tokio::sync::Mutex<HashMap<String, Vec<TraefikCounterSample>>>,
 }
 
 impl TraefikMetricsProvider {
@@ -47,9 +47,10 @@ impl MetricsProvider for TraefikMetricsProvider {
     async fn snapshot(
         &self,
         registration: &JobRegistration,
-        _window: Duration,
+        window: Duration,
     ) -> Result<MetricSnapshot> {
-        let service_label = format!("{}@{}", registration.service_name.0, self.provider);
+        let labels = metric_labels_for_registration(registration, &self.provider);
+        let sample_key = labels.join("|");
         let url = format!("{}/metrics", self.metrics_url);
 
         let resp = self
@@ -71,7 +72,7 @@ impl MetricsProvider for TraefikMetricsProvider {
             .await
             .map_err(|e| NscaleError::Consul(format!("failed to read metrics body: {e}")))?;
 
-        let counters = parse_traefik_request_counters(&body, &service_label);
+        let counters = parse_traefik_request_counters_for_labels(&body, &labels);
         let current = TraefikCounterSample {
             total: counters.total,
             errors: counters.errors,
@@ -79,12 +80,23 @@ impl MetricsProvider for TraefikMetricsProvider {
         };
 
         let mut last = self.last_samples.lock().await;
-        let previous = last.insert(service_label, current);
+        let samples = last.entry(sample_key).or_default();
+        samples.push(current);
+        let retention = window.saturating_mul(2).max(Duration::from_secs(1));
+        samples
+            .retain(|sample| current.observed_at.duration_since(sample.observed_at) <= retention);
 
-        Ok(previous
-            .and_then(|sample| calculate_snapshot(sample, current))
-            .unwrap_or_default())
+        Ok(calculate_window_snapshot(samples, window).unwrap_or_default())
     }
+}
+
+fn metric_labels_for_registration(registration: &JobRegistration, provider: &str) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+    labels.insert(format!("{}@{}", registration.service_name.0, provider));
+    for router in &registration.traefik_routers {
+        labels.insert(format!("{}@{}", router, provider));
+    }
+    labels.into_iter().collect()
 }
 
 pub fn parse_traefik_service_counters(body: &str, service_label: &str) -> TraefikCounters {
@@ -148,6 +160,17 @@ pub fn parse_traefik_request_counters(
     counters
 }
 
+pub fn parse_traefik_request_counters_for_labels(body: &str, labels: &[String]) -> TraefikCounters {
+    labels
+        .iter()
+        .fold(TraefikCounters::default(), |mut acc, label| {
+            let counters = parse_traefik_request_counters(body, label);
+            acc.total += counters.total;
+            acc.errors += counters.errors;
+            acc
+        })
+}
+
 pub fn calculate_snapshot(
     previous: TraefikCounterSample,
     current: TraefikCounterSample,
@@ -169,6 +192,20 @@ pub fn calculate_snapshot(
         }),
         in_flight: None,
     })
+}
+
+pub fn calculate_window_snapshot(
+    samples: &[TraefikCounterSample],
+    window: Duration,
+) -> Option<MetricSnapshot> {
+    let current = samples.last().copied()?;
+    let previous = samples[..samples.len().saturating_sub(1)]
+        .iter()
+        .find(|sample| current.observed_at.duration_since(sample.observed_at) <= window)
+        .copied()
+        .or_else(|| samples.iter().rev().nth(1).copied())?;
+
+    calculate_snapshot(previous, current)
 }
 
 #[cfg(test)]
@@ -211,6 +248,20 @@ traefik_router_requests_total{code="200",method="GET",protocol="http",router="ot
     }
 
     #[test]
+    fn parses_counters_for_any_matching_label() {
+        let counters = parse_traefik_request_counters_for_labels(
+            ROUTER_BODY,
+            &[
+                "api@consulcatalog".to_string(),
+                "missing@consulcatalog".to_string(),
+            ],
+        );
+
+        assert_eq!(counters.total, 100);
+        assert_eq!(counters.errors, 10);
+    }
+
+    #[test]
     fn computes_request_rate_and_error_rate_from_counter_deltas() {
         let previous = TraefikCounterSample {
             total: 100,
@@ -228,6 +279,33 @@ traefik_router_requests_total{code="200",method="GET",protocol="http",router="ot
         assert_eq!(snapshot.request_rate_rps, Some(2.0));
         assert_eq!(snapshot.error_rate, Some(0.1));
         assert_eq!(snapshot.p95_latency_ms, None);
+    }
+
+    #[test]
+    fn calculates_rate_over_configured_window() {
+        let now = Instant::now();
+        let samples = vec![
+            TraefikCounterSample {
+                total: 10,
+                errors: 1,
+                observed_at: now - Duration::from_secs(120),
+            },
+            TraefikCounterSample {
+                total: 40,
+                errors: 4,
+                observed_at: now - Duration::from_secs(30),
+            },
+            TraefikCounterSample {
+                total: 100,
+                errors: 10,
+                observed_at: now,
+            },
+        ];
+
+        let snapshot = calculate_window_snapshot(&samples, Duration::from_secs(60)).unwrap();
+
+        assert_eq!(snapshot.request_rate_rps, Some(2.0));
+        assert_eq!(snapshot.error_rate, Some(0.1));
     }
 
     #[test]

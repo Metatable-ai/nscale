@@ -456,6 +456,7 @@ mod tests {
             service_name: ServiceName("test-svc".into()),
             nomad_group: "web".into(),
             autoscaling: None,
+            traefik_routers: Vec::new(),
         }
     }
 
@@ -735,12 +736,14 @@ mod tests {
             service_name: ServiceName("svc-1".into()),
             nomad_group: "web".into(),
             autoscaling: None,
+            traefik_routers: Vec::new(),
         };
         let reg2 = JobRegistration {
             job_id: JobId("job-2".into()),
             service_name: ServiceName("svc-2".into()),
             nomad_group: "web".into(),
             autoscaling: None,
+            traefik_routers: Vec::new(),
         };
 
         // Start both wakes concurrently with only 1 semaphore permit.

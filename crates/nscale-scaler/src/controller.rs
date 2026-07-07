@@ -547,6 +547,7 @@ mod tests {
             service_name: ServiceName(format!("svc-{job_id}")),
             nomad_group: "web".into(),
             autoscaling: None,
+            traefik_routers: Vec::new(),
         }
     }
 
