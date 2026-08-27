@@ -10,13 +10,13 @@ use axum::{
 use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
-use nscale_core::inflight::InFlightTracker;
+use nscale_core::inflight::{InFlightGuard, InFlightTracker};
 use nscale_core::job::JobId;
 use nscale_core::traits::{ActivityStore, MissingJobTracker};
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
 
-use crate::proxy::forward_request;
+use crate::proxy::{forward_request, forward_websocket_upgrade, is_websocket_upgrade};
 
 const TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [100, 250];
 
@@ -26,6 +26,11 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+struct WebSocketLifecycle {
+    _in_flight_guard: InFlightGuard,
+    _heartbeat_cancel_guard: CancelOnDrop,
 }
 
 /// Shared application state for the proxy handler.
@@ -225,9 +230,10 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    let is_websocket = is_websocket_upgrade(&req);
 
     // --- Track in-flight request so the scale-down controller skips this job ---
-    let _in_flight_guard = state.in_flight.track(&job_id.0);
+    let in_flight_guard = state.in_flight.track(&job_id.0);
 
     // Spawn a heartbeat that refreshes activity while the proxy request is in-flight.
     // This prevents the scale-down controller from treating the job as idle during
@@ -237,19 +243,27 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let heartbeat_interval = state.heartbeat_interval;
     let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
     let heartbeat_cancel_clone = heartbeat_cancel.clone();
-    let _heartbeat_cancel_guard = CancelOnDrop(heartbeat_cancel.clone());
+    let heartbeat_cancel_guard = CancelOnDrop(heartbeat_cancel.clone());
 
-    // Cap heartbeat duration at 2× the request timeout so it cannot
-    // outlive the handler by more than a bounded amount.
-    let max_heartbeat_duration = state.heartbeat_interval * 6 + std::time::Duration::from_secs(60);
+    // WebSocket heartbeats run until the tunnel closes. Ordinary requests retain
+    // the existing cap so a stuck handler cannot refresh activity indefinitely.
+    let heartbeat_deadline = (!is_websocket).then(|| {
+        tokio::time::Instant::now()
+            + state.heartbeat_interval * 6
+            + std::time::Duration::from_secs(60)
+    });
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + max_heartbeat_duration;
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.tick().await; // first tick is immediate, skip it
         loop {
             tokio::select! {
                 _ = heartbeat_cancel_clone.cancelled() => break,
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = async {
+                    match heartbeat_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     warn!(job_id = %heartbeat_job, "heartbeat exceeded max duration, stopping");
                     break;
                 }
@@ -262,6 +276,29 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
     });
+
+    if is_websocket {
+        let lifecycle = WebSocketLifecycle {
+            _in_flight_guard: in_flight_guard,
+            _heartbeat_cancel_guard: heartbeat_cancel_guard,
+        };
+
+        return match forward_websocket_upgrade(&endpoint, req, lifecycle).await {
+            Ok(response) => response,
+            Err(error) => {
+                error!(
+                    job_id = %job_id,
+                    endpoint = %endpoint,
+                    error = %error,
+                    "backend WebSocket upgrade failed"
+                );
+                error.status_code().into_response()
+            }
+        };
+    }
+
+    let _in_flight_guard = in_flight_guard;
+    let _heartbeat_cancel_guard = heartbeat_cancel_guard;
 
     // --- 4. Forward request to backend; retry transient transport failures ---
     let result = match forward_request(&state.http_client, &endpoint, req).await {
