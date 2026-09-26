@@ -44,11 +44,19 @@ config:
     wakeTimeoutSecs: 60
     scaleDownIntervalSecs: 30
     minScaleDownAgeSecs: 120
+    autoDeregister:
+      enabled: true
+      notFoundThreshold: 5
   proxy:
+    endpointRefreshSecs: 2
     requestTimeoutSecs: 30
     requestBufferSize: 1000
   routing:
     fileProviderService: s2z-nscale@file
+  admin:
+    # Optional existing Secret; separate from Nomad/Consul ACL credentials.
+    existingSecret: ""
+    secretKey: token
   logging:
     rustLog: info,nscale=debug
     format: compact
@@ -61,6 +69,9 @@ externalServices:
   traefik:
     metricsUrl: ""
     provider: consulcatalog
+  prometheus:
+    url: ""
+    timeoutSecs: 5
 
 registry:
   durable:
@@ -123,7 +134,7 @@ redis:
       memory: 64Mi
     limits:
       cpu: 100m
-      memory: 128Mi
+      memory: 256Mi
   persistence:
     enabled: false
     accessModes:
@@ -131,13 +142,14 @@ redis:
     size: 2Gi
     storageClassName: ""
   config: |
-    # Cache-only Redis: etcd is the durable registry source of truth.
-    # Keep Redis bounded and disposable so cache loss does not block writes.
+    # Shared request tokens and mutation leases must not be evicted.
+    # Reserve memory headroom and monitor rejected writes at the limit.
+    # Persistence remains opt-in; Redis-only registries need backups.
     dir /tmp
     appendonly no
     save ""
     maxmemory 100mb
-    maxmemory-policy allkeys-lru
+    maxmemory-policy noeviction
     protected-mode no
 
 etcd:

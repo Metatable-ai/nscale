@@ -26,6 +26,7 @@ use nscale_core::config::{PrometheusConfig, TraefikConfig};
 use nscale_core::error::{NscaleError, Result as NscaleResult};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::{JobAutoscalingPolicy, JobId, JobRegistration, ScaleUnit};
+use nscale_core::lease::{Lease, job_lock_key};
 use nscale_core::traits::{ActivityStore, MissingJobTracker, Orchestrator};
 use nscale_etcd::EtcdClient;
 use nscale_nomad::client::NomadClient;
@@ -482,7 +483,13 @@ impl MetricsProvider for ProxyNativeMetricsProvider {
                 Some(snapshot.error_count as f64 / snapshot.request_count as f64)
             },
             in_flight: None,
-            ..Default::default()
+            // Local samples cannot establish low load across other proxy replicas.
+            // Keep overload signals usable, but require complete metrics to reduce.
+            incomplete: nscale_scaler::autoscale_policy::IncompleteMetrics {
+                latency: true,
+                error_rate: true,
+                ..Default::default()
+            },
         })
     }
 }
@@ -827,52 +834,75 @@ async fn admin_submit_job(
         );
     }
 
-    let submit_response = match state.nomad_client.submit_job(&parsed_job).await {
-        Ok(response) => response,
-        Err(e) => {
-            error!(error = %e, "failed to submit Nomad job");
+    let job_id = &managed_services[0].job_id;
+    let lease =
+        match Lease::acquire(state.activity_store.clone(), job_lock_key(job_id)).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "job mutation in progress; retry submission" })),
+            )
+                .into_response(),
+            Err(error) => {
+                return (
+                    admin_error_status(&error),
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+    let result = lease
+        .run(async {
+            let submitted = state.nomad_client.submit_job(&parsed_job).await?;
+            let registrations = state
+                .registry
+                .replace_job_registrations(job_id, &managed_services)
+                .await;
+            if let Ok(previous) = &registrations {
+                // Discard local endpoint pools for removed services and changed groups.
+                for registration in previous.iter().chain(&managed_services) {
+                    state
+                        .coordinator
+                        .mark_dormant(&registration.scale_unit_key());
+                }
+                let units: BTreeSet<_> = managed_services
+                    .iter()
+                    .map(|reg| reg.scale_unit_key().0)
+                    .collect();
+                for unit in units {
+                    let unit = ScaleUnit(unit);
+                    if let Err(error) = state.activity_store.record_activity(&unit).await {
+                        error!(%unit, %error, "failed to seed activity for submitted job");
+                    }
+                }
+            }
+            Ok((submitted, registrations))
+        })
+        .await;
+    let (submit_response, registrations) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            error!(%error, "failed to submit Nomad job");
             return (
-                admin_error_status(&e),
-                Json(serde_json::json!({ "error": e.to_string() })),
+                admin_error_status(&error),
+                Json(serde_json::json!({ "error": error.to_string() })),
             )
                 .into_response();
         }
     };
-
-    let mut seeded_units = BTreeSet::new();
-    let mut registration_failures = Vec::new();
-    for registration in &managed_services {
-        match state.registry.register(registration).await {
-            Ok(()) => {
-                seeded_units.insert(registration.scale_unit_key().0);
-                info!(
-                    job_id = %registration.job_id,
-                    service_name = %registration.service_name,
-                    group = %registration.nomad_group,
-                    "registered submitted job with nscale"
-                );
-            }
-            Err(e) => {
-                error!(
-                    job_id = %registration.job_id,
-                    service_name = %registration.service_name,
-                    error = %e,
-                    "failed to register submitted job with nscale"
-                );
-                registration_failures.push(RegistrationFailure {
+    let registration_failures = match registrations {
+        Ok(_) => Vec::new(),
+        Err(error) => {
+            error!(%job_id, %error, "failed to replace submitted job registrations");
+            managed_services
+                .iter()
+                .map(|registration| RegistrationFailure {
                     service_name: registration.service_name.0.clone(),
-                    error: e.to_string(),
-                });
-            }
+                    error: error.to_string(),
+                })
+                .collect()
         }
-    }
-
-    for unit in seeded_units {
-        let unit = ScaleUnit(unit);
-        if let Err(e) = state.activity_store.record_activity(&unit).await {
-            error!(unit = %unit, error = %e, "failed to seed activity for submitted job");
-        }
-    }
+    };
 
     let status = if registration_failures.is_empty() {
         StatusCode::CREATED
@@ -1129,5 +1159,367 @@ mod autoscaling_admin_tests {
             rendered.contains("nscale_proxy_request_duration_seconds_bucket{"),
             "the configured Prometheus latency query needs buckets, but the exporter produced:\n{rendered}"
         );
+    }
+    #[tokio::test]
+    async fn missing_cluster_latency_must_not_downscale_from_one_replica() {
+        struct UnavailableCluster;
+        #[async_trait]
+        impl MetricsProvider for UnavailableCluster {
+            fn name(&self) -> &'static str {
+                "unavailable-prometheus"
+            }
+            async fn snapshot(
+                &self,
+                _: &JobRegistration,
+                _: Duration,
+            ) -> NscaleResult<MetricSnapshot> {
+                Err(NscaleError::Consul("Prometheus unavailable".into()))
+            }
+        }
+        let policy: JobAutoscalingPolicy =
+            serde_json::from_str(r#"{"max_count":10,"target_p95_latency_ms":100}"#).unwrap();
+        let reg = JobRegistration {
+            job_id: "api".into(),
+            service_name: "api".into(),
+            nomad_group: "web".into(),
+            scale_unit: None,
+            autoscaling: Some(policy.clone()),
+            traefik_routers: vec![],
+        };
+        let local = ProxyMetrics::new();
+        local.record_request(
+            &reg.job_id,
+            &reg.service_name,
+            200,
+            Duration::from_millis(10),
+        );
+        let peer = ProxyMetrics::new();
+        for _ in 0..99 {
+            peer.record_request(
+                &reg.job_id,
+                &reg.service_name,
+                200,
+                Duration::from_millis(1000),
+            );
+        }
+        assert_eq!(
+            peer.snapshot(&reg.job_id, &reg.service_name, Duration::from_secs(60))
+                .p95_latency_ms,
+            Some(1000.0)
+        );
+        let providers = CompositeMetricsProvider::new(vec![
+            Arc::new(UnavailableCluster),
+            Arc::new(ProxyNativeMetricsProvider { metrics: local }),
+        ]);
+        let snapshot = providers
+            .group_snapshot(&[reg], Duration::from_secs(60))
+            .await
+            .unwrap();
+        let decision =
+            nscale_scaler::autoscale_policy::decide_autoscale(&policy, 3, &snapshot, false);
+        assert_ne!(
+            decision.direction,
+            nscale_scaler::autoscale_policy::AutoscaleDirection::Down,
+            "cluster latency unavailable; local snapshot={snapshot:?}, decision={decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_native_metrics_block_reductions_but_allow_overload_and_cluster_recovery() {
+        use nscale_scaler::autoscale_policy::{AutoscaleDirection, decide_autoscale};
+        struct Cluster(Option<MetricSnapshot>);
+        #[async_trait]
+        impl MetricsProvider for Cluster {
+            fn name(&self) -> &'static str {
+                "cluster"
+            }
+            async fn snapshot(
+                &self,
+                _: &JobRegistration,
+                _: Duration,
+            ) -> NscaleResult<MetricSnapshot> {
+                self.0
+                    .clone()
+                    .ok_or_else(|| NscaleError::Consul("unavailable".into()))
+            }
+        }
+        for target in [r#""target_p95_latency_ms":100"#, r#""max_error_rate":0.1"#] {
+            let policy: JobAutoscalingPolicy =
+                serde_json::from_str(&format!("{{\"max_count\":10,{target}}}")).unwrap();
+            let reg = JobRegistration {
+                job_id: "api".into(),
+                service_name: "api".into(),
+                nomad_group: "web".into(),
+                scale_unit: None,
+                autoscaling: Some(policy.clone()),
+                traefik_routers: vec![],
+            };
+            for cluster in [None, Some(MetricSnapshot::default())] {
+                for overloaded in [false, true] {
+                    let native = ProxyMetrics::new();
+                    native.record_request(
+                        &reg.job_id,
+                        &reg.service_name,
+                        if overloaded { 500 } else { 200 },
+                        Duration::from_millis(if overloaded { 1000 } else { 10 }),
+                    );
+                    let providers = CompositeMetricsProvider::new(vec![
+                        Arc::new(Cluster(cluster.clone())),
+                        Arc::new(ProxyNativeMetricsProvider { metrics: native }),
+                    ]);
+                    let snapshot = providers
+                        .group_snapshot(std::slice::from_ref(&reg), Duration::from_secs(60))
+                        .await
+                        .unwrap();
+                    let decision = decide_autoscale(&policy, 3, &snapshot, false);
+                    assert_eq!(
+                        decision.direction,
+                        if overloaded {
+                            AutoscaleDirection::Up
+                        } else {
+                            AutoscaleDirection::None
+                        },
+                        "target={target}, overloaded={overloaded}, snapshot={snapshot:?}"
+                    );
+                }
+            }
+            let native = ProxyMetrics::new();
+            native.record_request(
+                &reg.job_id,
+                &reg.service_name,
+                200,
+                Duration::from_millis(10),
+            );
+            let providers = CompositeMetricsProvider::new(vec![
+                Arc::new(Cluster(Some(MetricSnapshot {
+                    p95_latency_ms: Some(10.0),
+                    error_rate: Some(0.0),
+                    ..Default::default()
+                }))),
+                Arc::new(ProxyNativeMetricsProvider { metrics: native }),
+            ]);
+            let snapshot = providers
+                .group_snapshot(&[reg], Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(
+                decide_autoscale(&policy, 3, &snapshot, false).direction,
+                AutoscaleDirection::Down,
+                "complete cluster signal can authorize reductions"
+            );
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated Redis"]
+    async fn resubmission_removes_obsolete_service_policy() {
+        assert_resubmission_reconciles(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis and etcd"]
+    async fn durable_resubmission_removes_obsolete_service_policy() {
+        assert_resubmission_reconciles(true).await;
+    }
+
+    async fn assert_resubmission_reconciles(durable_enabled: bool) {
+        use fred::prelude::*;
+        use nscale_core::traits::DurableRegistry;
+        use serde_json::{Value, json};
+        let job = nscale_core::lease::unique_token();
+        let parsed_job = job.clone();
+        let reject_submission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rejected = reject_submission.clone();
+        let mock = Router::new()
+            .route("/v1/jobs/parse", post(move |Json(body): Json<Value>| {
+                let job = parsed_job.clone();
+                async move {
+                    let services = if body["JobHCL"] == "initial" { vec!["a", "b"] } else { vec!["a"] };
+                    let services: Vec<_> = services.into_iter().map(|name| json!({"Name": format!("{job}-{name}"), "Tags": ["traefik.enable=true", format!("traefik.http.routers.{name}.rule=Host(`{name}.example`)")]})).collect();
+                    Json(json!({"ID": job, "TaskGroups": [{"Name":"web", "Count":3, "Services": services}]}))
+                }
+            }))
+            .route("/v1/jobs", post(move || {
+                let rejected = rejected.clone();
+                async move {
+                    if rejected.load(std::sync::atomic::Ordering::SeqCst) {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    Json(json!({"EvalID":"test-eval", "JobModifyIndex":10})).into_response()
+                }
+            }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let store = Arc::new(
+            RedisActivityStore::new(&std::env::var("NSCALE_TEST_REDIS_URL").unwrap())
+                .await
+                .unwrap(),
+        );
+        let nomad = Arc::new(NomadClient::new(&format!("http://{address}"), None).unwrap());
+        let durable = if durable_enabled {
+            Some(Arc::new(
+                EtcdClient::new(
+                    vec![
+                        std::env::var("NSCALE_TEST_ETCD_ENDPOINT").expect("isolated etcd required"),
+                    ],
+                    format!("/test/{job}"),
+                )
+                .await
+                .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let registry = match &durable {
+            Some(etcd) => JobRegistry::with_durable(store.client().clone(), etcd.clone()),
+            None => JobRegistry::new(store.client().clone()),
+        };
+        let unrelated = JobRegistration {
+            job_id: format!("{job}-other").into(),
+            service_name: format!("{job}-other").into(),
+            nomad_group: "other".into(),
+            scale_unit: None,
+            autoscaling: None,
+            traefik_routers: vec![],
+        };
+        registry.register(&unrelated).await.unwrap();
+        let state = AdminState {
+            registry: Arc::new(registry),
+            activity_store: store.clone(),
+            nomad_client: nomad.clone(),
+            coordinator: Arc::new(WakeCoordinator::new(
+                nomad,
+                Arc::new(ConsulClient::new("http://unused", None).unwrap()),
+                10,
+                Duration::from_secs(1),
+            )),
+            in_flight: InFlightTracker::new(),
+            missing_job_tracker: Arc::new(RedisMissingJobTracker::new(store.client().clone())),
+            file_provider_service: "s2z-nscale@file".into(),
+            prometheus_handle: install_metrics_recorder(),
+        };
+        for (hcl, max) in [("initial", 3), ("replacement", 6)] {
+            let request = SubmitJobRequest {
+                hcl: hcl.into(),
+                variables: None,
+                autoscaling: Some(
+                    serde_json::from_value(
+                        json!({"max_count":max,"target_requests_per_second_per_instance":10}),
+                    )
+                    .unwrap(),
+                ),
+            };
+            let response = admin_submit_job(State(state.clone()), Json(request))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        // A rejected Nomad replacement must leave the last successful registry intact.
+        reject_submission.store(true, std::sync::atomic::Ordering::SeqCst);
+        let rejected = admin_submit_job(
+            State(state.clone()),
+            Json(SubmitJobRequest {
+                hcl: "initial".into(),
+                variables: None,
+                autoscaling: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        reject_submission.store(false, std::sync::atomic::Ordering::SeqCst);
+        let lease = Lease::acquire(store.clone(), job_lock_key(&job.clone().into()))
+            .await
+            .unwrap()
+            .unwrap();
+        let busy = admin_submit_job(
+            State(state.clone()),
+            Json(SubmitJobRequest {
+                hcl: "initial".into(),
+                variables: None,
+                autoscaling: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        lease.run(async { Ok(()) }).await.unwrap();
+        let registrations: Vec<_> = state
+            .registry
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.job_id.0 == job)
+            .collect();
+        assert_eq!(
+            registrations.len(),
+            1,
+            "replacement must remove obsolete same-group policy"
+        );
+        assert_eq!(registrations[0].autoscaling.as_ref().unwrap().max_count, 6);
+        assert!(
+            state
+                .registry
+                .get_by_service_name(&format!("{job}-b").into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .registry
+                .get(&unrelated.job_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        if let Some(etcd) = durable {
+            let persisted: Vec<_> = etcd
+                .list_all()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.job_id.0 == job)
+                .collect();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].autoscaling.as_ref().unwrap().max_count, 6);
+            // Evict only this test's cache entries; restoration must not resurrect B.
+            let _: i64 = store.client().hdel("nscale:jobs", &job).await.unwrap();
+            let _: i64 = store
+                .client()
+                .hdel("nscale:jobs:services", format!("{job}-a"))
+                .await
+                .unwrap();
+            state.registry.sync_from_durable().await.unwrap();
+            assert!(
+                state
+                    .registry
+                    .get_by_service_name(&format!("{job}-b").into())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                state
+                    .registry
+                    .get(&job.clone().into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .autoscaling
+                    .unwrap()
+                    .max_count,
+                6
+            );
+        }
+        state
+            .registry
+            .deregister(&job.clone().into())
+            .await
+            .unwrap();
+        state.registry.deregister(&unrelated.job_id).await.unwrap();
+        store.remove_activity(&ScaleUnit(job)).await.unwrap();
+        server.abort();
     }
 }

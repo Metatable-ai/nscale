@@ -2,11 +2,15 @@
 
 Branch: `feat/autoscaling` (baseline `9d24719`).
 
+Current status and remaining production gates: [release readiness](../autoscaling-release-readiness.md).
+This document records successive implementation and validation passes; earlier test counts and
+integration results apply to the code at those passes.
+
 ## Decisions
 
 - Keep managed traffic through nscale. Discover all healthy Consul endpoints per
   service, refresh the pool every two seconds, and select endpoints round-robin.
-- Coalesce wake by task group while selecting ports by service. Wake only a zero
+- Coalesce readiness by service and serialize count mutations by task group. Wake only a zero
   count, using the enabled policy's minimum. Restart/discovery misses and stopped
   allocations must preserve a running group's desired count.
 - Use the task-group scale unit consistently for activity and request tracking.
@@ -125,8 +129,92 @@ bidirectional tunnel regression is retained.
 Final merged validation passed: formatting, `cargo check --workspace`, strict
 workspace Clippy, and `cargo nextest run --workspace --run-ignored all` against
 isolated Redis (160 passed, none skipped). Shell syntax and diff checks passed.
-The full Nomad/Consul/Traefik integration scripts were not rerun in this final
-merge pass; their earlier results are recorded above.
+The full Nomad/Consul/Traefik integration scripts were not rerun in that merge
+pass; they were rerun during the subsequent follow-up below.
+
+## HA fallback and sibling-service follow-up
+
+Native latency/error samples are explicitly incomplete across proxy replicas.
+They can still trigger scale-up, but cannot authorize reductions when cluster
+metrics fail, return no observations, or are not configured. Complete cluster
+signals still authorize reductions. The existing idle scale-to-zero policy and
+activity guards remain independent.
+
+Wake readiness and cached endpoints are keyed by group and service. A local
+per-group mutex protects only the count check/mutation, alongside the existing
+shared Redis job lease. It is released before service health polling. A failed
+or missing endpoint invalidates only that service's readiness; whole-unit
+scale-down still invalidates every service.
+
+Regressions cover the original unequal-replica metric case, unavailable/empty
+cluster observations, both latency and error targets, known local overload,
+cluster recovery, and healthy siblings during failed health waits in both
+cold and already-running groups. The fake orchestrator now retains counts per
+job/group, matching actual Nomad behavior during sibling wake tests.
+
+The updated workspace passes 163 tests with all isolated-Redis cases enabled,
+including lease loss/renewal, cancellation, authenticated retries, and the
+31-second WebSocket tunnel. Formatting, workspace check, and strict Clippy pass.
+
+The final follow-up also passes all four disposable integration suites:
+
+- `test-autoscaling-regressions.sh`: cold minimum, three real allocation IDs,
+  restart/count preservation, shared streaming protection, load-driven scaling,
+  and `scale_to_zero = false`.
+- `test-autoscaling-prometheus.sh`: 759 successful load requests, histogram and
+  positive-rate samples from both proxies, aggregate p95, scale-up within the
+  cap, and idle scale-to-zero.
+- `test-multigroup.sh`: independent wake and idle reduction, including alpha
+  reaching zero while beta remains active.
+- `test-acl.sh`: 23 assertions, including scoped token access, submission,
+  HTTP/HTTPS routing, cold wake, idle reduction, and re-wake.
+
+Temporary Redis and integration stacks were removed after validation.
+
+## Registration replacement and failed-wake follow-up
+
+Successful `/admin/jobs` submissions replace the complete service set for that
+job, removing obsolete registrations and policies from Redis and optional etcd.
+The shared job mutation lease covers submission and registry replacement. Redis
+updates both indexes in one Lua operation; etcd updates its keys in one transaction.
+Local readiness is invalidated for affected units. Other jobs remain registered.
+Busy submissions return 409. Store failures after Nomad accepts a job still return
+207 with registration failures; operators must retry after restoring the store,
+because the three systems do not share a transaction.
+
+Wake callers subscribe to the shared health result before acquiring the endpoint
+refresh mutex. Both successful and failed wakes are coalesced, and later requests
+can retry failures. A deadline bounds the entire request wake path and background
+wake task, including refresh, group mutation, and Nomad semaphore queues.
+
+Regressions exercise eight concurrent failing wakes, one shared health attempt,
+retry, queued deadlines, and cancellation before a delayed count mutation. Real
+Redis and etcd tests exercise service removal, policy replacement, unrelated-job
+preservation, rejected/busy submissions, and recovery after cache eviction.
+All 167 workspace tests pass with ignored infrastructure tests enabled; formatting,
+workspace check, strict Clippy, shell syntax, and diff checks pass.
+
+The updated `test-durable.sh` also passes against the full disposable stack:
+renaming a submitted service removes its old Redis and etcd entries, and both
+warm requests and cold wakes recover after Redis registry cache loss.
+
+## 3.0.0 packaging follow-up
+
+All nine Cargo packages and their lockfile entries, plus Helm chart version and appVersion,
+now target 3.0.0. No third-party dependency versions changed. The chart uses Recreate for the
+app Deployment and noeviction for bundled Redis, with a 256 MiB container limit around its
+100 MB data budget. Existing custom Redis config must still be reviewed during migration.
+
+Chart values now expose endpoint refresh, Prometheus URL/timeout, missing-job cleanup, and an
+independent existing Secret for the admin token. Default renders omit optional Prometheus and
+admin authentication. Configured renders preserve separate Nomad/Consul Secret references.
+Migration and operator documentation reflect these defaults and values.
+
+Validation passed for 3.0.0: formatting, workspace check, strict Clippy, and all 167 workspace
+tests with isolated Redis/etcd enabled. Helm lint and semantic render checks passed for default,
+configured two-replica, and zero-replica durable deployments, including their runtime TOML.
+Documentation link, shell-example, and diff checks passed. No live Kubernetes upgrade or
+release publishing was performed; the remaining release gates still apply.
 
 ## Operational boundaries
 
@@ -134,8 +222,8 @@ merge pass; their earlier results are recorded above.
   graceful shutdown and Nomad `shutdown_delay`/`kill_timeout` must cover supported
   requests. Network partitions, direct/manual termination, and newly admitted
   requests racing a reduction are not guaranteed lossless.
-- No production deployment, production traffic replay, prolonged soak, or
-  ACL-enabled integration has been performed as part of these fixes.
+- No production deployment, production traffic replay, or prolonged soak has
+  been performed as part of these fixes.
 - Drain and replace older proxy replicas together: mixed versions do not all
   publish shared request tokens or use the new mutation coordination.
 - No new production dependencies or pushes are included.

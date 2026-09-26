@@ -27,7 +27,12 @@ data:
     scale_down_interval_secs = {{ int .Values.config.scaling.scaleDownIntervalSecs }}
     min_scale_down_age_secs = {{ int .Values.config.scaling.minScaleDownAgeSecs }}
 
+    [default.scaling.auto_deregister]
+    enabled = {{ .Values.config.scaling.autoDeregister.enabled }}
+    not_found_threshold = {{ int .Values.config.scaling.autoDeregister.notFoundThreshold }}
+
     [default.proxy]
+    endpoint_refresh_secs = {{ int .Values.config.proxy.endpointRefreshSecs }}
     request_timeout_secs = {{ int .Values.config.proxy.requestTimeoutSecs }}
     request_buffer_size = {{ int .Values.config.proxy.requestBufferSize }}
 
@@ -44,4 +49,10 @@ data:
     [default.traefik]
     metrics_url = {{ .Values.externalServices.traefik.metricsUrl | quote }}
     provider = {{ .Values.externalServices.traefik.provider | quote }}
+{{- end }}
+{{- if .Values.externalServices.prometheus.url }}
+
+    [default.prometheus]
+    url = {{ .Values.externalServices.prometheus.url | quote }}
+    timeout_secs = {{ int .Values.externalServices.prometheus.timeoutSecs }}
 {{- end }}

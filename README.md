@@ -57,8 +57,8 @@ tracks every request, enabling in-flight protection and heartbeat-based activity
 
 ### In-flight request protection
 
-nscale prevents scale-down of services with active long-running requests using an
-`InFlightTracker` with RAII guards and periodic heartbeats:
+nscale guards reductions using local `InFlightTracker` guards and shared Redis request leases,
+kept alive through HTTP response completion or WebSocket closure:
 
 ```mermaid
 sequenceDiagram
@@ -66,30 +66,31 @@ sequenceDiagram
     participant Traefik
     participant nscale
     participant Backend
+    participant Redis
     participant Scaler
 
     Client->>Traefik: GET /slow?delay=60
     Traefik->>nscale: route via s2z-nscale@file
-    nscale->>nscale: InFlightTracker.track(job_id)
-    nscale->>nscale: record_activity(start)
+    nscale->>nscale: InFlightTracker.track(scale_unit)
+    nscale->>Redis: record activity and request token
     nscale->>Backend: proxy request
 
-    loop Every idle_timeout / 3
-        nscale->>nscale: heartbeat → record_activity
+    loop Every 100 ms–5 s, derived from idle_timeout / 3
+        nscale->>Redis: refresh activity and request token
     end
 
     Note over Scaler: Scale-down tick
-    Scaler->>nscale: has_in_flight(job_id)?
-    nscale-->>Scaler: true → skip scale-down
+    Scaler->>Redis: active_requests(scale_unit)?
+    Redis-->>Scaler: active → skip scale-down
 
-    Backend-->>nscale: response (after 60s)
+    Backend-->>nscale: stream response
+    nscale-->>Client: stream body until completion or disconnect
     nscale->>nscale: InFlightGuard dropped
-    nscale->>nscale: record_activity(end)
-    nscale-->>Client: response
+    nscale->>Redis: finish request token and record activity
 
     Note over Scaler: Next tick after idle_timeout
-    Scaler->>nscale: has_in_flight(job_id)?
-    nscale-->>Scaler: false
+    Scaler->>Redis: active_requests(scale_unit)?
+    Redis-->>Scaler: zero
     Scaler->>Scaler: check traffic probe
     Scaler->>nscale: scale to zero
 ```
@@ -104,7 +105,8 @@ flowchart TD
     Idle -->|Found idle jobs| Loop["For each idle job"]
     Loop --> Deferred{"Deferred due to<br/>active deployment?"}
     Deferred -->|Yes, backoff active| Skip["Skip job"]
-    Deferred -->|No| InFlight{"InFlightTracker<br/>has_in_flight?"}
+    Deferred -->|No| InFlight{"Local or shared<br/>active requests?"}
+    InFlight -->|Shared state unavailable| Skip
     InFlight -->|Yes| Refresh["Refresh activity<br/>→ skip"]
     InFlight -->|No| Probe{"Traefik traffic probe<br/>request delta > 0?"}
     Probe -->|Active traffic| Refresh
@@ -116,7 +118,7 @@ flowchart TD
     Cleanup --> Loop
 ```
 
-**nscale** is a single Rust binary composed of seven internal crates:
+**nscale** is a single Rust binary composed of eight internal crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -131,15 +133,16 @@ flowchart TD
 
 ## Features
 
-- **Wake-on-request** — Dormant services are started automatically when traffic arrives
+- **Wake-on-request** — Dormant services start at the enabled policy’s minimum; failed wakes are coalesced and queue time counts toward the wake deadline
+- **Per-group autoscaling** — Per-job policies control running capacity using request rate, latency, and error signals; missing required metrics prevent reductions
 - **Request coalescing** — Concurrent requests for the same service share a single wake cycle
-- **In-flight protection** — RAII-based `InFlightTracker` with heartbeat prevents scale-down during active requests
-- **Heartbeat activity** — Long-running requests refresh activity every `idle_timeout / 3`, surviving any idle window
+- **In-flight protection** — Local guards and renewable Redis request leases track HTTP bodies and WebSocket tunnels across proxy replicas
+- **Heartbeat activity** — Requests refresh activity and their Redis lease every `idle_timeout / 3`, clamped to 100 ms–5 s; leases expire after 30 s without renewal
 - **Reverse proxy** — All requests (cold and warm path) route through nscale for full visibility
 - **Idle detection** — Services with no recent activity are scaled to zero via Redis sorted set
 - **Durable registry** — Job registrations can be stored in etcd and cached in Redis for resilient multi-replica recovery
 - **Traffic probe** — Scrapes Traefik Prometheus metrics as a secondary guard against scaling down active services
-- **Retry with cache invalidation** — On upstream failure, invalidates stale endpoints and retries the full wake cycle
+- **Safe transport retries** — Only empty-body GET/HEAD requests are replayed, preserving headers, URI, method, and HTTP version
 - **Nomad event stream** — Reacts to allocation lifecycle events for instant state transitions
 - **Active-deployment tolerance** — Gracefully handles Nomad 400 "scaling blocked due to active deployment"
 - **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
@@ -148,6 +151,23 @@ Additional operator docs live in [`docs/`](./docs/), starting with the
 [`performance-configuration.md`](./docs/performance-configuration.md) guide,
 [`job-submission.md`](./docs/job-submission.md) for the admin submission flow,
 and [`durable-registry.md`](./docs/durable-registry.md) for etcd-backed registry mode.
+
+### Upgrading from 2.2.x
+
+Follow the [autoscaling migration guide](./docs/migration-autoscaling.md) before upgrading.
+This update requires a controlled drain/stop/start cutover, a non-evicting shared Redis store,
+registration reconciliation for multi-group jobs, and a tested rollback. Pin the target image;
+the chart and Cargo packages now target `3.0.0`. The chart uses `Recreate` and non-evicting Redis
+by default; review inherited Helm values because custom Redis settings are preserved.
+
+### Autoscaling release status
+
+The latest validation passed **167 workspace tests** with infrastructure tests enabled,
+plus the durable integration suite. Previously identified release blockers have fixes and
+regressions. The final registration/wake changes have not yet had all four earlier
+integration suites rerun, and staging rollout, rollback, and prolonged soak remain unverified.
+See [release readiness](./docs/autoscaling-release-readiness.md) for the evidence and remaining
+production gates. This is a staging candidate, not production sign-off.
 
 ## Quick Start
 
@@ -479,7 +499,7 @@ The admin submission endpoint lets nscale own the full registration flow:
 1. parse Nomad HCL with optional variables through Nomad's parser
 2. inject or override `traefik.http.routers.<name>.service=s2z-nscale@file`
 3. submit the mutated job to Nomad
-4. auto-register every managed service in Redis
+4. replace the job’s managed registrations in Redis (and etcd when enabled), removing services absent from the submitted job
 5. seed initial activity so the scaler can safely discover the job later
 
 The endpoint only manages services that:
@@ -543,7 +563,14 @@ When present, `max_count` is required. Jobs without this object keep the existin
 behavior.
 
 Successful responses include the Nomad evaluation information plus the set of managed services that
-nscale registered automatically.
+nscale registered automatically. A `201` response means the complete registration set was replaced.
+A `409` means another job mutation holds the lease; retry the submission. A `207` means Nomad
+accepted the job but registration replacement failed; inspect `registration_failures` and retry
+after restoring the store. Nomad, etcd, and Redis do not share a transaction.
+
+Concurrent requests for an unhealthy service share the same wake result. `wake_timeout_secs`
+bounds each request’s entire wake attempt, including time queued for discovery refresh or
+Nomad concurrency slots. A later request can retry a failed wake.
 
 ### Manual registration payload
 
@@ -587,15 +614,18 @@ Policy fields:
 | `scale_to_zero` | `true` | Whether idle scale-down may still scale this job to zero |
 | `scale_up_step` | `1` | Maximum instances added in one autoscale decision |
 | `scale_down_step` | `1` | Maximum instances removed in one autoscale decision |
-| `cooldown_secs` | `120` | Optional per-job cooldown after a successful autoscale decision (shared across replicas) |
+| `cooldown_secs` | `120` | Per-group cooldown after a successful autoscale decision (shared across replicas) |
 | `decision_window_secs` | `60` | Optional per-job metrics window used for autoscale decisions (max `1800`) |
 | `target_requests_per_second_per_instance` | optional | Traefik request-rate target per instance |
-| `target_p95_latency_ms` | optional | nscale-native p95 proxy latency target |
+| `target_p95_latency_ms` | optional | p95 proxy latency target; aggregate Prometheus samples support reductions |
 | `max_error_rate` | optional | Error-rate threshold used as a downscale guard and scale-up signal |
 
 Traefik metrics provide the cluster-wide request-rate signal when `NSCALE_TRAEFIK__METRICS_URL` is
 configured. nscale-native metrics provide request latency and local error-rate signals through the
-admin `/metrics` endpoint.
+admin `/metrics` endpoint. Replica-local latency and error samples can trigger scale-up,
+but cannot independently authorize downscaling, including when Prometheus is unavailable
+or returns no observations. Configure cluster-wide metrics for latency/error-driven
+reductions; idle scale-to-zero still uses its separate activity and traffic guards.
 
 > **Multi-group jobs:** a single Nomad job may expose more than one task group,
 > each with its own service/router. nscale tracks idle state, wake, in-flight
@@ -607,13 +637,15 @@ admin `/metrics` endpoint.
 Healthy backend endpoints are cached **per service**, selected round-robin, and refreshed every
 `proxy.endpoint_refresh_secs` (default `2`, environment: `NSCALE_PROXY__ENDPOINT_REFRESH_SECS`).
 Allocation-stop events invalidate discovery without resetting the group's desired count.
+Sibling services share count-mutation coordination, but have separate readiness waits:
+an unhealthy service does not make a healthy service in the same group fail.
 
 Services sharing a group contribute their request rates to one decision. Latency/error checks use
 the worst service signal; absent required observations block reductions while known overload can
 still trigger scale-up. Router traffic is preferred
 when present, with service traffic as a fallback, so the same request is not counted twice.
 
-Wake, autoscaling, and idle scale-down share renewable Redis mutation leases per Nomad job.
+Job submission, wake, autoscaling, and idle scale-down share renewable Redis mutation leases per Nomad job.
 Scaling writes enforce Nomad's job modification index and abandon stale decisions. In-flight request
 leases are shared across proxy replicas and remain active through response-body completion or client
 disconnection. Request leases refresh at most every five seconds and expire after thirty seconds
@@ -651,6 +683,11 @@ when the job still exists but was submitted outside `nscale` and just needs to b
 
 ```bash
 cargo nextest run --workspace
+
+# Include opt-in tests using disposable services, never production stores.
+NSCALE_TEST_REDIS_URL=redis://127.0.0.1:58411 \
+NSCALE_TEST_ETCD_ENDPOINT=http://127.0.0.1:58412 \
+  cargo nextest run --workspace --run-ignored all --test-threads 4
 ```
 
 ### Autoscaling release regressions
@@ -813,15 +850,15 @@ endpoint, then proxies the original request.
 When the service is healthy, Traefik creates a ConsulCatalog route (priority 30)
 that also points to `s2z-nscale@file`. The request still flows through nscale,
 which tracks it with `InFlightTracker`, spawns a heartbeat, and proxies to the
-real backend using the coordinator's cached endpoint (resolved from Consul during wake).
+healthy backends using a per-service round-robin pool, refreshed from Consul every
+`proxy.endpoint_refresh_secs`.
 
 ### 4. In-flight protection
 
-Each proxied request increments an atomic counter via `InFlightTracker.track()`,
-returning an RAII guard that decrements on drop. A background heartbeat task
-refreshes activity in Redis every `idle_timeout / 3`. The scale-down controller
-checks `has_in_flight()` before any scale operation — if requests are active,
-it refreshes activity and skips.
+Each request owns a local guard and an expiring Redis token. A heartbeat refreshes activity and
+the token every `idle_timeout / 3`, clamped to 100 ms–5 s. Both remain active through response-body
+completion, disconnect, or WebSocket closure. Controllers check local and shared request state
+before reducing capacity; unavailable shared state blocks reductions.
 
 ### 5. Scale down
 
@@ -829,17 +866,17 @@ The scale-down controller runs a periodic sweep:
 
 1. Acquire distributed lock in Redis
 2. Query the activity sorted set for jobs with score < `now - idle_timeout`
-3. For each idle job, check deployment deferral (skip if Nomad reported active deployment recently)
-4. Check `InFlightTracker` (in-flight requests block scale-down and refresh activity)
-5. Check Traefik traffic probe (request counter delta; fail-open on probe errors)
-6. If truly idle, scale Nomad job to `count = 0`
+3. Acquire the job mutation lease, recheck group idleness/cooldown, and check deployment deferral
+4. Check local and shared in-flight requests; unreadable shared state blocks scale-down
+5. Check the configured Traefik traffic probe (request counter delta; skip on probe errors)
+6. If policy and idle guards allow it, scale the task group to `count = 0` with a Nomad index check
 7. Mark dormant, remove activity, and clear the traffic probe baseline
 
 ### 6. Nomad event stream
 
 nscale subscribes to Nomad's allocation event stream. When allocations transition
-to running, it records activity. When they stop, it marks the job dormant and
-clears the coordinator cache — enabling instant state transitions without polling.
+to running, it records activity. Allocation stops invalidate the affected group’s endpoint
+cache. The next discovery/wake preserves a running group’s desired count instead of resetting it.
 
 ## Project Structure
 

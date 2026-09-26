@@ -137,6 +137,14 @@ pub trait DurableRegistry: Send + Sync {
     /// Store or update a job registration durably.
     async fn store_registration(&self, reg: &JobRegistration) -> Result<()>;
 
+    /// Atomically replace every service registration belonging to a job.
+    /// Callers serialize job mutations across the durable store and its cache.
+    async fn replace_job_registrations(
+        &self,
+        job_id: &JobId,
+        registrations: &[JobRegistration],
+    ) -> Result<()>;
+
     /// Remove a registration from durable storage.
     async fn remove_registration(&self, job_id: &JobId) -> Result<()>;
 

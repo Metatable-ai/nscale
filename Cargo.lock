@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "nscale"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-consul"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "nscale-core",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-core"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "figment",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-etcd"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "etcd-client",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-nomad"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-proxy"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-scaler"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-store"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "fred",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "nscale-waker"
-version = "2.2.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "dashmap",

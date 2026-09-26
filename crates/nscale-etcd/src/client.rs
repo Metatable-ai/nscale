@@ -127,6 +127,50 @@ impl DurableRegistry for EtcdClient {
         .await
     }
 
+    async fn replace_job_registrations(
+        &self,
+        job_id: &JobId,
+        registrations: &[JobRegistration],
+    ) -> Result<()> {
+        let Some(alias) = registrations.last() else {
+            return Err(NscaleError::Config("empty job replacement".into()));
+        };
+        let replacements = registrations
+            .iter()
+            .map(|reg| {
+                Ok((
+                    self.service_key(&reg.service_name),
+                    Self::encode_registration(reg)?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        if registrations.iter().any(|reg| reg.job_id != *job_id)
+            || replacements.len() != registrations.len()
+        {
+            return Err(NscaleError::Config(
+                "replacement requires unique services belonging to one job".into(),
+            ));
+        }
+        let mut operations = self
+            .service_keys_for_job(job_id)
+            .await?
+            .into_iter()
+            .filter(|key| !replacements.contains_key(key))
+            .map(|key| TxnOp::delete(key, None))
+            .collect::<Vec<_>>();
+        operations.extend(
+            replacements
+                .into_iter()
+                .map(|(key, value)| TxnOp::put(key, value, None)),
+        );
+        operations.push(TxnOp::put(
+            self.job_key(job_id),
+            Self::encode_registration(alias)?,
+            None,
+        ));
+        self.apply_txn(operations).await
+    }
+
     #[instrument(skip(self), fields(job_id = %job_id))]
     async fn remove_registration(&self, job_id: &JobId) -> Result<()> {
         let mut operations = self

@@ -11,8 +11,8 @@ The recommended values in this document are a practical baseline, not hard requi
 If you only remember a few things, remember these:
 
 1. **All traffic for managed services should pass through `nscale`** on both the cold path and the warm path.
-2. **Proxy timeout must cover both wake time and backend work time**.
-3. **Idle timeout is also the heartbeat budget** for long-running requests.
+2. **Ingress/client timeouts must cover wake time, backend work, and any permitted retries**; the backend attempt has its own timeout.
+3. **Shared Redis request leases protect long-running requests** while their heartbeats continue.
 4. **The Traefik traffic probe should be enabled** if you want safe, aggressive scale-down.
 5. **Fast scale-down sweeps only work when the guardrails are present**.
 
@@ -46,7 +46,7 @@ The repository defaults are intentionally conservative for local development. Fo
 |---|---:|---:|
 | `scaling.idle_timeout_secs` | 300 | 45 |
 | `scaling.scale_down_interval_secs` | 30 | 5 |
-| `scaling.min_scale_down_age_secs` | 120 | 30 |
+| `scaling.min_scale_down_age_secs` | 120 | Currently unused; do not rely on this as a guard |
 | `proxy.request_timeout_secs` | 30 | 90 |
 | `traefik` | not set | enabled |
 
@@ -92,10 +92,10 @@ Use this as a starting point when you want:
 | Area | Setting | Recommended value | Why |
 |---|---|---:|---|
 | Nomad | `nomad.concurrency` | `50` | Sufficient for most fleets with up to 50 concurrent services waking simultaneously. |
-| Scaling | `scaling.idle_timeout_secs` | `45` | Aggressive enough for fast scale-down while still allowing heartbeat refreshes every 15 seconds. |
-| Scaling | `scaling.wake_timeout_secs` | `60` | Gives Nomad + Consul enough time to recover from cold starts without leaving requests hanging indefinitely. |
+| Scaling | `scaling.idle_timeout_secs` | `45` | Controls idle eligibility; request heartbeats are capped at five seconds. |
+| Scaling | `scaling.wake_timeout_secs` | `60` | Bounds one wake attempt, including queue time, Nomad work, and Consul readiness. |
 | Scaling | `scaling.scale_down_interval_secs` | `5` | Keeps the controller reactive under frequent wake/sleep cycles. |
-| Proxy | `proxy.request_timeout_secs` | `90` | Covers up to 60 seconds of wake latency plus up to 30 seconds of backend work. |
+| Proxy | `proxy.request_timeout_secs` | `90` | Bounds one ordinary HTTP backend attempt after wake; size this for backend work and response streaming. |
 | Prometheus | `prometheus.url` | optional | Queries Prometheus before the direct Traefik and nscale-native fallback providers when configured. |
 | Prometheus | `prometheus.timeout_secs` | `5` | Bounds Prometheus query latency before falling back to direct providers. |
 | Traefik | `traefik.metrics_url` | enabled | Enables the traffic probe, which prevents scale-down when Traefik is still serving requests to a healthy service. |
@@ -126,43 +126,34 @@ Why this matters:
 - the scale-down controller is safer when warm traffic remains visible to `nscale`
 - routing consistency prevents split-brain behavior between cold and warm service paths
 
-### Align proxy timeout with wake budget and slow work
+### Budget wake and backend work separately
 
-A good rule is:
+`scaling.wake_timeout_secs` bounds a call to the wake coordinator, including time queued behind
+endpoint refresh, group mutation, and Nomad concurrency limits. Concurrent requests for one
+service share success or failure; later requests can retry. Sibling services have separate
+readiness waits, while count changes are coordinated per group and Nomad job.
 
-$$
-\text{proxy.request\\_timeout\\_secs} \ge \text{wake\\_timeout\\_secs} + \text{max backend request time}
-$$
+`proxy.request_timeout_secs` configures the ordinary HTTP backend client after wake. It is not an
+end-to-end timeout for the incoming request. Budget the ingress/client deadline for wake plus
+backend work and retry overhead. For example, a 60-second wake and 90-second backend attempt can
+consume 150 seconds before retry overhead. Only empty-body GET/HEAD requests are replayable.
+WebSocket tunnels have separate lifetimes; do not treat this HTTP timeout as a tunnel deadline.
 
-For the recommended baseline:
+### Understand the heartbeat and lease budget
 
-$$
-90 = 60 + 30
-$$
+Request heartbeat cadence is `idle_timeout_secs / 3`, clamped to **100 ms–5 s**. With a 45-second
+idle timeout, a long-running request refreshes activity and its shared lease every five seconds.
+Each request token expires after **30 seconds without renewal**. Tracking remains active until
+HTTP response-body completion, disconnect, or WebSocket tunnel closure.
 
-That is why a larger request timeout is appropriate for workloads with non-trivial cold-start and request duration.
+All proxy replicas must use the same Redis store. New admission fails with `503` if Redis cannot
+record the request token. Reductions and unforced purge are blocked when shared request state
+cannot be read. Lease expiry bounds crash cleanup; it does not make network partitions or direct
+allocation termination lossless. Configure application graceful shutdown and Nomad drain/kill
+settings for supported request durations.
 
-If your workloads can hold a request open longer than 30 seconds, raise `proxy.request_timeout_secs` accordingly.
-
-### Treat `idle_timeout_secs` as a heartbeat budget
-
-`nscale` derives its heartbeat interval from:
-
-$$
-\text{heartbeat interval} = \frac{\text{idle\\_timeout\\_secs}}{3}
-$$
-
-With `idle_timeout_secs = 45`, heartbeats fire every 15 seconds during long-running proxied requests.
-
-That is short enough to keep 10–30 second requests alive without making Redis writes excessively chatty.
-
-If you lower `idle_timeout_secs`, you increase write frequency and make the system more sensitive to jitter. If you raise it too far, you reduce scale-to-zero aggressiveness.
-
-In practice, `idle_timeout_secs` controls more than just scale-down speed:
-
-- it influences how quickly a quiet service becomes eligible for scale-down
-- it determines how often long-running requests refresh activity
-- it changes how sensitive the system is to Redis latency and scheduling jitter
+Changing `idle_timeout_secs` affects idle eligibility and, below the five-second cap, heartbeat
+frequency. It does not change the 30-second request-token lifetime.
 
 ### Enable the Traefik traffic probe
 
@@ -183,8 +174,9 @@ Autoscaling policies live on `JobRegistration` records submitted through `/admin
 behavior.
 
 For autoscaled jobs, Prometheus is optional. When configured, nscale queries Prometheus before the
-direct Traefik and nscale-native fallback providers. The autoscaling behavior remains per-job and
-unchanged; only the metrics source changes. The autoscaler only manages running jobs between each
+direct Traefik and nscale-native fallback providers. Missing required observations block reductions. Replica-local latency/error observations may
+trigger scale-up, but cannot authorize reductions, even in a single-proxy deployment. Configure
+Prometheus to aggregate all proxy replicas if latency/error policies need to scale down. The autoscaler only manages running jobs between each
 job's `min_count` and `max_count`; wake-on-request and idle scale-down still own the transition to
 and from zero. Set `scale_to_zero = false` in a job policy when a service should stay at or above
 `min_count` instead of becoming dormant.
@@ -209,7 +201,8 @@ A `scale_down_interval_secs` of `5` works well **because** `nscale` includes:
 - scale-down deferral when Nomad reports an active deployment
 - traffic baseline clearing after successful scale-down
 
-If any of those protections are disabled or unavailable in your environment, increase the sweep interval to compensate.
+A slower sweep is not a replacement for these protections. Confirm shared Redis request tracking,
+routing, and metrics in the target environment before enabling aggressive reductions.
 
 ### Keep Nomad concurrency high enough to absorb fan-out wakes
 
@@ -257,7 +250,7 @@ providers:
 serversTransport:
   forwardingTimeouts:
     dialTimeout: 1s
-    responseHeaderTimeout: 60s
+    responseHeaderTimeout: 150s
 ```
 
 Notes:
@@ -292,7 +285,9 @@ timeout_secs = 5
 ```
 
 When Prometheus is configured, nscale queries it before direct Traefik and nscale-native fallback
-providers. Autoscaling behavior remains per-job and unchanged; only the metrics source changes.
+providers. Scrape every proxy replica: latency uses aggregate histogram buckets, and error rate
+uses aggregate request counters. Empty or unavailable observations remain unknown. Local overload
+can still increase capacity; incomplete required signals cannot authorize reductions.
 
 The repository includes an opt-in Prometheus integration test:
 
@@ -335,7 +330,13 @@ Redis is on the hot path for:
 
 - activity timestamps
 - job registry
-- distributed scale-down lock
+- renewable job-mutation and controller leases
+- shared active-request tokens and autoscaling cooldowns
+
+Use `maxmemory-policy noeviction` and capacity monitoring: eviction of active request or mutation
+keys can remove coordination without a connection error. The 3.0.0 chart uses `noeviction` by
+default; inherited Helm values or external Redis may still need this change. See the [migration guide](./migration-autoscaling.md) before changing Redis configuration
+or restarting it.
 
 For best performance:
 
@@ -385,7 +386,7 @@ Key points:
 - a Redis cache miss may incur a slightly slower first lookup because `nscale` reads through to etcd
   and then repopulates Redis.
 - multi-replica deployments should keep durable registry mode enabled so each replica can recover
-  its cache from the same source of truth.
+  the shared cache from the same source of truth.
 
 The durable registry settings are configured under `[default.registry]` and are described in more
 detail in [`durable-registry.md`](./durable-registry.md).
@@ -438,7 +439,9 @@ scale_down_interval_secs = 5
 request_timeout_secs = 70
 ```
 
-The short idle timeout means services become eligible for scale-down quickly. The proxy timeout covers the wake budget (60s) plus a small margin for the fast response.
+The short idle timeout makes services eligible for scale-down sooner. The 70-second proxy timeout
+applies to a backend attempt; a 60-second cold wake can add to that. Choose a smaller backend
+budget if appropriate and allow for both phases in ingress/client deadlines.
 
 ### Slow batch or processing services (10–60s response time)
 
@@ -453,8 +456,17 @@ scale_down_interval_secs = 10
 request_timeout_secs = 120
 ```
 
-The longer idle timeout gives heartbeats plenty of room (every 20 seconds). The proxy timeout covers wake budget (60s) plus the full backend work window. The slower sweep interval reduces unnecessary scale-down checks.
+Heartbeats remain capped at five seconds. The 120-second proxy timeout covers backend work and
+HTTP response streaming after wake; a 60-second cold wake can add to that. The slower sweep
+interval reduces check frequency.
 
 ### Mixed fleet (fast and slow services together)
 
 Use the recommended baseline profile. It is calibrated for the worst-case service (slow) while remaining responsive enough for fast services.
+
+## Rollout verification
+
+Follow the [autoscaling release gates](./autoscaling-release-readiness.md) before production.
+Drain and replace older proxies together: they do not publish the shared request tokens used by
+this branch. Validate real workload durations, metrics coverage, and rollback in staging; the
+local integration runs do not establish those production properties.

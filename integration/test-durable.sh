@@ -279,6 +279,9 @@ pass "All durable-mode services healthy (${elapsed}s)"
 
 info "Submitting variableized echo job through nscale admin API..."
 SUBMIT_PAYLOAD=$(build_submit_payload)
+REPLACEMENT_PAYLOAD="$SUBMIT_PAYLOAD"
+RETIRED_SERVICE="${SERVICE_NAME}-retired"
+SUBMIT_PAYLOAD=$(echo "$SUBMIT_PAYLOAD" | jq --arg current "$SERVICE_NAME" --arg retired "$RETIRED_SERVICE" '.variables |= (split($current) | join($retired))')
 SUBMIT_RESP=$(curl -sS -w "\n%{http_code}" -X POST "$NSCALE_ADMIN/admin/jobs" \
     -H "Content-Type: application/json" \
     -d "$SUBMIT_PAYLOAD")
@@ -295,6 +298,25 @@ pass "Job submitted in durable mode"
 info "Waiting for submitted job to become running..."
 wait_for_job_running
 pass "Job is running"
+
+info "Replacing the job with a renamed service..."
+wait_for_deployment_complete
+SUBMIT_RESP=$(curl -sS -w "\n%{http_code}" -X POST "$NSCALE_ADMIN/admin/jobs" \
+    -H "Content-Type: application/json" -d "$REPLACEMENT_PAYLOAD")
+SUBMIT_CODE=$(echo "$SUBMIT_RESP" | tail -1)
+if [ "$SUBMIT_CODE" != "201" ]; then
+    fail "Replacement submission failed: $SUBMIT_RESP"
+    exit 1
+fi
+retired_cache=$(dc exec -T redis redis-cli --raw HEXISTS nscale:jobs:services "$RETIRED_SERVICE" | tr -d '\r')
+retired_durable=$(dc exec -T etcd /usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 get "${ETCD_PREFIX}/services/${RETIRED_SERVICE}" --print-value-only | tr -d '\r')
+if [ "$retired_cache" != "0" ] || [ -n "$retired_durable" ]; then
+    fail "Replacement left a retired service registration in Redis or etcd"
+    exit 1
+fi
+wait_for_deployment_complete
+wait_for_job_running
+pass "Job replacement removed retired service from Redis and etcd"
 
 info "Verifying registration was persisted to Redis and etcd..."
 assert_redis_registration_present

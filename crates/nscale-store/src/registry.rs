@@ -105,6 +105,71 @@ impl JobRegistry {
         Ok(())
     }
 
+    /// Replace a submitted job's complete service set, preserving other jobs.
+    /// The caller must hold the job mutation lease until both stores are updated.
+    /// Returns the old cached registrations so local readiness can be invalidated.
+    pub async fn replace_job_registrations(
+        &self,
+        job_id: &JobId,
+        registrations: &[JobRegistration],
+    ) -> Result<Vec<JobRegistration>> {
+        let mut services = std::collections::HashSet::new();
+        if registrations.is_empty()
+            || registrations
+                .iter()
+                .any(|reg| reg.job_id != *job_id || !services.insert(&reg.service_name))
+        {
+            return Err(NscaleError::Config(
+                "replacement requires unique services belonging to one job".into(),
+            ));
+        }
+        let mut args = vec![job_id.0.clone()];
+        for reg in registrations {
+            args.push(reg.service_name.0.clone());
+            args.push(Self::encode_registration(reg)?);
+        }
+        if let Some(durable) = &self.durable {
+            durable
+                .replace_job_registrations(job_id, registrations)
+                .await?;
+        }
+        // Decode before mutating: Lua errors do not roll back earlier commands.
+        // Both indexes change in one Redis operation, so readers never see a
+        // mixture of the previous and replacement policies.
+        let script = r#"
+            local entries = redis.call('hgetall', KEYS[2])
+            local old = {}
+            local removed = {}
+            for i = 1, #entries, 2 do
+                local reg = cjson.decode(entries[i + 1])
+                if reg.job_id == ARGV[1] then
+                    table.insert(removed, entries[i])
+                    table.insert(old, entries[i + 1])
+                end
+            end
+            for _, service in ipairs(removed) do
+                redis.call('hdel', KEYS[2], service)
+            end
+            for i = 2, #ARGV, 2 do
+                redis.call('hset', KEYS[2], ARGV[i], ARGV[i + 1])
+            end
+            redis.call('hset', KEYS[1], ARGV[1], ARGV[#ARGV])
+            return old
+        "#;
+        let old: Vec<String> = self
+            .client
+            .eval(
+                script,
+                vec![REGISTRY_BY_JOB_KEY, REGISTRY_BY_SERVICE_KEY],
+                args,
+            )
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        old.into_iter()
+            .map(|value| serde_json::from_str(&value).map_err(NscaleError::from))
+            .collect()
+    }
+
     #[instrument(skip(self), fields(job_id = %job_id))]
     pub async fn deregister(&self, job_id: &JobId) -> Result<()> {
         let existing = self.get(job_id).await?;

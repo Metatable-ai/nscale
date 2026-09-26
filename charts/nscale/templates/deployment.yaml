@@ -7,6 +7,11 @@ metadata:
     app.kubernetes.io/component: app
 spec:
   replicas: {{ int .Values.replicaCount }}
+  # Avoid overlapping incompatible coordination protocols during an upgrade.
+  # Operators must still drain traffic before replacing pods.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       {{- include "nscale.selectorLabels" . | nindent 6 }}
@@ -84,6 +89,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "nscale.secretName" . }}
                   key: {{ .Values.secrets.secretKeys.consulToken }}
+            {{- end }}
+            {{- if .Values.config.admin.existingSecret }}
+            - name: NSCALE_ADMIN__TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.admin.existingSecret | quote }}
+                  key: {{ .Values.config.admin.secretKey | quote }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

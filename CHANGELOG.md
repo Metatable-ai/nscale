@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Planned release: **3.0.0**.
+
+### Added
+- Per-job autoscaling policies for running task-group capacity, with request-rate, latency, and error signals, shared cooldowns, and `/admin/autoscaling` status.
+- Per-service round-robin endpoint pools, minimum-count cold wakes, independent multi-group scaling, and aggregate Prometheus latency histograms.
+- Shared Redis request leases covering HTTP bodies and WebSocket tunnels, plus renewable job-mutation coordination and Nomad index checks.
+
+### Changed
+- Aligned all Cargo packages and Helm chart/app versions at `3.0.0`.
+- Helm app deployments use `Recreate`; bundled Redis uses `noeviction` with additional memory headroom. Added values for endpoint refresh, Prometheus, missing-job cleanup, and a separate existing Secret for admin authentication.
+- Successful `/admin/jobs` submissions replace the job’s managed service set in Redis and optional etcd, removing obsolete services and policies. Busy submissions return `409`; accepted Nomad jobs with failed registration replacement return `207` and require retry.
+- Incomplete metrics prevent capacity reductions. Replica-local latency/error samples can trigger scale-up but cannot independently authorize downscaling.
+- Wake deadlines include queue time; concurrent failing requests share a health attempt and later requests may retry.
+
+### Fixed
+- Preserve running counts after proxy restarts and allocation-stop events, isolate sibling-service health failures, and preserve endpoint rotation across refreshes.
+- Resolve proxy services by exact identity, aggregate sibling metrics without double-counting router/service traffic, and retain partial overload observations.
+- Preserve headers and request identity on empty-body GET/HEAD transport retries; retain request tracking for WebSocket tunnels and response streams.
+
+### Deployment notes
+- Follow the [2.2.x migration guide](docs/migration-autoscaling.md). Replace inherited/custom Redis `allkeys-lru` settings with the new `noeviction` default, pin the target image, and reconcile legacy multi-group registrations before reopening traffic.
+- Drain and replace older proxy replicas together; mixed versions do not share all coordination guarantees.
+- See [release readiness](docs/autoscaling-release-readiness.md) for test evidence, partial-submission recovery, operational limits, and remaining production gates.
+
 ---
 
 ## [2.2.1] - 2026-05-21

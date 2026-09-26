@@ -7,7 +7,7 @@ The `/admin/jobs` endpoint is the preferred path when you want `nscale` to own t
 1. parse Nomad HCL with optional variables
 2. inject the Traefik router service override required for warm-path routing through `nscale`
 3. submit the mutated job to Nomad
-4. auto-register every managed service in Redis, and in etcd when durable registry mode is enabled
+4. replace the job’s complete managed-service set in Redis, and in etcd when durable mode is enabled
 5. seed activity so the scaler can safely detect future idleness
 
 ## Why use `/admin/jobs`
@@ -44,8 +44,27 @@ When durable registry mode is enabled, that automatic registration becomes durab
 |---|---|---|
 | `hcl` | yes | The Nomad job file contents in HCL format |
 | `variables` | no | Optional Nomad variable assignments passed to the HCL parser |
+| `autoscaling` | no | Policy applied to every managed service; `max_count` is required when supplied |
 
 The `variables` string is forwarded to Nomad's parser exactly as provided.
+
+An optional policy can be added alongside `hcl` and `variables`:
+
+```json
+{
+  "max_count": 5,
+  "min_count": 2,
+  "scale_to_zero": false,
+  "target_requests_per_second_per_instance": 25.0
+}
+```
+
+Put this object under `autoscaling`. See the [policy reference](../README.md#per-job-autoscaling)
+for all fields. Validation runs before Nomad submission. Without a policy, the submitted job
+uses scale-to-zero behavior; omitting it on replacement removes the previous autoscaling policy.
+
+For a complete before/after payload and push command, see the
+[migration comparison](./migration-autoscaling.md#job-push-example-previous-release-versus-autoscaling-release).
 
 ## Example
 
@@ -132,10 +151,25 @@ That registration is used by:
 - idle activity seeding
 
 This is especially important when `service_name` differs from `job_id`.
-The updated registry path supports both lookup modes.
+Proxy lookup uses the exact service identity; administrative lookup also accepts the job alias.
 
 If durable registry mode is enabled, the same `JobRegistration` is also persisted in etcd so
 another replica can recover the cache later without manual per-job re-registration.
+
+## Replacing an existing job
+
+A successful submission replaces all nscale-managed registrations for that job. Services removed,
+renamed, or no longer Traefik-enabled are removed from the registry. Retained services receive the
+new policy and group mapping. Unrelated jobs are preserved. A job with no managed services is
+rejected; use the purge endpoint when removing the entire job.
+
+Submission and replacement hold the shared Nomad-job mutation lease. Redis replaces both indexes
+in one operation; durable mode first replaces the job’s etcd entries in one transaction. Local
+endpoint pools for affected units are invalidated, and current units receive an activity timestamp.
+A failed Nomad submission leaves the previous registration set intact.
+
+This replacement behavior belongs to `/admin/jobs`. Manual `/admin/registry` and
+`/admin/registry/sync` requests upsert the supplied registrations; they do not remove omitted services.
 
 ## Response shape
 
@@ -158,8 +192,16 @@ Successful responses return the submitted Nomad evaluation data plus the service
 }
 ```
 
-If Nomad submission succeeds but one or more Redis registrations fail, `nscale` returns
-`207 Multi-Status` with `registration_failures` populated.
+| Status | Meaning | Operator action |
+|---|---|---|
+| `201 Created` | Nomad accepted the job and the registration set was replaced | Check deployment and service health; acceptance does not mean allocations are healthy yet |
+| `409 Conflict` | Another mutation owns the job lease; this request has not submitted to Nomad | Retry with backoff |
+| `207 Multi-Status` | Nomad accepted the job, but registration replacement failed | Inspect `registration_failures`, restore the failing store, and resubmit the same desired job and policy |
+
+Nomad, etcd, and Redis do not share a transaction. In particular, etcd may contain the replacement
+while Redis still holds the previous set if the cache write fails. A successful retry reconciles
+both stores. Do not interpret `207` as a completed deployment or assume a process restart prunes
+stale registrations.
 
 ## Direct Nomad submit vs `/admin/jobs`
 
@@ -210,7 +252,7 @@ If you need variableized names, keep block labels literal and apply variables in
 
 ## Validation and regression coverage
 
-The repository now covers this flow in both environments:
+Available Docker and Kubernetes integration scripts include:
 
 - `integration/test.sh`
 - `integration/test-acl.sh`
@@ -231,3 +273,8 @@ The durable integration tests verify that:
 - registrations survive Redis cache loss when etcd is available
 - a second nscale replica can read through to etcd and repopulate Redis
 - service lookup still works when `service_name != job_id`
+
+The current [release evidence](./autoscaling-release-readiness.md) distinguishes scripts run on
+the latest changes from earlier passes. The latest durable test also renames a service and checks
+removal from both stores. Opt-in Rust tests cover removed sibling policies, rejected/busy
+submissions, preservation of unrelated jobs, and cache restoration.

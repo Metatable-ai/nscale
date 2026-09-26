@@ -55,11 +55,46 @@ If you already have an external etcd cluster, leave `etcd.enabled=false` and pro
 
 ## Upgrade
 
-```bash
-helm upgrade nscale ./charts/nscale \
-  --namespace nscale \
-  --reuse-values
+For the autoscaling update from 2.2.x, use the [migration runbook](../../docs/migration-autoscaling.md).
+The app deployment now uses `Recreate`. For this major upgrade, externally drain,
+stop all old app pods, apply the reviewed values with `replicaCount=0`, then start only the new image.
+
+Pin `image.tag`; an empty tag uses `Chart.appVersion`, now `3.0.0`. Verify the release artifact
+is available before deployment. `Recreate` prevents overlapping versions in this Deployment;
+it does not drain requests or stop proxies in other Deployments. Keep the explicit maintenance cutover.
+
+The bundled Redis now defaults to `noeviction`, with a 100 MB data budget and a 256 MiB container
+limit for headroom. Monitor memory and rejected writes. Existing custom `redis.config` values are
+not rewritten: replace inherited `allkeys-lru` settings. Changing this config restarts Redis, so
+back up registrations first. Persistence remains disabled by default with `dir /tmp`; enabling
+the PVC at `/data` alone does not make that config persistent.
+
+### Autoscaling release settings
+
+```yaml
+image:
+  tag: "3.0.0"
+config:
+  proxy:
+    endpointRefreshSecs: 2
+  admin:
+    existingSecret: nscale-admin
+    secretKey: token
+  scaling:
+    autoDeregister:
+      enabled: true
+      notFoundThreshold: 5
+externalServices:
+  prometheus:
+    url: http://prometheus.monitoring.svc.cluster.local:9090
+    timeoutSecs: 5
 ```
+
+Prometheus is omitted when its URL is empty. Admin authentication is unset unless the existing
+Secret is configured (or supplied via `extraEnv`). The Secret is separate from Nomad/Consul ACL
+credentials, and the chart does not create or embed its token. Health and metrics endpoints remain
+public. Avoid duplicate admin-token environment variables when moving from `extraEnv` to these values.
+Autoscaling policies themselves remain per-job registration payloads, not Helm values.
 
 ## Uninstall
 
@@ -107,6 +142,14 @@ For production, reusing an externally managed Secret is the safer pattern.
 | Value | Purpose | Default |
 |-------|---------|---------|
 | `replicaCount` | Number of `nscale` pods | `1` |
+| `image.tag` | Image tag; empty uses chart appVersion | `3.0.0` via appVersion |
+| `config.proxy.endpointRefreshSecs` | Service endpoint pool refresh interval | `2` |
+| `config.admin.existingSecret` | Existing Secret containing the admin bearer token | `""` |
+| `config.admin.secretKey` | Key in the admin Secret | `token` |
+| `config.scaling.autoDeregister.enabled` | Enable missing-job cleanup | `true` |
+| `config.scaling.autoDeregister.notFoundThreshold` | Missing-job observations before cleanup | `5` |
+| `externalServices.prometheus.url` | Aggregate metrics query URL | `""` |
+| `externalServices.prometheus.timeoutSecs` | Prometheus query timeout | `5` |
 | `image.repository` | nscale image repository | `ghcr.io/metatable-ai/nscale` |
 | `externalServices.nomad.addr` | Nomad HTTP API base URL | `http://nomad.default.svc.cluster.local:4646` |
 | `externalServices.consul.addr` | Consul HTTP API base URL | `http://consul.default.svc.cluster.local:8500` |
