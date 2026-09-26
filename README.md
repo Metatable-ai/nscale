@@ -574,7 +574,8 @@ policy in `config/default.toml`.
 If a registration has an `autoscaling` policy, the autoscaler evaluates that job periodically and
 scales its Nomad task group between `min_count` and `max_count`. The autoscaler does not wake jobs
 from zero and does not scale jobs to zero; wake-on-request and idle scale-down keep owning the
-`0 ↔ 1` transitions.
+zero transitions. A cold request wakes an enabled policy directly to `min_count`
+(default `1`); a cache miss or proxy restart preserves an already-running count.
 
 Policy fields:
 
@@ -582,7 +583,7 @@ Policy fields:
 |-------|---------|-------------|
 | `max_count` | required | Hard cap for this job's autoscaled task-group count |
 | `enabled` | `true` | Disable this job's autoscaling policy without removing it |
-| `min_count` | `1` | Minimum nonzero count while autoscaling a running job |
+| `min_count` | `1` | Minimum running count and cold-wake count; must be at least `1` |
 | `scale_to_zero` | `true` | Whether idle scale-down may still scale this job to zero |
 | `scale_up_step` | `1` | Maximum instances added in one autoscale decision |
 | `scale_down_step` | `1` | Maximum instances removed in one autoscale decision |
@@ -602,6 +603,29 @@ admin `/metrics` endpoint.
 > scales independently. Internally the scale-to-zero unit is the job id for
 > single-group jobs (unchanged, no data migration) and a `job_id/group` composite
 > for multi-group jobs.
+
+Healthy backend endpoints are cached **per service**, selected round-robin, and refreshed every
+`proxy.endpoint_refresh_secs` (default `2`, environment: `NSCALE_PROXY__ENDPOINT_REFRESH_SECS`).
+Allocation-stop events invalidate discovery without resetting the group's desired count.
+
+Services sharing a group contribute their request rates to one decision. Latency/error checks use
+the worst service signal; absent required observations block reductions while known overload can
+still trigger scale-up. Router traffic is preferred
+when present, with service traffic as a fallback, so the same request is not counted twice.
+
+Wake, autoscaling, and idle scale-down share renewable Redis mutation leases per Nomad job.
+Scaling writes enforce Nomad's job modification index and abandon stale decisions. In-flight request
+leases are shared across proxy replicas and remain active through response-body completion or client
+disconnection. Request leases refresh at most every five seconds and expire after thirty seconds
+without renewal. New requests return `503` when Redis admission fails; reductions and unforced purge
+are blocked when shared request state cannot be read.
+
+Drain and replace older proxy replicas together when introducing this coordination protocol:
+older versions do not publish shared request leases and cannot participate in these guarantees.
+
+Configure application graceful shutdown and Nomad `shutdown_delay`/`kill_timeout` for the supported
+request duration. Discovery refresh and distributed request guards reduce disruption but cannot make
+arbitrary application termination or network partitions lossless.
 
 ### Manual purge endpoint
 
@@ -628,6 +652,22 @@ when the job still exists but was submitted outside `nscale` and just needs to b
 ```bash
 cargo nextest run --workspace
 ```
+
+### Autoscaling release regressions
+
+```bash
+# Builds a disposable two-proxy Nomad/Consul/Redis/Traefik stack.
+bash integration/test-autoscaling-regressions.sh
+
+# Isolated Redis component tests (requires an independently started test Redis).
+NSCALE_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo nextest run -p nscale-store --test coordination --run-ignored only
+```
+
+The release regressions check allocation IDs in HTTP responses, minimum-count cold wake,
+replica preservation across proxy restarts and allocation stops, cross-proxy streaming protection,
+and metric-driven up/down scaling. They require free integration ports, including `18081` and
+`19091`, and refuse to take over another Compose project's `nscale-net` network.
 
 ### Integration / stress tests (k6)
 
@@ -672,10 +712,11 @@ cd integration
 ./test-autoscaling-prometheus.sh
 ```
 
-This uses `docker-compose.prometheus.yml` to add a Prometheus service without changing the default
-integration stack. Prometheus scrapes Traefik `/metrics` and nscale `/metrics`; nscale runs with
-`NSCALE_PROMETHEUS__URL=http://prometheus:9090`, and the test verifies autoscaling still scales up
-within `max_count` and returns to zero.
+This uses `docker-compose.prometheus.yml` to add Prometheus and a second proxy without changing
+the default integration stack. Prometheus scrapes Traefik and both proxies; nscale runs with
+`NSCALE_PROMETHEUS__URL=http://prometheus:9090`. The test checks real latency histogram buckets
+from both proxies and their aggregated p95, then verifies autoscaling stays within `max_count`
+and returns to zero. The second proxy uses local ports `18081` and `19091`.
 
 For the full operational lifecycle test, run:
 

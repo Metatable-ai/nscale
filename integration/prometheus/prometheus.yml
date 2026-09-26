@@ -14,3 +14,4 @@ scrape_configs:
     static_configs:
       - targets:
           - nscale:9090
+          - nscale-peer:9090

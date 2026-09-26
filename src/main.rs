@@ -95,9 +95,7 @@ async fn main() {
 
     info!("nscale — Nomad Scale-to-Zero starting");
 
-    let prometheus_handle = PrometheusBuilder::new()
-        .install_recorder()
-        .expect("failed to install Prometheus metrics recorder");
+    let prometheus_handle = install_metrics_recorder();
 
     // ── Config ───────────────────────────────────────────
     let config = Config::load().unwrap_or_else(|e| {
@@ -184,12 +182,16 @@ async fn main() {
             .expect("failed to create Consul client"),
     );
 
-    let coordinator = Arc::new(WakeCoordinator::new(
-        nomad_client.clone(),
-        consul_client.clone(),
-        config.nomad.concurrency,
-        config.scaling.wake_timeout(),
-    ));
+    let coordinator = Arc::new(
+        WakeCoordinator::new(
+            nomad_client.clone(),
+            consul_client.clone(),
+            config.nomad.concurrency,
+            config.scaling.wake_timeout(),
+        )
+        .with_activity_store(activity_store.clone())
+        .with_endpoint_refresh(Duration::from_secs(config.proxy.endpoint_refresh_secs)),
+    );
 
     let http_client = reqwest::Client::builder()
         .pool_max_idle_per_host(100)
@@ -468,7 +470,9 @@ impl MetricsProvider for ProxyNativeMetricsProvider {
         registration: &JobRegistration,
         window: Duration,
     ) -> NscaleResult<MetricSnapshot> {
-        let snapshot = self.metrics.snapshot(&registration.job_id, window);
+        let snapshot =
+            self.metrics
+                .snapshot(&registration.job_id, &registration.service_name, window);
         Ok(MetricSnapshot {
             request_rate_rps: None,
             p95_latency_ms: snapshot.p95_latency_ms,
@@ -478,6 +482,7 @@ impl MetricsProvider for ProxyNativeMetricsProvider {
                 Some(snapshot.error_count as f64 / snapshot.request_count as f64)
             },
             in_flight: None,
+            ..Default::default()
         })
     }
 }
@@ -529,6 +534,22 @@ struct AutoscalingJobStatus {
 struct DeleteJobQuery {
     #[serde(default)]
     force: bool,
+}
+
+fn install_metrics_recorder() -> PrometheusHandle {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "nscale_proxy_request_duration_seconds".into(),
+            ),
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.5,
+                5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+            ],
+        )
+        .expect("request latency buckets must be nonempty")
+        .install_recorder()
+        .expect("failed to install Prometheus metrics recorder")
 }
 
 async fn healthz() -> &'static str {
@@ -610,14 +631,12 @@ async fn cleanup_admin_job_state(
 ) -> Result<Vec<String>, NscaleError> {
     let mut warnings = Vec::new();
 
-    state.coordinator.mark_dormant(&ScaleUnit(job_id.0.clone()));
-
-    if let Err(e) = state
-        .activity_store
-        .remove_activity(&ScaleUnit(job_id.0.clone()))
-        .await
-    {
-        warnings.push(format!("failed to remove activity: {e}"));
+    let units = job_scale_units(&state.registry, job_id).await?;
+    for unit in units {
+        state.coordinator.mark_dormant(&unit);
+        if let Err(e) = state.activity_store.remove_activity(&unit).await {
+            warnings.push(format!("failed to remove activity for {unit}: {e}"));
+        }
     }
 
     state.registry.deregister(job_id).await?;
@@ -629,15 +648,43 @@ async fn cleanup_admin_job_state(
     Ok(warnings)
 }
 
+async fn job_scale_units(registry: &JobRegistry, job_id: &JobId) -> NscaleResult<Vec<ScaleUnit>> {
+    let mut units = BTreeSet::from([job_id.0.clone()]);
+    for reg in registry.list_all().await? {
+        if reg.job_id == *job_id {
+            units.insert(reg.scale_unit_key().0);
+        }
+    }
+    Ok(units.into_iter().map(ScaleUnit).collect())
+}
+
 async fn admin_purge_job(
     State(state): State<AdminState>,
     Path(job_id): Path<String>,
     Query(query): Query<DeleteJobQuery>,
 ) -> impl IntoResponse {
     let job_id = JobId(job_id);
-    let in_flight = state.in_flight.count(&job_id.0);
+    let units = match job_scale_units(&state.registry, &job_id).await {
+        Ok(units) => units,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    let in_flight: usize = units
+        .iter()
+        .map(|unit| state.in_flight.count(&unit.0))
+        .sum();
 
-    if in_flight > 0 && !query.force {
+    let mut shared_in_flight = 0;
+    if !query.force {
+        for unit in &units {
+            match state.activity_store.active_requests(unit).await {
+                Ok(count) => shared_in_flight += count,
+                Err(error) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+                }
+            }
+        }
+    }
+    if (in_flight > 0 || shared_in_flight > 0) && !query.force {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1065,6 +1112,22 @@ mod autoscaling_admin_tests {
         assert_eq!(
             send(open, "/admin/x", None).await.unwrap().status(),
             StatusCode::OK
+        );
+    }
+    #[tokio::test]
+    async fn exported_latency_has_histogram_buckets_for_prometheus() {
+        let handle = install_metrics_recorder();
+        let metrics = ProxyMetrics::new();
+        metrics.record_request(
+            &JobId("api".into()),
+            &ServiceName("api".into()),
+            200,
+            Duration::from_millis(250),
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("nscale_proxy_request_duration_seconds_bucket{"),
+            "the configured Prometheus latency query needs buckets, but the exporter produced:\n{rendered}"
         );
     }
 }

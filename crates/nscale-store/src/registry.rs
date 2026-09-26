@@ -148,6 +148,31 @@ impl JobRegistry {
         }
     }
 
+    /// Resolve a proxy Host by service identity, without consulting job aliases.
+    pub async fn get_by_service_name(
+        &self,
+        service: &ServiceName,
+    ) -> Result<Option<JobRegistration>> {
+        if let Some(reg) = self
+            .get_from_hash(REGISTRY_BY_SERVICE_KEY, &service.0)
+            .await?
+        {
+            return Ok(Some(reg));
+        }
+        if let Some(durable) = &self.durable
+            && let Some(reg) = durable.get_by_service_name(service).await?
+        {
+            self.cache_registration(&reg).await?;
+            return Ok(Some(reg));
+        }
+        // Older caches may only have the job hash. Accept an exact service
+        // identity there, never a different service stored under the same job ID.
+        Ok(self
+            .get_from_hash(REGISTRY_BY_JOB_KEY, &service.0)
+            .await?
+            .filter(|reg| reg.service_name == *service))
+    }
+
     pub async fn get(&self, lookup: &JobId) -> Result<Option<JobRegistration>> {
         match self
             .get_from_hash(REGISTRY_BY_JOB_KEY, lookup.0.as_str())

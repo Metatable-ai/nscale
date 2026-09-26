@@ -23,3 +23,14 @@ services:
     depends_on:
       prometheus:
         condition: service_healthy
+
+  nscale-peer:
+    extends:
+      file: docker-compose.autoscale-regressions.yml
+      service: nscale-peer
+    environment:
+      NSCALE_PROMETHEUS__URL: http://prometheus:9090
+      NSCALE_PROMETHEUS__TIMEOUT_SECS: 5
+    depends_on:
+      nscale:
+        condition: service_healthy

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration test for nscale multi-group scale-to-zero.
 #
-# A single Nomad job ("multi-group-s2z") exposes two independent task groups
+# A single Nomad job ("mg-alpha") exposes two independent task groups
 # ("alpha" and "beta"), each with its own Consul service and Traefik router.
 # nscale must scale, idle-detect, and wake each GROUP independently.
 #
@@ -19,7 +19,9 @@ NOMAD_ADDR="http://localhost:4646"
 NSCALE_PROXY="http://localhost:80"
 NSCALE_ADMIN="http://localhost:9090"
 
-JOB_ID="multi-group-s2z"
+# Deliberately match the alpha service name: registering beta must not shadow it
+# through the registry's legacy job-ID alias.
+JOB_ID="mg-alpha"
 ALPHA_GROUP="alpha"
 BETA_GROUP="beta"
 ALPHA_SVC="mg-alpha"

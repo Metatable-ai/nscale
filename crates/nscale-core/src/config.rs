@@ -143,6 +143,8 @@ impl PrometheusConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
+    #[serde(default = "default_endpoint_refresh")]
+    pub endpoint_refresh_secs: u64,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
     #[serde(default = "default_request_buffer_size")]
@@ -201,6 +203,10 @@ fn default_auto_deregister_enabled() -> bool {
 fn default_auto_deregister_not_found_threshold() -> u32 {
     5
 }
+fn default_endpoint_refresh() -> u64 {
+    2
+}
+
 fn default_request_timeout() -> u64 {
     30
 }
@@ -251,6 +257,7 @@ impl Default for Config {
                 auto_deregister: AutoDeregisterConfig::default(),
             },
             proxy: ProxyConfig {
+                endpoint_refresh_secs: default_endpoint_refresh(),
                 request_timeout_secs: default_request_timeout(),
                 request_buffer_size: default_request_buffer_size(),
             },

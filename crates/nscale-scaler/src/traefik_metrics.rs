@@ -80,7 +80,10 @@ impl MetricsProvider for TraefikMetricsProvider {
             .await
             .map_err(|e| NscaleError::Consul(format!("failed to read metrics body: {e}")))?;
 
-        let counters = parse_traefik_request_counters_for_labels(&body, &labels);
+        let Some(counters) = selected_counters(&body, &labels) else {
+            self.last_samples.lock().await.remove(&sample_key);
+            return Ok(MetricSnapshot::default());
+        };
         let current = TraefikCounterSample {
             total: counters.total,
             errors: counters.errors,
@@ -105,6 +108,41 @@ impl MetricsProvider for TraefikMetricsProvider {
 
         Ok(calculate_window_snapshot(samples, window).unwrap_or_default())
     }
+}
+
+fn selected_counters(body: &str, labels: &[String]) -> Option<TraefikCounters> {
+    // Prefer one instrumentation layer; gauges and unrelated metric families
+    // cannot establish the presence of a request counter.
+    for family in [
+        "traefik_router_requests_total{",
+        "traefik_service_requests_total{",
+    ] {
+        let lines: Vec<_> = body
+            .lines()
+            .filter(|line| {
+                line.starts_with(family)
+                    && labels
+                        .iter()
+                        .any(|label| line.contains(&format!("=\"{label}\"")))
+            })
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        if lines.iter().any(|line| {
+            !line
+                .rsplit_once(' ')
+                .and_then(|(_, v)| v.parse::<f64>().ok())
+                .is_some_and(|v| v.is_finite() && v >= 0.0)
+        }) {
+            return None;
+        }
+        return Some(parse_traefik_request_counters_for_labels(
+            &lines.join("\n"),
+            labels,
+        ));
+    }
+    None
 }
 
 fn metric_labels_for_registration(registration: &JobRegistration, provider: &str) -> Vec<String> {
@@ -208,6 +246,7 @@ pub fn calculate_snapshot(
             error_delta as f64 / total_delta as f64
         }),
         in_flight: None,
+        ..Default::default()
     })
 }
 
@@ -361,5 +400,34 @@ traefik_router_requests_total{code="200",method="GET",protocol="http",router="ot
 
         assert_eq!(snapshot.request_rate_rps, Some(0.0));
         assert_eq!(snapshot.error_rate, Some(0.0));
+    }
+    #[test]
+    fn selects_one_counter_layer_and_distinguishes_missing_from_zero() {
+        let labels = vec!["api@consulcatalog".to_string()];
+        let both = "traefik_router_requests_total{router=\"api@consulcatalog\",code=\"200\"} 100\ntraefik_service_requests_total{service=\"api@consulcatalog\",code=\"200\"} 100";
+        assert_eq!(selected_counters(both, &labels).unwrap().total, 100);
+        assert!(
+            selected_counters(
+                "traefik_service_open_connections{service=\"api@consulcatalog\"} 0",
+                &labels
+            )
+            .is_none()
+        );
+        assert_eq!(
+            selected_counters(
+                "traefik_service_requests_total{service=\"api@consulcatalog\",code=\"200\"} 0",
+                &labels
+            )
+            .unwrap()
+            .total,
+            0
+        );
+        assert!(
+            selected_counters(
+                "traefik_service_requests_total{service=\"api@consulcatalog\"} NaN",
+                &labels
+            )
+            .is_none()
+        );
     }
 }

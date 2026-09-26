@@ -24,11 +24,13 @@ pub struct ProxyMetricSnapshot {
     pub error_count: u64,
 }
 
+type RequestSamples = HashMap<(String, String), VecDeque<RequestSample>>;
+
 #[derive(Clone, Default)]
 pub struct ProxyMetrics {
     // ponytail: one global lock guarding all jobs; shard by job_id only if this
     // becomes a measured contention point.
-    requests: Arc<Mutex<HashMap<String, VecDeque<RequestSample>>>>,
+    requests: Arc<Mutex<RequestSamples>>,
     last_sweep: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -44,7 +46,7 @@ impl ProxyMetrics {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, VecDeque<RequestSample>>> {
+    fn lock(&self) -> MutexGuard<'_, RequestSamples> {
         // Recover from a poisoned lock instead of cascading panics: a panic in
         // one request thread must not take down all metric recording.
         self.requests.lock().unwrap_or_else(|e| e.into_inner())
@@ -116,7 +118,9 @@ impl ProxyMetrics {
         .record(duration.as_secs_f64());
 
         let mut requests = self.lock();
-        let samples = requests.entry(job_id.0.clone()).or_default();
+        let samples = requests
+            .entry((job_id.0.clone(), service_name.0.clone()))
+            .or_default();
         samples.push_back(RequestSample {
             status,
             duration,
@@ -125,7 +129,12 @@ impl ProxyMetrics {
         prune_samples(samples, observed_at);
     }
 
-    pub fn snapshot(&self, job_id: &JobId, window: Duration) -> ProxyMetricSnapshot {
+    pub fn snapshot(
+        &self,
+        job_id: &JobId,
+        service_name: &ServiceName,
+        window: Duration,
+    ) -> ProxyMetricSnapshot {
         let now = Instant::now();
         // On underflow (window reaches before process start) keep every sample,
         // matching how pruning treats the same case.
@@ -150,7 +159,7 @@ impl ProxyMetrics {
             });
         }
 
-        let Some(samples) = requests.get(&job_id.0) else {
+        let Some(samples) = requests.get(&(job_id.0.clone(), service_name.0.clone())) else {
             return ProxyMetricSnapshot::default();
         };
 
@@ -219,7 +228,7 @@ mod tests {
             metrics.record_request(&job_id, &service_name, 200, Duration::from_millis(millis));
         }
 
-        let snapshot = metrics.snapshot(&job_id, Duration::from_secs(60));
+        let snapshot = metrics.snapshot(&job_id, &service_name, Duration::from_secs(60));
 
         assert_eq!(snapshot.p95_latency_ms, Some(500.0));
         assert_eq!(snapshot.request_count, 5);
@@ -241,7 +250,7 @@ mod tests {
         );
         metrics.record_request(&job_id, &service_name, 500, Duration::from_millis(250));
 
-        let snapshot = metrics.snapshot(&job_id, Duration::from_secs(60));
+        let snapshot = metrics.snapshot(&job_id, &service_name, Duration::from_secs(60));
 
         assert_eq!(snapshot.p95_latency_ms, Some(250.0));
         assert_eq!(snapshot.request_count, 1);
@@ -265,7 +274,7 @@ mod tests {
         );
         metrics.record_request_at(&job_id, &service_name, 200, Duration::from_millis(20), now);
 
-        let snapshot = metrics.snapshot(&job_id, Duration::from_secs(3600));
+        let snapshot = metrics.snapshot(&job_id, &service_name, Duration::from_secs(3600));
         assert_eq!(snapshot.request_count, 1);
     }
 
@@ -285,7 +294,27 @@ mod tests {
         assert_eq!(metrics.tracked_jobs(), 1);
 
         // Any snapshot sweeps whole-map stale entries, bounding the key set.
-        let _ = metrics.snapshot(&JobId("other".into()), Duration::from_secs(60));
+        let _ = metrics.snapshot(
+            &JobId("other".into()),
+            &service_name,
+            Duration::from_secs(60),
+        );
         assert_eq!(metrics.tracked_jobs(), 0);
+    }
+
+    #[test]
+    fn services_in_same_job_do_not_mix_latency_or_errors() {
+        let metrics = ProxyMetrics::new();
+        metrics.record_request(
+            &"api".into(),
+            &"fast".into(),
+            200,
+            Duration::from_millis(10),
+        );
+        metrics.record_request(&"api".into(), &"slow".into(), 500, Duration::from_secs(1));
+        let fast = metrics.snapshot(&"api".into(), &"fast".into(), Duration::from_secs(60));
+        assert_eq!(fast.p95_latency_ms, Some(10.0));
+        assert_eq!(fast.error_count, 0);
+        assert_eq!(fast.request_count, 1);
     }
 }

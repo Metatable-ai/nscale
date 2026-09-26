@@ -162,6 +162,9 @@ pub struct JobAutoscalingPolicy {
 
 impl JobAutoscalingPolicy {
     pub fn validate(&self) -> Result<(), String> {
+        if self.min_count == 0 {
+            return Err("autoscaling min_count must be at least one".into());
+        }
         if self.max_count < self.min_count {
             return Err("autoscaling max_count must be greater than or equal to min_count".into());
         }

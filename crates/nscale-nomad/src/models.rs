@@ -46,6 +46,8 @@ pub struct JobStopResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ScaleRequest {
+    pub enforce_index: bool,
+    pub job_modify_index: u64,
     pub count: Option<u32>,
     pub target: ScaleTarget,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +64,8 @@ pub struct ScaleTarget {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Job {
+    #[serde(default)]
+    pub job_modify_index: u64,
     #[serde(rename = "ID")]
     pub id: String,
     pub name: String,

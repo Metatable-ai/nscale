@@ -1,11 +1,20 @@
 use nscale_core::job::JobAutoscalingPolicy;
 
 #[derive(Debug, Clone, Default)]
+pub struct IncompleteMetrics {
+    pub request_rate: bool,
+    pub latency: bool,
+    pub error_rate: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MetricSnapshot {
     pub request_rate_rps: Option<f64>,
     pub p95_latency_ms: Option<f64>,
     pub error_rate: Option<f64>,
     pub in_flight: Option<u64>,
+    /// Known values remain useful for scale-up even if some services are missing.
+    pub incomplete: IncompleteMetrics,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -29,6 +38,16 @@ pub fn decide_autoscale(
     metrics: &MetricSnapshot,
     downscale_blocked: bool,
 ) -> AutoscaleDecision {
+    if !policy.enabled || policy.validate().is_err() || current_count == 0 {
+        return no_change(current_count, "inactive-or-invalid-policy");
+    }
+    let missing_target = (policy.target_requests_per_second_per_instance.is_some()
+        && (metrics.request_rate_rps.is_none() || metrics.incomplete.request_rate))
+        || (policy.target_p95_latency_ms.is_some()
+            && (metrics.p95_latency_ms.is_none() || metrics.incomplete.latency))
+        || (policy.max_error_rate.is_some()
+            && (metrics.error_rate.is_none() || metrics.incomplete.error_rate));
+    let downscale_blocked = downscale_blocked || missing_target;
     let mut raw_desired: Option<u32> = None;
     let mut reasons = Vec::new();
 
@@ -47,7 +66,7 @@ pub fn decide_autoscale(
             raw_desired = Some(
                 raw_desired
                     .unwrap_or(current_count)
-                    .max(current_count + policy.scale_up_step),
+                    .max(current_count.saturating_add(policy.scale_up_step)),
             );
         } else {
             raw_desired = Some(
@@ -61,7 +80,11 @@ pub fn decide_autoscale(
 
     if let (Some(error_rate), Some(max_error_rate)) = (metrics.error_rate, policy.max_error_rate) {
         if error_rate > max_error_rate {
-            raw_desired = Some(raw_desired.unwrap_or(current_count).max(current_count + 1));
+            raw_desired = Some(
+                raw_desired
+                    .unwrap_or(current_count)
+                    .max(current_count.saturating_add(1)),
+            );
         } else {
             raw_desired = Some(
                 raw_desired
@@ -153,6 +176,7 @@ mod tests {
                 p95_latency_ms: None,
                 error_rate: None,
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -176,6 +200,7 @@ mod tests {
                 p95_latency_ms: None,
                 error_rate: None,
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -196,6 +221,7 @@ mod tests {
                 p95_latency_ms: Some(100.0),
                 error_rate: Some(0.0),
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -214,6 +240,7 @@ mod tests {
                 p95_latency_ms: Some(100.0),
                 error_rate: Some(0.0),
                 in_flight: Some(1),
+                ..Default::default()
             },
             true,
         );
@@ -232,6 +259,7 @@ mod tests {
                 p95_latency_ms: Some(900.0),
                 error_rate: None,
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -251,6 +279,7 @@ mod tests {
                 p95_latency_ms: None,
                 error_rate: None,
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -273,6 +302,7 @@ mod tests {
                 p95_latency_ms: Some(100.0),
                 error_rate: None,
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -296,6 +326,7 @@ mod tests {
                 p95_latency_ms: None,
                 error_rate: Some(0.0),
                 in_flight: None,
+                ..Default::default()
             },
             false,
         );
@@ -303,5 +334,41 @@ mod tests {
         assert_eq!(decision.desired_count, 2);
         assert_eq!(decision.direction, AutoscaleDirection::Down);
         assert!(decision.reason.contains("error-rate"));
+    }
+
+    #[test]
+    fn missing_load_signal_cannot_be_overridden_by_healthy_latency() {
+        let result = decide_autoscale(
+            &policy(),
+            4,
+            &MetricSnapshot {
+                p95_latency_ms: Some(10.0),
+                error_rate: Some(0.0),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(result.desired_count, 4);
+    }
+
+    #[test]
+    fn zero_minimum_is_rejected_and_never_emits_zero() {
+        let mut p = policy();
+        p.min_count = 0;
+        p.scale_to_zero = false;
+        assert!(p.validate().is_err());
+        assert_eq!(
+            decide_autoscale(
+                &p,
+                1,
+                &MetricSnapshot {
+                    request_rate_rps: Some(0.0),
+                    ..Default::default()
+                },
+                false
+            )
+            .desired_count,
+            1
+        );
     }
 }

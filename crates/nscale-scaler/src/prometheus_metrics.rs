@@ -68,15 +68,16 @@ impl MetricsProvider for PrometheusMetricsProvider {
     ) -> Result<MetricSnapshot> {
         let regex = label_regex_for_registration(registration, &self.provider);
         let escaped_job = escape_label_value(&registration.job_id.0);
+        let escaped_service = escape_label_value(&registration.service_name.0);
         let range = prometheus_window(window);
 
         let request_rate_query = traefik_request_rate_query(&regex, &range, None);
         let error_count_query = traefik_request_rate_query(&regex, &range, Some("5.."));
         let error_rate_query = format!(
-            "({error_count_query}) / clamp_min(({request_rate_query}), {ERROR_RATE_DENOMINATOR_FLOOR})"
+            "(({error_count_query}) or vector(0)) / clamp_min(({request_rate_query}), {ERROR_RATE_DENOMINATOR_FLOOR})"
         );
         let latency_query = format!(
-            "histogram_quantile(0.95, sum by (le) (rate(nscale_proxy_request_duration_seconds_bucket{{job_id=\"{escaped_job}\"}}[{range}]))) * 1000"
+            "histogram_quantile(0.95, sum by (le) (rate(nscale_proxy_request_duration_seconds_bucket{{job_id=\"{escaped_job}\",service_name=\"{escaped_service}\"}}[{range}]))) * 1000"
         );
 
         // The three queries are independent; run them concurrently to keep the
@@ -92,6 +93,7 @@ impl MetricsProvider for PrometheusMetricsProvider {
             p95_latency_ms,
             error_rate,
             in_flight: None,
+            ..Default::default()
         })
     }
 }
@@ -102,7 +104,7 @@ fn traefik_request_rate_query(regex: &str, range: &str, code_filter: Option<&str
         .unwrap_or_default();
 
     format!(
-        "(sum(rate(traefik_router_requests_total{{router=~\"{regex}\"{code_matcher}}}[{range}])) or vector(0)) + (sum(rate(traefik_service_requests_total{{service=~\"{regex}\"{code_matcher}}}[{range}])) or vector(0))"
+        "sum(rate(traefik_router_requests_total{{router=~\"{regex}\"{code_matcher}}}[{range}])) or sum(rate(traefik_service_requests_total{{service=~\"{regex}\"{code_matcher}}}[{range}]))"
     )
 }
 
@@ -248,10 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn traefik_request_query_zero_fills_missing_router_or_service_metrics() {
+    fn traefik_request_query_preserves_missing_and_prefers_router_metrics() {
         let query = traefik_request_rate_query("api@consulcatalog", "60s", None);
 
-        assert!(query.contains("or vector(0)"));
+        assert!(!query.contains("or vector(0)"));
+        assert!(!query.contains(" + "));
         assert!(query.contains("traefik_router_requests_total"));
         assert!(query.contains("traefik_service_requests_total"));
         assert!(!query.contains("clamp_min"));
@@ -262,13 +265,12 @@ mod tests {
         let request_rate_query = traefik_request_rate_query("api@consulcatalog", "60s", None);
         let error_count_query = traefik_request_rate_query("api@consulcatalog", "60s", Some("5.."));
         let error_rate_query = format!(
-            "({error_count_query}) / clamp_min(({request_rate_query}), {ERROR_RATE_DENOMINATOR_FLOOR})"
+            "(({error_count_query}) or vector(0)) / clamp_min(({request_rate_query}), {ERROR_RATE_DENOMINATOR_FLOOR})"
         );
 
         assert!(error_rate_query.contains("code=~\"5..\""));
         assert!(error_rate_query.contains("clamp_min("));
         assert!(error_rate_query.contains(ERROR_RATE_DENOMINATOR_FLOOR));
-        assert!(!error_rate_query.contains("clamp_min((sum"));
         assert!(!error_rate_query.contains(", 1)"));
     }
 

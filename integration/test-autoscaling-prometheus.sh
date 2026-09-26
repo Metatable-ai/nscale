@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PROM_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.prometheus.yml"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-integration}"
 ECHO_JOB_FILE="$SCRIPT_DIR/jobs/autoscale-echo.nomad"
 TRAEFIK_CERT_SCRIPT="$SCRIPT_DIR/traefik/certs/generate.sh"
 
@@ -42,6 +43,8 @@ dc() {
 
 cleanup() {
     local exit_code=$?
+    [ -z "${LOAD_PID:-}" ] || kill "$LOAD_PID" 2>/dev/null || true
+    [ -z "${COUNT_MONITOR_PID:-}" ] || kill "$COUNT_MONITOR_PID" 2>/dev/null || true
 
     if [ "$exit_code" -ne 0 ]; then
         info "Prometheus autoscaling integration failed; collecting diagnostics..."
@@ -418,8 +421,9 @@ force_scale_to_zero "$JOB_ID"
 
 info "Driving traffic through Traefik while Prometheus scrapes metrics..."
 start_count_ceiling_monitor "$JOB_ID" 3 140
-run_k6_autoscale "$SERVICE_NAME" 14 90s
-wait "$COUNT_MONITOR_PID"
+run_k6_autoscale "$SERVICE_NAME" 14 90s &
+LOAD_PID=$!
+# Check rates while traffic is still running, not after the 30s window expired.
 
 wait_for_prometheus_vector_value \
     "Traefik request rate for ${SERVICE_NAME}" \
@@ -431,11 +435,33 @@ wait_for_prometheus_vector_value \
     'sum(rate(nscale_proxy_requests_total[30s])) or vector(0)' \
     90
 
+# Populate the same service's histogram on another proxy. Verify the exported
+# buckets, including both instance labels, before using the production p95 query.
+for _ in $(seq 1 20); do
+    curl -fsS --max-time 30 -H "Host: ${SERVICE_NAME}.localhost" http://localhost:18081/ >/dev/null
+    sleep 0.25 # span multiple scrape intervals so the peer has a rate sample
+done
+wait_for_prometheus_vector_value \
+    "latency histograms from both proxies" \
+    "count(sum by (instance) (nscale_proxy_request_duration_seconds_bucket{job_id=\"${JOB_ID}\",service_name=\"${SERVICE_NAME}\",le=\"+Inf\"})) == 2" \
+    30
+wait_for_prometheus_vector_value \
+    "positive request rates from both proxies" \
+    "count(sum by (instance) (rate(nscale_proxy_request_duration_seconds_count{job_id=\"${JOB_ID}\",service_name=\"${SERVICE_NAME}\"}[30s])) > 0) == 2" \
+    30
+wait_for_prometheus_vector_value \
+    "aggregated proxy p95 latency" \
+    "histogram_quantile(0.95, sum by (le) (rate(nscale_proxy_request_duration_seconds_bucket{job_id=\"${JOB_ID}\",service_name=\"${SERVICE_NAME}\"}[30s]))) * 1000" \
+    30
+
 wait_for_job_count_at_least "$JOB_ID" 2 120
 pass "Prometheus-backed request-rate autoscaling increased count within cap"
+wait "$LOAD_PID"
+LOAD_PID=
+wait "$COUNT_MONITOR_PID"
+COUNT_MONITOR_PID=
 
 info "Waiting for traffic to drain and job to return to zero..."
-wait_for_job_count_exact "$JOB_ID" 1 "$SCALE_ZERO_TIMEOUT"
 wait_for_job_count_exact "$JOB_ID" 0 "$SCALE_ZERO_TIMEOUT"
 pass "Prometheus-backed autoscaled job returned to zero"
 
@@ -448,5 +474,5 @@ echo "Verified:"
 echo "  1. Prometheus service runs as opt-in compose override"
 echo "  2. nscale starts with NSCALE_PROMETHEUS__URL configured"
 echo "  3. Prometheus scrapes Traefik request metrics"
-echo "  4. Prometheus scrapes nscale proxy metrics"
+echo "  4. Prometheus aggregates real latency histograms from both proxies"
 echo "  5. Autoscaling scales up within max_count and returns to zero"

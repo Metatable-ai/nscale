@@ -6,7 +6,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::error::{NscaleError, Result};
 use nscale_core::job::{Endpoint, JobRegistration, ScaleUnit};
-use nscale_core::traits::{Orchestrator, ServiceDiscovery};
+use nscale_core::lease::{Lease, job_lock_key};
+use nscale_core::traits::{ActivityStore, Orchestrator, ServiceDiscovery};
 
 use crate::state::{STATE_DORMANT, STATE_READY, STATE_WAKING, WakeResult, WakeState};
 
@@ -18,8 +19,44 @@ pub struct WakeCoordinator {
     discovery: Arc<dyn ServiceDiscovery>,
     wake_semaphore: Arc<tokio::sync::Semaphore>,
     wake_timeout: Duration,
+    activity_store: Option<Arc<dyn ActivityStore>>,
     /// Cache of endpoint for ready jobs.
     endpoints: Arc<DashMap<String, Endpoint>>,
+    service_endpoints: DashMap<(String, String), EndpointPool>,
+    endpoint_refresh: Duration,
+    refresh_locks: DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>,
+}
+
+struct EndpointPool {
+    endpoints: Vec<Endpoint>,
+    next: usize,
+    refreshed: tokio::time::Instant,
+}
+
+impl EndpointPool {
+    fn refresh(&mut self, endpoints: Vec<Endpoint>) {
+        // Keep the next endpoint's identity when Consul reorders its response.
+        // If it disappeared, keep the cursor position within the new pool.
+        let next = self.endpoints.get(self.next % self.endpoints.len().max(1));
+        self.next = next
+            .and_then(|next| {
+                endpoints
+                    .iter()
+                    .position(|endpoint| endpoint.host == next.host && endpoint.port == next.port)
+            })
+            .unwrap_or(self.next % endpoints.len().max(1));
+        self.endpoints = endpoints;
+        self.refreshed = tokio::time::Instant::now();
+    }
+
+    fn select(&mut self) -> Option<Endpoint> {
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        let endpoint = self.endpoints[self.next % self.endpoints.len()].clone();
+        self.next = self.next.wrapping_add(1);
+        Some(endpoint)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +79,69 @@ impl WakeCoordinator {
             discovery,
             wake_semaphore: Arc::new(tokio::sync::Semaphore::new(nomad_concurrency)),
             wake_timeout,
+            activity_store: None,
             endpoints: Arc::new(DashMap::new()),
+            service_endpoints: DashMap::new(),
+            endpoint_refresh: Duration::from_secs(2),
+            refresh_locks: DashMap::new(),
         }
+    }
+
+    pub fn with_activity_store(mut self, store: Arc<dyn ActivityStore>) -> Self {
+        self.activity_store = Some(store);
+        self
+    }
+
+    pub fn with_endpoint_refresh(mut self, interval: Duration) -> Self {
+        self.endpoint_refresh = interval;
+        self
+    }
+
+    /// Wake is coalesced per group; routing is selected per service/port.
+    pub async fn ensure_running(&self, reg: &JobRegistration) -> Result<Endpoint> {
+        let key = (reg.scale_unit_key().0, reg.service_name.0.clone());
+        if let Some(mut pool) = self.service_endpoints.get_mut(&key)
+            && pool.refreshed.elapsed() < self.endpoint_refresh
+            && let Some(endpoint) = pool.select()
+        {
+            return Ok(endpoint);
+        }
+        let lock = self
+            .refresh_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        if let Some(mut pool) = self.service_endpoints.get_mut(&key)
+            && pool.refreshed.elapsed() < self.endpoint_refresh
+            && let Some(endpoint) = pool.select()
+        {
+            return Ok(endpoint);
+        }
+
+        // Even after process restart, a running group must not be scaled back to one.
+        self.ensure_group_running(reg).await?;
+        let mut endpoints = self.discovery.healthy_endpoints(&reg.service_name).await?;
+        if endpoints.is_empty() {
+            self.mark_dormant(&reg.scale_unit_key());
+            self.ensure_group_running(reg).await?;
+            endpoints = self.discovery.healthy_endpoints(&reg.service_name).await?;
+        }
+        self.refresh_pool(key, endpoints)
+            .ok_or_else(|| NscaleError::JobNotReady(reg.service_name.0.clone()))
+    }
+
+    fn refresh_pool(&self, key: (String, String), endpoints: Vec<Endpoint>) -> Option<Endpoint> {
+        let mut pool = self
+            .service_endpoints
+            .entry(key)
+            .or_insert_with(|| EndpointPool {
+                endpoints: Vec::new(),
+                next: 0,
+                refreshed: tokio::time::Instant::now(),
+            });
+        pool.refresh(endpoints);
+        pool.select()
     }
 
     /// Ensure a job is running and return its endpoint.
@@ -51,7 +149,7 @@ impl WakeCoordinator {
     /// If already waking, subscribes to the existing wake-up broadcast.
     /// If ready, returns the cached endpoint immediately.
     #[instrument(skip(self, reg), fields(job_id = %reg.job_id))]
-    pub async fn ensure_running(&self, reg: &JobRegistration) -> Result<Endpoint> {
+    async fn ensure_group_running(&self, reg: &JobRegistration) -> Result<Endpoint> {
         let job_key = reg.scale_unit_key().0;
 
         // Fast path: already ready with cached endpoint
@@ -75,6 +173,7 @@ impl WakeCoordinator {
                 Arc::clone(&*state_ref)
             }; // <-- DashMap shard lock dropped here
 
+            let mut rx = state.notify.subscribe();
             let current = state.status.load(std::sync::atomic::Ordering::Acquire);
 
             match current {
@@ -100,7 +199,6 @@ impl WakeCoordinator {
                 STATE_WAKING => {
                     // Subscribe to existing wake-up
                     debug!("job is waking, subscribing to broadcast");
-                    let mut rx = state.notify.subscribe();
 
                     return match tokio::time::timeout(self.wake_timeout, rx.recv()).await {
                         Ok(Ok(WakeResult::Ready(ep))) => Ok(ep),
@@ -126,13 +224,13 @@ impl WakeCoordinator {
                     // Try to become the waker
                     if state.try_start_wake() {
                         debug!("won wake race, starting wake task");
-                        let mut rx = state.notify.subscribe();
 
                         // Spawn the actual wake task
                         let orchestrator = self.orchestrator.clone();
                         let discovery = self.discovery.clone();
                         let semaphore = self.wake_semaphore.clone();
                         let timeout = self.wake_timeout;
+                        let store = self.activity_store.clone();
                         let reg_clone = reg.clone();
                         let endpoints = self.endpoints.clone();
                         let jobs = self.jobs.clone();
@@ -147,6 +245,7 @@ impl WakeCoordinator {
                                 &reg_clone,
                                 timeout,
                                 &notify,
+                                store,
                             )
                             .await;
 
@@ -230,8 +329,14 @@ impl WakeCoordinator {
         }
     }
 
+    /// An allocation change invalidates discovery, not the group's desired count.
+    pub fn invalidate_service_endpoints(&self, unit: &ScaleUnit) {
+        self.service_endpoints.retain(|(key, _), _| key != &unit.0);
+    }
+
     /// Mark a scale-to-zero unit as dormant (called after scale-down).
     pub fn mark_dormant(&self, unit: &ScaleUnit) {
+        self.service_endpoints.retain(|(key, _), _| key != &unit.0);
         self.endpoints.remove(&unit.0);
         if let Some(state) = self.jobs.get(&unit.0) {
             state.set_dormant();
@@ -243,6 +348,7 @@ impl WakeCoordinator {
     /// `ensure_running` call to re-discover (and re-wake if needed).
     /// Called when the proxy detects a backend connection failure.
     pub fn invalidate(&self, unit: &ScaleUnit) {
+        self.service_endpoints.retain(|(key, _), _| key != &unit.0);
         self.endpoints.remove(&unit.0);
         if let Some(state) = self.jobs.get(&unit.0) {
             state.set_dormant();
@@ -253,45 +359,25 @@ impl WakeCoordinator {
 
     /// Re-check the running endpoint for a job without forcing a scale-up.
     /// This is used after transient proxy transport failures to avoid
-    /// invalidating a healthy cached endpoint unless Nomad disagrees.
+    /// invalidating a healthy cached endpoint unless Consul disagrees.
     #[instrument(skip(self, reg, current), fields(job_id = %reg.job_id, endpoint = %current))]
     pub async fn refresh_endpoint(
         &self,
         reg: &JobRegistration,
         current: &Endpoint,
     ) -> Result<EndpointRefresh> {
-        let job_key = reg.scale_unit_key().0;
-
-        match self
-            .orchestrator
-            .get_healthy_endpoint(&reg.job_id, &reg.nomad_group)
-            .await?
-        {
+        let key = (reg.scale_unit_key().0, reg.service_name.0.clone());
+        let endpoints = self.discovery.healthy_endpoints(&reg.service_name).await?;
+        match self.refresh_pool(key, endpoints) {
             Some(endpoint) => {
-                self.endpoints.insert(job_key.clone(), endpoint.clone());
-                if let Some(state) = self.jobs.get(&job_key) {
-                    state.set_ready();
-                }
-
                 if endpoint.host == current.host && endpoint.port == current.port {
-                    debug!(endpoint = %endpoint, "healthy endpoint unchanged after transport failure");
                     Ok(EndpointRefresh::Confirmed(endpoint))
                 } else {
-                    info!(
-                        old_endpoint = %current,
-                        endpoint = %endpoint,
-                        "healthy endpoint changed after transport failure"
-                    );
                     Ok(EndpointRefresh::Updated(endpoint))
                 }
             }
             None => {
-                self.endpoints.remove(&job_key);
-                if let Some(state) = self.jobs.get(&job_key) {
-                    state.set_dormant();
-                }
-                self.jobs.remove(&job_key);
-                debug!("no running endpoint found while refreshing cached endpoint");
+                self.mark_dormant(&reg.scale_unit_key());
                 Ok(EndpointRefresh::Missing)
             }
         }
@@ -303,6 +389,7 @@ impl WakeCoordinator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_wake_task(
     orchestrator: &dyn Orchestrator,
     discovery: &dyn ServiceDiscovery,
@@ -310,6 +397,7 @@ async fn run_wake_task(
     reg: &JobRegistration,
     timeout: Duration,
     notify: &tokio::sync::broadcast::Sender<WakeResult>,
+    store: Option<Arc<dyn ActivityStore>>,
 ) -> Result<Endpoint> {
     // Phase 1: Acquire semaphore to bound concurrent Nomad API calls.
     // The permit is held only during scale_up (fast ~5ms), NOT during
@@ -320,9 +408,43 @@ async fn run_wake_task(
         .map_err(|_| NscaleError::Nomad("wake semaphore closed".to_string()))?;
 
     debug!(job_id = %reg.job_id, group = %reg.nomad_group, "scaling up job");
-    orchestrator
-        .scale_up(&reg.job_id, &reg.nomad_group, 1)
-        .await?;
+    let scale = async {
+        if orchestrator
+            .get_job_count(&reg.job_id, &reg.nomad_group)
+            .await?
+            == 0
+        {
+            let count = reg
+                .autoscaling
+                .as_ref()
+                .filter(|p| p.enabled)
+                .map_or(1, |p| p.min_count.max(1));
+            orchestrator
+                .scale_up(&reg.job_id, &reg.nomad_group, count)
+                .await?;
+        }
+
+        Ok(())
+    };
+    if let Some(store) = store {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(lease) =
+                    Lease::acquire(store.clone(), job_lock_key(&reg.job_id)).await?
+                {
+                    break lease.run(scale).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| NscaleError::WakeTimeout {
+            job_id: reg.job_id.0.clone(),
+            elapsed_secs: timeout.as_secs_f64(),
+        })??;
+    } else {
+        scale.await?;
+    }
 
     // Release semaphore early — other scale_up calls can proceed while
     // this task waits for the service to become healthy.
@@ -370,6 +492,8 @@ mod tests {
     /// Mock orchestrator that counts calls.
     struct MockOrchestrator {
         scale_up_calls: AtomicU32,
+        current_count: AtomicU32,
+        requested_count: AtomicU32,
         job_not_found_on_scale_up: AtomicBool,
         healthy_endpoint: Mutex<Option<Endpoint>>,
     }
@@ -378,16 +502,11 @@ mod tests {
         fn new() -> Self {
             Self {
                 scale_up_calls: AtomicU32::new(0),
+                current_count: AtomicU32::new(0),
+                requested_count: AtomicU32::new(0),
                 job_not_found_on_scale_up: AtomicBool::new(false),
                 healthy_endpoint: Mutex::new(Some(Endpoint::new("10.0.0.1", 8080))),
             }
-        }
-
-        fn set_healthy_endpoint(&self, endpoint: Option<Endpoint>) {
-            *self
-                .healthy_endpoint
-                .lock()
-                .expect("healthy endpoint lock should succeed") = endpoint;
         }
 
         fn set_job_not_found_on_scale_up(&self, enabled: bool) {
@@ -398,7 +517,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Orchestrator for MockOrchestrator {
-        async fn scale_up(&self, _job_id: &JobId, _group: &str, _count: u32) -> Result<()> {
+        async fn scale_up(&self, _job_id: &JobId, _group: &str, count: u32) -> Result<()> {
+            self.requested_count
+                .store(count, std::sync::atomic::Ordering::Relaxed);
             self.scale_up_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self
@@ -423,7 +544,9 @@ mod tests {
             Ok(())
         }
         async fn get_job_count(&self, _job_id: &JobId, _group: &str) -> Result<u32> {
-            Ok(1)
+            Ok(self
+                .current_count
+                .load(std::sync::atomic::Ordering::Relaxed))
         }
         async fn get_healthy_endpoint(
             &self,
@@ -440,9 +563,29 @@ mod tests {
 
     /// Mock discovery that returns an endpoint immediately.
     struct MockDiscovery;
+    struct MutableDiscovery(std::sync::Mutex<Vec<Endpoint>>);
+    #[async_trait::async_trait]
+    impl ServiceDiscovery for MutableDiscovery {
+        async fn healthy_endpoints(&self, _: &ServiceName) -> Result<Vec<Endpoint>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+        async fn deregister_fallback(&self, _: &ServiceName) -> Result<()> {
+            Ok(())
+        }
+        async fn wait_for_healthy(&self, _: &ServiceName, _: Duration) -> Result<Endpoint> {
+            Ok(self.0.lock().unwrap()[0].clone())
+        }
+    }
 
     #[async_trait::async_trait]
     impl ServiceDiscovery for MockDiscovery {
+        async fn healthy_endpoints(&self, _: &ServiceName) -> Result<Vec<Endpoint>> {
+            Ok(vec![Endpoint::new("10.0.0.1", 8080)])
+        }
+
         async fn register_fallback(&self, _name: &ServiceName, _ep: &Endpoint) -> Result<()> {
             Ok(())
         }
@@ -634,13 +777,15 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_endpoint_updates_cached_endpoint() {
         let orch = Arc::new(MockOrchestrator::new());
-        let disc = Arc::new(MockDiscovery);
-        let coord = WakeCoordinator::new(orch.clone(), disc, 10, Duration::from_secs(2));
+        let disc = Arc::new(MutableDiscovery(std::sync::Mutex::new(vec![
+            Endpoint::new("10.0.0.1", 8080),
+        ])));
+        let coord = WakeCoordinator::new(orch.clone(), disc.clone(), 10, Duration::from_secs(2));
 
         let reg = test_registration();
         let current = coord.ensure_running(&reg).await.unwrap();
 
-        orch.set_healthy_endpoint(Some(Endpoint::new("10.0.0.2", 9090)));
+        *disc.0.lock().unwrap() = vec![Endpoint::new("10.0.0.2", 9090)];
 
         let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
         match refreshed {
@@ -659,13 +804,15 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_endpoint_missing_clears_cache() {
         let orch = Arc::new(MockOrchestrator::new());
-        let disc = Arc::new(MockDiscovery);
-        let coord = WakeCoordinator::new(orch.clone(), disc, 10, Duration::from_secs(2));
+        let disc = Arc::new(MutableDiscovery(std::sync::Mutex::new(vec![
+            Endpoint::new("10.0.0.1", 8080),
+        ])));
+        let coord = WakeCoordinator::new(orch.clone(), disc.clone(), 10, Duration::from_secs(2));
 
         let reg = test_registration();
         let current = coord.ensure_running(&reg).await.unwrap();
 
-        orch.set_healthy_endpoint(None);
+        disc.0.lock().unwrap().clear();
 
         let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
         assert!(matches!(refreshed, EndpointRefresh::Missing));
@@ -692,6 +839,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceDiscovery for SlowDiscovery {
+        async fn healthy_endpoints(&self, _: &ServiceName) -> Result<Vec<Endpoint>> {
+            Ok(vec![Endpoint::new("10.0.0.1", 8080)])
+        }
+
         async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
             Ok(())
         }
@@ -817,6 +968,154 @@ mod tests {
             orch.scale_up_calls
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+    }
+    #[tokio::test]
+    async fn restart_and_replica_stop_preserve_running_count() {
+        let orch = Arc::new(MockOrchestrator::new());
+        orch.current_count
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let coord = WakeCoordinator::new(
+            orch.clone(),
+            Arc::new(MockDiscovery),
+            10,
+            Duration::from_secs(2),
+        );
+        let reg = test_registration();
+        coord.ensure_running(&reg).await.unwrap();
+        coord.mark_dormant(&reg.scale_unit_key());
+        coord.ensure_running(&reg).await.unwrap();
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_wake_uses_policy_minimum() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let coord = WakeCoordinator::new(
+            orch.clone(),
+            Arc::new(MockDiscovery),
+            10,
+            Duration::from_secs(2),
+        );
+        let mut reg = test_registration();
+        reg.autoscaling = Some(
+            serde_json::from_str(
+                r#"{"min_count":3,"max_count":5,"target_requests_per_second_per_instance":10}"#,
+            )
+            .unwrap(),
+        );
+        coord.ensure_running(&reg).await.unwrap();
+        assert_eq!(
+            orch.requested_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn round_robin_refreshes_after_scale_up_and_removal() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MutableDiscovery(std::sync::Mutex::new(vec![
+            Endpoint::new("a", 80),
+            Endpoint::new("b", 80),
+        ])));
+        let coord = WakeCoordinator::new(orch, disc.clone(), 10, Duration::from_secs(2));
+        let reg = test_registration();
+        for expected in ["a", "b", "a", "b"] {
+            assert_eq!(coord.ensure_running(&reg).await.unwrap().host, expected);
+        }
+        *disc.0.lock().unwrap() = vec![Endpoint::new("c", 80), Endpoint::new("d", 80)];
+        // Expire the pool deterministically without sleeping.
+        coord
+            .service_endpoints
+            .get_mut(&(reg.scale_unit_key().0, reg.service_name.0.clone()))
+            .unwrap()
+            .refreshed -= Duration::from_secs(3);
+        for expected in ["c", "d", "c", "d"] {
+            assert_eq!(coord.ensure_running(&reg).await.unwrap().host, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn services_in_one_group_keep_separate_ports() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MutableDiscovery(std::sync::Mutex::new(vec![
+            Endpoint::new("a", 80),
+        ])));
+        let coord = WakeCoordinator::new(orch.clone(), disc.clone(), 10, Duration::from_secs(2));
+        let first = test_registration();
+        let mut second = first.clone();
+        second.service_name = ServiceName("second".into());
+        assert_eq!(coord.ensure_running(&first).await.unwrap().port, 80);
+        *disc.0.lock().unwrap() = vec![Endpoint::new("a", 90)];
+        assert_eq!(coord.ensure_running(&second).await.unwrap().port, 90);
+        assert_eq!(coord.ensure_running(&first).await.unwrap().port, 80);
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn refreshed_pool_handles_reordering_additions_and_removal() {
+        let mut pool = EndpointPool {
+            endpoints: vec![Endpoint::new("a", 80), Endpoint::new("b", 80)],
+            next: 0,
+            refreshed: tokio::time::Instant::now(),
+        };
+        assert_eq!(pool.select().unwrap().host, "a");
+        pool.refresh(vec![
+            Endpoint::new("c", 80),
+            Endpoint::new("b", 80),
+            Endpoint::new("a", 80),
+        ]);
+        assert_eq!(
+            pool.select().unwrap().host,
+            "b",
+            "preserve next backend despite reordered discovery"
+        );
+        pool.refresh(vec![Endpoint::new("c", 80), Endpoint::new("d", 80)]);
+        assert_eq!(
+            pool.select().unwrap().host,
+            "c",
+            "removed next backend must be skipped"
+        );
+        assert_eq!(pool.select().unwrap().host, "d");
+        pool.refresh(vec![]);
+        assert!(pool.select().is_none());
+    }
+    #[tokio::test]
+    async fn refresh_preserves_round_robin_for_sparse_requests() {
+        let disc = Arc::new(MutableDiscovery(std::sync::Mutex::new(vec![
+            Endpoint::new("a", 80),
+            Endpoint::new("b", 80),
+            Endpoint::new("c", 80),
+        ])));
+        let coord = WakeCoordinator::new(
+            Arc::new(MockOrchestrator::new()),
+            disc,
+            10,
+            Duration::from_secs(2),
+        );
+        let reg = test_registration();
+        let mut chosen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            chosen.insert(coord.ensure_running(&reg).await.unwrap().host);
+            coord
+                .service_endpoints
+                .get_mut(&(reg.scale_unit_key().0, reg.service_name.0.clone()))
+                .unwrap()
+                .refreshed -= Duration::from_secs(3);
+        }
+        assert_eq!(
+            chosen.len(),
+            3,
+            "requests spanning pool refreshes must use all three healthy backends; got {chosen:?}"
         );
     }
 }

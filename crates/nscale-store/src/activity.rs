@@ -59,6 +59,62 @@ impl RedisActivityStore {
 
 #[async_trait]
 impl ActivityStore for RedisActivityStore {
+    async fn refresh_request(&self, unit: &ScaleUnit, token: &str, ttl: Duration) -> Result<()> {
+        let script = "local t=redis.call('time'); local now=t[1]*1000+math.floor(t[2]/1000); redis.call('zadd',KEYS[1],now+ARGV[2],ARGV[1]); redis.call('pexpire',KEYS[1],ARGV[2]*2); return 1";
+        let _: i64 = self
+            .client
+            .eval(
+                script,
+                vec![format!("nscale:requests:{}", unit.0)],
+                vec![token.to_string(), ttl.as_millis().to_string()],
+            )
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(())
+    }
+    async fn finish_request(&self, unit: &ScaleUnit, token: &str) -> Result<()> {
+        let _: i64 = self
+            .client
+            .zrem(format!("nscale:requests:{}", unit.0), token)
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        self.record_activity(unit).await
+    }
+    async fn active_requests(&self, unit: &ScaleUnit) -> Result<u64> {
+        let script = "local t=redis.call('time'); local now=t[1]*1000+math.floor(t[2]/1000); redis.call('zremrangebyscore',KEYS[1],'-inf',now); return redis.call('zcard',KEYS[1])";
+        self.client
+            .eval(
+                script,
+                vec![format!("nscale:requests:{}", unit.0)],
+                Vec::<String>::new(),
+            )
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))
+    }
+
+    async fn acquire_lease(&self, key: &str, token: &str, ttl: Duration) -> Result<bool> {
+        let result: Option<String> = self
+            .client
+            .set(
+                lock_key(key),
+                token,
+                Some(Expiration::PX(ttl.as_millis() as i64)),
+                Some(SetOptions::NX),
+                false,
+            )
+            .await
+            .map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(result.is_some())
+    }
+    async fn renew_lease(&self, key: &str, token: &str, ttl: Duration) -> Result<bool> {
+        let result: i64 = self.client.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end", vec![lock_key(key)], vec![token.to_string(), ttl.as_millis().to_string()]).await.map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(result == 1)
+    }
+    async fn release_lease(&self, key: &str, token: &str) -> Result<()> {
+        let _: i64 = self.client.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", vec![lock_key(key)], vec![token.to_string()]).await.map_err(|e| NscaleError::Store(e.to_string()))?;
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(unit = %unit))]
     async fn record_activity(&self, unit: &ScaleUnit) -> Result<()> {
         let score = now_epoch_secs();

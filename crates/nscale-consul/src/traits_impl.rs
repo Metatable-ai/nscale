@@ -10,6 +10,10 @@ use crate::client::ConsulClient;
 
 #[async_trait]
 impl ServiceDiscovery for ConsulClient {
+    async fn healthy_endpoints(&self, service: &ServiceName) -> Result<Vec<Endpoint>> {
+        self.healthy_service_endpoints(service).await
+    }
+
     async fn register_fallback(
         &self,
         service_name: &ServiceName,

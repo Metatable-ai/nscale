@@ -28,20 +28,18 @@ pub struct EventProcessor {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AllocationEventAction {
     RecordActivity,
-    MarkDormant,
+    RefreshEndpoints,
     Ignore,
 }
 
 fn allocation_event_action(client_status: &str, desired_status: &str) -> AllocationEventAction {
     match (client_status, desired_status) {
         ("running", "run") => AllocationEventAction::RecordActivity,
-        ("complete" | "failed" | "lost", _) | (_, "stop") => AllocationEventAction::MarkDormant,
+        ("complete" | "failed" | "lost", _) | (_, "stop") => {
+            AllocationEventAction::RefreshEndpoints
+        }
         _ => AllocationEventAction::Ignore,
     }
-}
-
-fn stopped_allocation_should_remove_activity() -> bool {
-    false
 }
 
 impl EventProcessor {
@@ -163,7 +161,7 @@ impl EventProcessor {
                     debug!(unit = %unit, alloc_id = %alloc_id, "allocation already seen running, skipping activity");
                 }
             }
-            AllocationEventAction::MarkDormant => {
+            AllocationEventAction::RefreshEndpoints => {
                 // Allocation stopped — remove from seen-running set and check
                 // if the job should be marked dormant.
                 {
@@ -177,20 +175,14 @@ impl EventProcessor {
                     desired_status,
                     "allocation stopped"
                 );
-                // We only mark dormant; the scale-down controller still handles
-                // the actual scale-down decision. Do not remove activity here:
-                // autoscaling N→N-1 also emits stopped allocation events while
-                // the unit still has running allocations. Clearing activity here
-                // would hide the unit from idle scale-to-zero checks.
-                self.coordinator.mark_dormant(&unit);
-                if stopped_allocation_should_remove_activity() {
-                    let _ = self.store.remove_activity(&unit).await;
-                }
+                // Other allocations may still be serving this group. Preserve
+                // both wake state and activity; refresh service-specific pools.
+                self.coordinator.invalidate_service_endpoints(&unit);
                 info!(
                     job_id = %job_id,
                     unit = %unit,
                     service_name = %registration.service_name,
-                    "unit marked dormant via event stream"
+                    "unit endpoints invalidated via event stream"
                 );
             }
             AllocationEventAction::Ignore => {
@@ -212,10 +204,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stopped_allocation_marks_dormant_without_implying_activity_removal() {
+    fn stopped_allocation_refreshes_endpoints_without_marking_group_dormant() {
         assert_eq!(
             allocation_event_action("complete", "stop"),
-            AllocationEventAction::MarkDormant
+            AllocationEventAction::RefreshEndpoints
         );
         assert_eq!(
             allocation_event_action("running", "run"),
@@ -225,6 +217,5 @@ mod tests {
             allocation_event_action("pending", "run"),
             AllocationEventAction::Ignore
         );
-        assert!(!stopped_allocation_should_remove_activity());
     }
 }

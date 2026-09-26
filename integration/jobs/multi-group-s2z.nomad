@@ -1,4 +1,4 @@
-job "multi-group-s2z" {
+job "mg-alpha" {
   datacenters = ["dc1"]
   type        = "service"
 

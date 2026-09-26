@@ -1,3 +1,4 @@
+use nscale_core::lease::{Lease, cooldown_key, job_lock_key};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,6 @@ use crate::metrics_provider::MetricsProvider;
 
 const AUTOSCALE_LOCK_KEY: &str = "nscale:lock:autoscale";
 const AUTOSCALE_INTERVAL: Duration = Duration::from_secs(30);
-const AUTOSCALE_LOCK_TTL: Duration = Duration::from_secs(35);
 const AUTOSCALE_DECISION_WINDOW: Duration = Duration::from_secs(60);
 const AUTOSCALE_COOLDOWN: Duration = Duration::from_secs(120);
 const DEPLOYMENT_BACKOFF: Duration = Duration::from_secs(30);
@@ -78,32 +78,47 @@ impl AutoscaleController {
 
     #[instrument(skip(self))]
     async fn tick(&self) -> Result<()> {
-        if !self
-            .store
-            .try_acquire_lock(AUTOSCALE_LOCK_KEY, AUTOSCALE_LOCK_TTL)
-            .await?
-        {
-            debug!("another instance holds the autoscale lock, skipping");
+        let Some(lease) = Lease::acquire(self.store.clone(), AUTOSCALE_LOCK_KEY.into()).await?
+        else {
             return Ok(());
-        }
-
-        let _lock_guard = LockGuard {
-            store: self.store.clone(),
-            key: AUTOSCALE_LOCK_KEY,
         };
+        lease
+            .run(async {
+                let registrations =
+                    unique_autoscaling_registrations(self.registry.list_all().await?);
+                for registration in registrations {
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                    self.evaluate_registration(&registration).await;
+                }
 
-        let registrations = unique_autoscaling_registrations(self.registry.list_all().await?);
-        for registration in registrations {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            self.evaluate_registration(&registration).await;
-        }
-
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
-    async fn evaluate_registration(&self, registration: &JobRegistration) {
+    async fn evaluate_registration(&self, registrations: &[JobRegistration]) {
+        let key = job_lock_key(&registrations[0].job_id);
+        match Lease::acquire(self.store.clone(), key).await {
+            Ok(Some(lease)) => {
+                if let Err(error) = lease
+                    .run(async {
+                        self.evaluate_locked(registrations).await;
+                        Ok(())
+                    })
+                    .await
+                {
+                    warn!(%error, "autoscale ownership lost");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "autoscale lock unavailable"),
+        }
+    }
+
+    async fn evaluate_locked(&self, registrations: &[JobRegistration]) {
+        let registration = &registrations[0];
         let Some(policy) = registration.autoscaling.as_ref() else {
             return;
         };
@@ -119,10 +134,7 @@ impl AutoscaleController {
 
         // Cooldown is stored in the shared activity store (Redis) so that it is
         // honored across all HA replicas, not just the instance that scaled.
-        let cooldown_key = format!(
-            "autoscale:{}:{}",
-            registration.job_id.0, registration.nomad_group
-        );
+        let cooldown_key = cooldown_key(&registration.job_id, &registration.nomad_group);
         match self.store.in_cooldown(&cooldown_key).await {
             Ok(true) => {
                 debug!(job_id = %registration.job_id, "autoscaling cooldown active, skipping");
@@ -164,7 +176,7 @@ impl AutoscaleController {
 
         let metrics = match self
             .metrics
-            .snapshot(registration, policy_decision_window(policy))
+            .group_snapshot(registrations, policy_decision_window(policy))
             .await
         {
             Ok(metrics) => metrics,
@@ -175,7 +187,15 @@ impl AutoscaleController {
             }
         };
 
-        let downscale_blocked = self.in_flight.has_in_flight(&registration.job_id.0);
+        let downscale_blocked = self
+            .in_flight
+            .has_in_flight(&registration.scale_unit_key().0)
+            || !matches!(
+                self.store
+                    .active_requests(&registration.scale_unit_key())
+                    .await,
+                Ok(0)
+            );
         let decision = decide_autoscale(policy, current_count, &metrics, downscale_blocked);
         if decision.direction == AutoscaleDirection::None {
             debug!(job_id = %registration.job_id, reason = %decision.reason, "autoscale decision made no change");
@@ -192,9 +212,10 @@ impl AutoscaleController {
         let reason = format!("nscale: autoscale {}", decision.reason);
         match self
             .orchestrator
-            .scale_to(
+            .scale_from(
                 &registration.job_id,
                 &registration.nomad_group,
+                current_count,
                 decision.desired_count,
                 &reason,
             )
@@ -257,28 +278,39 @@ fn record_skip(registration: &JobRegistration, reason: &str) {
     .increment(1);
 }
 
-fn unique_autoscaling_registrations(registrations: Vec<JobRegistration>) -> Vec<JobRegistration> {
+fn unique_autoscaling_registrations(
+    mut registrations: Vec<JobRegistration>,
+) -> Vec<Vec<JobRegistration>> {
+    registrations.sort_by(|a, b| {
+        (&a.job_id.0, &a.nomad_group, &a.service_name.0).cmp(&(
+            &b.job_id.0,
+            &b.nomad_group,
+            &b.service_name.0,
+        ))
+    });
     // Key by (job_id, nomad_group): a job may legitimately have several task
     // groups, each scaled independently. Only a genuinely divergent policy for
     // the *same* (job, group) is treated as a conflict.
-    let mut by_group: BTreeMap<(String, String), JobRegistration> = BTreeMap::new();
+    let mut by_group: BTreeMap<(String, String), Vec<JobRegistration>> = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
 
     for registration in registrations {
-        if registration.autoscaling.is_none() {
-            continue;
-        }
-
         let key = (
             registration.job_id.0.clone(),
             registration.nomad_group.clone(),
         );
-        if let Some(existing) = by_group.get(&key) {
-            if existing.autoscaling != registration.autoscaling {
+        if let Some(existing) = by_group.get_mut(&key) {
+            if existing[0].autoscaling != registration.autoscaling {
                 conflicts.insert(key);
             }
+            if !existing
+                .iter()
+                .any(|r| r.service_name == registration.service_name)
+            {
+                existing.push(registration);
+            }
         } else {
-            by_group.insert(key, registration);
+            by_group.insert(key, vec![registration]);
         }
     }
 
@@ -292,8 +324,10 @@ fn unique_autoscaling_registrations(registrations: Vec<JobRegistration>) -> Vec<
                     "conflicting autoscaling policies for job group, skipping autoscale evaluation"
                 );
                 None
-            } else {
+            } else if registration[0].autoscaling.is_some() {
                 Some(registration)
+            } else {
+                None
             }
         })
         .collect()
@@ -305,23 +339,6 @@ fn policy_decision_window(policy: &JobAutoscalingPolicy) -> Duration {
 
 fn policy_cooldown(policy: &JobAutoscalingPolicy) -> Duration {
     policy.cooldown(AUTOSCALE_COOLDOWN)
-}
-
-struct LockGuard {
-    store: Arc<dyn ActivityStore>,
-    key: &'static str,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let store = self.store.clone();
-        let key = self.key;
-        tokio::spawn(async move {
-            if let Err(err) = store.release_lock(key).await {
-                warn!(error = %err, "failed to release autoscale lock");
-            }
-        });
-    }
 }
 
 #[cfg(test)]
@@ -402,6 +419,13 @@ mod tests {
         let unique = unique_autoscaling_registrations(vec![first.clone(), second]);
         assert!(unique.is_empty());
 
+        let mut unconfigured_sibling = first.clone();
+        unconfigured_sibling.service_name = ServiceName("api-unconfigured".into());
+        unconfigured_sibling.autoscaling = None;
+        assert!(
+            unique_autoscaling_registrations(vec![first.clone(), unconfigured_sibling]).is_empty()
+        );
+
         first.service_name = ServiceName("api-c".into());
         let unique = unique_autoscaling_registrations(vec![first.clone(), first]);
         assert_eq!(unique.len(), 1);
@@ -425,5 +449,91 @@ mod tests {
 
         let unique = unique_autoscaling_registrations(vec![web, worker]);
         assert_eq!(unique.len(), 2);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires isolated Redis"]
+    async fn sibling_groups_are_all_evaluated() {
+        use nscale_core::job::{Endpoint, JobId};
+        struct Counts(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Orchestrator for Counts {
+            async fn scale_up(&self, _: &JobId, _: &str, _: u32) -> Result<()> {
+                Ok(())
+            }
+            async fn scale_down(&self, _: &JobId, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn scale_to(&self, _: &JobId, _: &str, _: u32, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn get_job_count(&self, _: &JobId, group: &str) -> Result<u32> {
+                self.0.lock().unwrap().push(group.into());
+                Ok(1)
+            }
+            async fn get_healthy_endpoint(&self, _: &JobId, _: &str) -> Result<Option<Endpoint>> {
+                Ok(None)
+            }
+        }
+        struct Idle;
+        #[async_trait::async_trait]
+        impl MetricsProvider for Idle {
+            fn name(&self) -> &'static str {
+                "idle"
+            }
+            async fn snapshot(
+                &self,
+                _: &JobRegistration,
+                _: Duration,
+            ) -> Result<crate::autoscale_policy::MetricSnapshot> {
+                Ok(crate::autoscale_policy::MetricSnapshot {
+                    request_rate_rps: Some(0.0),
+                    ..Default::default()
+                })
+            }
+        }
+        let store = Arc::new(
+            nscale_store::activity::RedisActivityStore::new(
+                &std::env::var("NSCALE_TEST_REDIS_URL").unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let registry = Arc::new(JobRegistry::new(store.client().clone()));
+        let job = nscale_core::lease::unique_token();
+        for group in ["alpha", "beta"] {
+            registry
+                .register(&JobRegistration {
+                    job_id: job.clone().into(),
+                    service_name: format!("{job}-{group}").into(),
+                    nomad_group: group.into(),
+                    scale_unit: Some(format!("{job}/{group}")),
+                    autoscaling: Some(policy()),
+                    traefik_routers: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let counts = Arc::new(Counts(std::sync::Mutex::new(vec![])));
+        let controller = AutoscaleController::new(
+            counts.clone(),
+            store,
+            registry.clone(),
+            Arc::new(Idle),
+            InFlightTracker::new(),
+            CancellationToken::new(),
+        );
+        for _ in 0..20 {
+            controller.tick().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        registry.deregister(&job.into()).await.unwrap();
+        let seen = counts.0.lock().unwrap();
+        let alpha = seen.iter().filter(|g| g.as_str() == "alpha").count();
+        let beta = seen.iter().filter(|g| g.as_str() == "beta").count();
+        assert_eq!(alpha, 20);
+        assert_eq!(
+            beta, alpha,
+            "every group must be evaluated; alpha={alpha}, beta={beta}"
+        );
     }
 }

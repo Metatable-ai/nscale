@@ -19,6 +19,24 @@ pub trait Orchestrator: Send + Sync {
     /// Scale a job's task group to an explicit count.
     async fn scale_to(&self, job_id: &JobId, group: &str, count: u32, reason: &str) -> Result<()>;
 
+    /// Compare the observed count before applying a scaling decision. Concrete
+    /// orchestrators should also enforce their version index atomically.
+    async fn scale_from(
+        &self,
+        job_id: &JobId,
+        group: &str,
+        expected: u32,
+        count: u32,
+        reason: &str,
+    ) -> Result<()> {
+        if self.get_job_count(job_id, group).await? != expected {
+            return Err(crate::error::NscaleError::Nomad(
+                "scaling count changed; reevaluate".into(),
+            ));
+        }
+        self.scale_to(job_id, group, count, reason).await
+    }
+
     /// Get the current count for a job's task group.
     async fn get_job_count(&self, job_id: &JobId, group: &str) -> Result<u32>;
 
@@ -40,6 +58,9 @@ pub trait ServiceDiscovery: Send + Sync {
     /// Deregister the fallback service for a given service name.
     async fn deregister_fallback(&self, service_name: &ServiceName) -> Result<()>;
 
+    /// Snapshot of all healthy, non-fallback endpoints for this service.
+    async fn healthy_endpoints(&self, service_name: &ServiceName) -> Result<Vec<Endpoint>>;
+
     /// Wait for a healthy service instance to appear, using blocking queries.
     /// Returns the endpoint once healthy, or errors on timeout.
     async fn wait_for_healthy(
@@ -56,6 +77,15 @@ pub trait ServiceDiscovery: Send + Sync {
 /// id, so existing data is unchanged.
 #[async_trait]
 pub trait ActivityStore: Send + Sync {
+    /// Refresh one request's liveness; each request has a unique token.
+    async fn refresh_request(&self, unit: &ScaleUnit, token: &str, ttl: Duration) -> Result<()>;
+    async fn finish_request(&self, unit: &ScaleUnit, token: &str) -> Result<()>;
+    async fn active_requests(&self, unit: &ScaleUnit) -> Result<u64>;
+
+    async fn acquire_lease(&self, key: &str, token: &str, ttl: Duration) -> Result<bool>;
+    async fn renew_lease(&self, key: &str, token: &str, ttl: Duration) -> Result<bool>;
+    async fn release_lease(&self, key: &str, token: &str) -> Result<()>;
+
     /// Record that a scale-to-zero unit was accessed at the current time.
     async fn record_activity(&self, unit: &ScaleUnit) -> Result<()>;
 

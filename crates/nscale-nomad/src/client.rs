@@ -30,6 +30,8 @@ impl NomadClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
             .pool_max_idle_per_host(20)
             .build()?;
 
@@ -191,6 +193,7 @@ impl NomadClient {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn scale_job(
         &self,
         job_id: &JobId,
@@ -199,16 +202,9 @@ impl NomadClient {
         reason: &str,
         operation: &'static str,
         active_deployment_is_ok: bool,
+        expected_count: Option<u32>,
     ) -> Result<()> {
         let path = format!("/v1/job/{}/scale", job_id);
-
-        let req = ScaleRequest {
-            count: Some(count),
-            target: ScaleTarget {
-                group: group.to_string(),
-            },
-            message: Some(reason.to_string()),
-        };
 
         // A scale-up blocked by an active deployment may be blocked by a
         // scale-DOWN of this or a sibling task group (Nomad allows only one
@@ -220,6 +216,33 @@ impl NomadClient {
         let mut blocked_retries = 0usize;
 
         loop {
+            let job = self.get_job(job_id).await?;
+            let current = job
+                .task_groups
+                .iter()
+                .find(|g| g.name == group)
+                .ok_or_else(|| {
+                    NscaleError::Nomad(format!("task group '{group}' missing in job {job_id}"))
+                })?
+                .count;
+            // Wake is strictly zero -> nonzero, even across multiple proxies.
+            if operation == "scale up" && current > 0 {
+                return Ok(());
+            }
+            if expected_count.is_some_and(|expected| expected != current) {
+                return Err(NscaleError::Nomad(
+                    "scaling count changed; reevaluate".into(),
+                ));
+            }
+            let req = ScaleRequest {
+                count: Some(count),
+                target: ScaleTarget {
+                    group: group.into(),
+                },
+                message: Some(reason.into()),
+                enforce_index: true,
+                job_modify_index: job.job_modify_index,
+            };
             let resp = self.client.post(self.url(&path)).json(&req).send().await?;
 
             if resp.status().is_success() {
@@ -257,8 +280,11 @@ impl NomadClient {
                     continue;
                 }
 
-                info!(job_id = %job_id, operation, "scaling still blocked by active deployment after retries, proceeding");
-                return Ok(());
+                info!(job_id = %job_id, operation, "scaling still blocked by active deployment after retries");
+                return Err(NscaleError::DeploymentInProgress {
+                    job_id: job_id.0.clone(),
+                    operation,
+                });
             }
 
             return Err(Self::classify_job_error(
@@ -280,6 +306,7 @@ impl Orchestrator for NomadClient {
             "nscale: scaling up on demand",
             "scale up",
             true,
+            Some(0),
         )
         .await
     }
@@ -294,6 +321,7 @@ impl Orchestrator for NomadClient {
             "nscale: scaling to zero after idle",
             "scale down",
             false,
+            None,
         )
         .await
     }
@@ -301,8 +329,28 @@ impl Orchestrator for NomadClient {
     #[instrument(skip(self, reason), fields(job_id = %job_id, group = %group, count = count))]
     async fn scale_to(&self, job_id: &JobId, group: &str, count: u32, reason: &str) -> Result<()> {
         debug!("scaling job to explicit count");
-        self.scale_job(job_id, group, count, reason, "autoscale", false)
+        self.scale_job(job_id, group, count, reason, "autoscale", false, None)
             .await
+    }
+
+    async fn scale_from(
+        &self,
+        job_id: &JobId,
+        group: &str,
+        expected: u32,
+        count: u32,
+        reason: &str,
+    ) -> Result<()> {
+        self.scale_job(
+            job_id,
+            group,
+            count,
+            reason,
+            "autoscale",
+            false,
+            Some(expected),
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(job_id = %job_id, group = %group))]
@@ -361,6 +409,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let job = client
             .parse_job("job \"example\" {}", Some("var.project_id = \"demo\""))
@@ -391,6 +440,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let response = client
             .submit_job(&serde_json::json!({
@@ -418,6 +468,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
         assert!(result.is_ok());
@@ -436,6 +487,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
         assert!(result.is_ok());
@@ -448,6 +500,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/job/test-job/scale"))
             .and(body_json(serde_json::json!({
+                "EnforceIndex": true,
+                "JobModifyIndex": 42,
                 "Count": 3,
                 "Target": { "Group": "web" },
                 "Message": "nscale: autoscale request-rate"
@@ -459,6 +513,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client
             .scale_to(
@@ -500,6 +555,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let mut client = NomadClient::new(&mock_server.uri(), None).unwrap();
         client.scale_retry_delay = Duration::from_millis(1);
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
@@ -524,6 +580,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
 
@@ -549,6 +606,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
 
@@ -566,6 +624,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
         assert!(matches!(result, Err(NscaleError::Nomad(_))));
@@ -587,6 +646,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let count = client
             .get_job_count(&"test-job".into(), "web")
@@ -620,6 +680,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let endpoint = client
             .get_healthy_endpoint(&"test-job".into(), "web")
@@ -650,6 +711,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let endpoint = client
             .get_healthy_endpoint(&"test-job".into(), "web")
@@ -669,13 +731,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.get_job(&"missing-job".into()).await;
         assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "missing-job"));
     }
 
     #[tokio::test]
-    async fn test_scale_up_active_deployment_succeeds() {
+    async fn test_scale_up_active_deployment_exhaustion_fails() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -688,13 +751,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let mut client = NomadClient::new(&mock_server.uri(), None).unwrap();
         client.scale_retry_delay = Duration::from_millis(1);
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
-        assert!(
-            result.is_ok(),
-            "a persistently-blocked scale-up should proceed after exhausting retries"
-        );
+        assert!(matches!(
+            result,
+            Err(NscaleError::DeploymentInProgress { .. })
+        ));
     }
 
     #[tokio::test]
@@ -710,6 +774,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
         assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
@@ -726,6 +791,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
         assert!(matches!(result, Err(NscaleError::Nomad(_))));
@@ -747,6 +813,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let response = client.stop_and_purge_job(&"test-job".into()).await.unwrap();
 
@@ -767,9 +834,66 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_job_read(&mock_server).await;
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.stop_and_purge_job(&"test-job".into()).await;
 
         assert!(matches!(result, Err(NscaleError::JobNotFound(job_id)) if job_id == "test-job"));
+    }
+    async fn mount_job_read(server: &MockServer) {
+        Mock::given(method("GET")).and(path("/v1/job/test-job"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"test-job", "Name":"test-job", "Status":"running", "JobModifyIndex":42, "TaskGroups":[{"Name":"web","Count":0}]})))
+            .with_priority(255).mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn wake_does_not_reduce_existing_replicas() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/v1/job/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ID":"api", "Name":"api", "Status":"running", "JobModifyIndex":42, "TaskGroups":[{"Name":"web","Count":4}]}))).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        NomadClient::new(&server.uri(), None)
+            .unwrap()
+            .scale_up(&JobId("api".into()), "web", 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_observed_count_does_not_write() {
+        let server = MockServer::start().await;
+        mount_job_read(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        assert!(
+            NomadClient::new(&server.uri(), None)
+                .unwrap()
+                .scale_from(&JobId("test-job".into()), "web", 4, 3, "test")
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn rejected_modify_index_is_not_retried_as_an_unconditional_write() {
+        let server = MockServer::start().await;
+        mount_job_read(&server).await;
+        Mock::given(method("POST")).and(path("/v1/job/test-job/scale"))
+            .and(body_json(serde_json::json!({"EnforceIndex":true,"JobModifyIndex":42,"Count":2,"Target":{"Group":"web"},"Message":"test"})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Enforcing job modify index 42: job exists with conflicting job modify index"))
+            .expect(1).mount(&server).await;
+        assert!(
+            NomadClient::new(&server.uri(), None)
+                .unwrap()
+                .scale_from(&JobId("test-job".into()), "web", 0, 2, "test")
+                .await
+                .is_err()
+        );
     }
 }

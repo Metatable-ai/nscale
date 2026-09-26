@@ -1,3 +1,4 @@
+use nscale_core::lease::{Lease, cooldown_key, job_lock_key};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,6 @@ pub struct ScaleDownController {
     missing_job_tracker: Arc<dyn MissingJobTracker>,
     idle_threshold: Duration,
     interval: Duration,
-    lock_ttl: Duration,
     auto_deregister_enabled: bool,
     auto_deregister_threshold: u32,
     cancel: CancellationToken,
@@ -62,8 +62,6 @@ impl ScaleDownController {
         auto_deregister_threshold: u32,
         cancel: CancellationToken,
     ) -> Self {
-        // Lock TTL should be a bit longer than the interval to avoid overlap
-        let lock_ttl = interval + Duration::from_secs(5);
         Self {
             orchestrator,
             store,
@@ -74,7 +72,6 @@ impl ScaleDownController {
             missing_job_tracker,
             idle_threshold,
             interval,
-            lock_ttl,
             auto_deregister_enabled,
             auto_deregister_threshold,
             cancel,
@@ -93,15 +90,18 @@ impl ScaleDownController {
     }
 
     async fn cleanup_missing_job_state(&self, job_id: &JobId) -> Result<()> {
-        let unit = ScaleUnit(job_id.0.clone());
-        self.coordinator.mark_dormant(&unit);
-
-        if let Err(e) = self.store.remove_activity(&unit).await {
-            warn!(job_id = %job_id, error = %e, "failed to remove activity during auto-deregister cleanup");
+        for reg in self
+            .registry
+            .list_all()
+            .await?
+            .iter()
+            .filter(|reg| reg.job_id == *job_id)
+        {
+            let unit = reg.scale_unit_key();
+            self.coordinator.mark_dormant(&unit);
+            self.store.remove_activity(&unit).await?;
+            self.deferred_jobs.remove(&unit.0);
         }
-
-        self.deferred_jobs.remove(&job_id.0);
-
         self.registry.deregister(job_id).await?;
 
         if let Err(e) = self.missing_job_tracker.clear_not_found(job_id).await {
@@ -184,20 +184,14 @@ impl ScaleDownController {
     #[instrument(skip(self))]
     async fn tick(&self) -> Result<()> {
         // Try to acquire distributed lock
-        if !self
-            .store
-            .try_acquire_lock(SCALE_DOWN_LOCK_KEY, self.lock_ttl)
-            .await?
-        {
-            debug!("another instance holds the scale-down lock, skipping");
+        let Some(lease) = Lease::acquire(self.store.clone(), SCALE_DOWN_LOCK_KEY.into()).await?
+        else {
             return Ok(());
-        }
-
-        let _lock_guard = LockGuard {
-            store: self.store.clone(),
-            key: SCALE_DOWN_LOCK_KEY,
         };
+        lease.run(self.sweep()).await
+    }
 
+    async fn sweep(&self) -> Result<()> {
         // Activity seeding is handled reactively by the Nomad event stream
         // processor (EventProcessor). The stream subscribes to Allocation
         // events and records activity when allocations reach "running".
@@ -212,20 +206,21 @@ impl ScaleDownController {
         info!(count = idle_units.len(), "found idle units to scale down");
 
         // Resolve each idle unit to its registration (group-aware).
-        let by_unit: std::collections::HashMap<String, JobRegistration> = self
-            .registry
-            .list_all()
-            .await?
-            .into_iter()
-            .map(|reg| (reg.scale_unit_key().0, reg))
-            .collect();
+        let mut by_unit: std::collections::BTreeMap<String, Vec<JobRegistration>> =
+            std::collections::BTreeMap::new();
+        for reg in self.registry.list_all().await? {
+            by_unit.entry(reg.scale_unit_key().0).or_default().push(reg);
+        }
 
         for unit in &idle_units {
             if self.cancel.is_cancelled() {
                 break;
             }
             match by_unit.get(&unit.0) {
-                Some(registration) => self.scale_down_unit(unit, registration).await,
+                Some(registrations) if group_policies_agree(registrations) => {
+                    self.scale_down_unit(unit, registrations).await
+                }
+                Some(_) => warn!(%unit, "conflicting group policies, skipping idle scale-down"),
                 None => {
                     warn!(unit = %unit, "no registration for idle unit, cleaning up stale activity");
                     let _ = self.store.remove_activity(unit).await;
@@ -236,9 +231,41 @@ impl ScaleDownController {
         Ok(())
     }
 
-    #[instrument(skip(self, registration), fields(unit = %unit))]
-    async fn scale_down_unit(&self, unit: &ScaleUnit, registration: &JobRegistration) {
+    #[instrument(skip(self, registrations), fields(unit = %unit))]
+    async fn scale_down_unit(&self, unit: &ScaleUnit, registrations: &[JobRegistration]) {
+        let registration = &registrations[0];
+        match Lease::acquire(self.store.clone(), job_lock_key(&registration.job_id)).await {
+            Ok(Some(lease)) => {
+                if let Err(error) = lease
+                    .run(async {
+                        self.scale_down_locked(unit, registrations).await;
+                        Ok(())
+                    })
+                    .await
+                {
+                    warn!(%error, "scale-down ownership lost");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "scale-down lock unavailable"),
+        }
+    }
+
+    async fn scale_down_locked(&self, unit: &ScaleUnit, registrations: &[JobRegistration]) {
+        let registration = &registrations[0];
         let job_id = &registration.job_id;
+        if !matches!(
+            self.store
+                .in_cooldown(&cooldown_key(job_id, &registration.nomad_group))
+                .await,
+            Ok(false)
+        ) {
+            return;
+        }
+        // The idle list may have been collected before another proxy recorded activity.
+        if !matches!(self.store.idle_age(unit).await, Ok(Some(age)) if age >= self.idle_threshold) {
+            return;
+        }
 
         // --- Deferred guard: skip units backing off after a blocked deployment ---
         if let Some(entry) = self.deferred_jobs.get(&unit.0) {
@@ -249,6 +276,11 @@ impl ScaleDownController {
             // Backoff expired — remove and proceed
             drop(entry);
             self.deferred_jobs.remove(&unit.0);
+        }
+
+        if !matches!(self.store.active_requests(unit).await, Ok(0)) {
+            debug!("shared requests active or unavailable; skipping scale-down");
+            return;
         }
 
         // --- In-flight guard: skip if nscale is actively proxying requests for this unit ---
@@ -267,25 +299,27 @@ impl ScaleDownController {
 
         // --- Traffic guard: skip if Traefik is actively routing to this service ---
         if let Some(probe) = &self.traffic_probe {
-            match probe.has_active_traffic(&registration.service_name).await {
-                Ok(true) => {
-                    info!(
-                        source = "traffic-guard",
-                        "service has active Traefik traffic, refreshing activity"
-                    );
-                    if let Err(e) = self.store.record_activity(unit).await {
-                        warn!(error = %e, "failed to refresh activity for active service");
+            for registration in registrations {
+                match probe.has_active_traffic(&registration.service_name).await {
+                    Ok(true) => {
+                        info!(
+                            source = "traffic-guard",
+                            "service has active Traefik traffic, refreshing activity"
+                        );
+                        if let Err(e) = self.store.record_activity(unit).await {
+                            warn!(error = %e, "failed to refresh activity for active service");
+                        }
+                        return;
                     }
-                    return;
-                }
-                Ok(false) => {
-                    debug!("no active Traefik traffic, proceeding with scale-down");
-                }
-                Err(e) => {
-                    // Fail-open: if we can't reach Traefik metrics, skip this
-                    // unit to avoid accidentally scaling down an active service.
-                    warn!(error = %e, "traffic probe failed, skipping scale-down to be safe");
-                    return;
+                    Ok(false) => {
+                        debug!("no active Traefik traffic, proceeding with scale-down");
+                    }
+                    Err(e) => {
+                        // Fail closed: if we can't reach Traefik metrics, skip this
+                        // unit to avoid accidentally scaling down an active service.
+                        warn!(error = %e, "traffic probe failed, skipping scale-down to be safe");
+                        return;
+                    }
                 }
             }
         }
@@ -345,10 +379,24 @@ impl ScaleDownController {
         info!(group = %registration.nomad_group, "scaling down idle unit");
 
         // Scale down via Nomad
-        let scale_down_result = self
+        let scale_down_result = match self
             .orchestrator
-            .scale_down(&registration.job_id, &registration.nomad_group)
-            .await;
+            .get_job_count(job_id, &registration.nomad_group)
+            .await
+        {
+            Ok(count) => {
+                self.orchestrator
+                    .scale_from(
+                        job_id,
+                        &registration.nomad_group,
+                        count,
+                        0,
+                        "nscale: idle scale-to-zero",
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
 
         match scale_down_result {
             Ok(()) => {
@@ -394,6 +442,14 @@ impl ScaleDownController {
             }
         }
     }
+}
+
+fn group_policies_agree(registrations: &[JobRegistration]) -> bool {
+    registrations.first().is_some_and(|first| {
+        registrations
+            .iter()
+            .all(|reg| reg.autoscaling == first.autoscaling)
+    })
 }
 
 fn scale_to_zero_disabled(registration: &nscale_core::job::JobRegistration) -> bool {
@@ -464,23 +520,6 @@ async fn handle_scale_down_result(
 }
 
 /// RAII guard that releases the distributed lock on drop.
-struct LockGuard {
-    store: Arc<dyn ActivityStore>,
-    key: &'static str,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let store = self.store.clone();
-        let key = self.key.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.release_lock(&key).await {
-                warn!(error = %e, key = %key, "failed to release lock");
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +579,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ActivityStore for MockStore {
+        async fn refresh_request(&self, _: &ScaleUnit, _: &str, _: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn finish_request(&self, _: &ScaleUnit, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn active_requests(&self, _: &ScaleUnit) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn acquire_lease(&self, key: &str, _: &str, ttl: Duration) -> Result<bool> {
+            self.try_acquire_lock(key, ttl).await
+        }
+        async fn renew_lease(&self, _: &str, _: &str, _: Duration) -> Result<bool> {
+            Ok(true)
+        }
+        async fn release_lease(&self, key: &str, _: &str) -> Result<()> {
+            self.release_lock(key).await
+        }
+
         async fn record_activity(&self, _: &ScaleUnit) -> Result<()> {
             self.record_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -576,6 +635,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceDiscovery for MockDiscovery {
+        async fn healthy_endpoints(&self, service: &ServiceName) -> Result<Vec<Endpoint>> {
+            Ok(vec![
+                self.wait_for_healthy(service, Duration::from_secs(1))
+                    .await?,
+            ])
+        }
         async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
             Ok(())
         }
@@ -620,6 +685,24 @@ mod tests {
 
         registration.autoscaling.as_mut().unwrap().scale_to_zero = false;
         assert!(scale_to_zero_disabled(&registration));
+
+        let mut sibling = registration.clone();
+        sibling.service_name = ServiceName("sibling".into());
+        assert!(group_policies_agree(&[
+            registration.clone(),
+            sibling.clone()
+        ]));
+        sibling.autoscaling.as_mut().unwrap().scale_to_zero = true;
+        assert!(!group_policies_agree(&[
+            registration.clone(),
+            sibling.clone()
+        ]));
+        assert!(!group_policies_agree(&[
+            sibling.clone(),
+            registration.clone()
+        ]));
+        sibling.autoscaling = None;
+        assert!(!group_policies_agree(&[registration, sibling]));
     }
 
     #[test]

@@ -27,6 +27,30 @@ struct ServiceInfo {
 }
 
 impl ConsulClient {
+    pub async fn healthy_service_endpoints(&self, service: &ServiceName) -> Result<Vec<Endpoint>> {
+        let entries: Vec<HealthEntry> = self
+            .client
+            .get(self.url(&format!("/v1/health/service/{}", service)))
+            .query(&[("passing", "true")])
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                !entry
+                    .service
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "nscale-fallback")
+            })
+            .map(|entry| Endpoint::new(entry.service.address, entry.service.port))
+            .collect())
+    }
+
     /// Wait for a healthy non-fallback instance of the service to appear.
     /// Uses Consul blocking queries (long-polling) to avoid tight polling loops.
     #[instrument(skip(self), fields(service = %service_name, timeout = ?timeout))]
@@ -177,5 +201,26 @@ mod tests {
 
         assert_eq!(ep.host, "10.0.0.10");
         assert_eq!(ep.port, 3000);
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_all_healthy_service_ports_without_fallback() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path_regex("/v1/health/service/api"))
+            .and(query_param("passing", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"Service":{"ID":"one","Address":"10.0.0.1","Port":8001,"Tags":[]}},
+                {"Service":{"ID":"two","Address":"10.0.0.2","Port":8002,"Tags":[]}},
+                {"Service":{"ID":"fallback","Address":"proxy","Port":8080,"Tags":["nscale-fallback"]}}
+            ]))).mount(&server).await;
+        let endpoints = ConsulClient::new(&server.uri(), None)
+            .unwrap()
+            .healthy_service_endpoints(&"api".into())
+            .await
+            .unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].port, 8001);
+        assert_eq!(endpoints[1].port, 8002);
     }
 }

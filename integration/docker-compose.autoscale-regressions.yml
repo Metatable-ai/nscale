@@ -1,0 +1,13 @@
+# A second proxy shares Redis/Nomad, but receives requests independently so tests
+# can distinguish shared request protection from process-local counters.
+services:
+  nscale-peer:
+    image: ${COMPOSE_PROJECT_NAME:-nscale-fix}-nscale
+    networks: [nscale-net]
+    ports:
+      - "18081:8080"
+      - "19091:9090"
+    volumes:
+      - ./config/:/app/config/:ro
+    environment:
+      RUST_LOG: info,nscale=debug
