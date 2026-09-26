@@ -17,7 +17,7 @@ use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
 
 use crate::metrics::ProxyMetrics;
-use crate::proxy::forward_request;
+use crate::proxy::{forward_request, forward_websocket_upgrade_tracked, is_websocket_upgrade};
 
 const REQUEST_LEASE_TTL: Duration = Duration::from_secs(30);
 
@@ -288,14 +288,19 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         status: 499,
         shared: Some((state.activity_store.clone(), unit.clone(), request_token)),
     };
-    let response = proxy_registered(&state, &registration, req).await;
-    track_response(response, lifetime)
+    let mut lifetime = Some(lifetime);
+    let response = proxy_registered(&state, &registration, req, &mut lifetime).await;
+    match lifetime {
+        Some(lifetime) => track_response(response, lifetime),
+        None => response, // An upgraded tunnel owns the lifetime until it closes.
+    }
 }
 
 async fn proxy_registered(
     state: &AppState,
     registration: &nscale_core::job::JobRegistration,
     req: Request<Body>,
+    lifetime: &mut Option<RequestLifetime>,
 ) -> Response {
     let job_id = registration.job_id.clone();
 
@@ -338,6 +343,19 @@ async fn proxy_registered(
         endpoint = %endpoint,
         "routing request to backend"
     );
+
+    if is_websocket_upgrade(&req) {
+        if let Some(lifetime) = lifetime.as_mut() {
+            lifetime.status = StatusCode::SWITCHING_PROTOCOLS.as_u16();
+        }
+        return match forward_websocket_upgrade_tracked(&endpoint, req, lifetime).await {
+            Ok(response) => response,
+            Err(error) => {
+                error!(%job_id, %endpoint, %error, "backend WebSocket upgrade failed");
+                error.status_code().into_response()
+            }
+        };
+    }
 
     let retry_request = RetryRequest::capture(&req);
 
@@ -600,7 +618,11 @@ fn track_response(response: Response, mut lifetime: RequestLifetime) -> Response
 mod tests {
     use axum::http::Method;
 
-    use super::{CancelOnDrop, RetryRequest};
+    use super::*;
+    use nscale_core::{
+        job::{Endpoint, JobRegistration},
+        traits::{Orchestrator, ServiceDiscovery},
+    };
 
     #[tokio::test]
     async fn cancel_on_drop_cancels_token() {
@@ -706,52 +728,48 @@ mod tests {
         assert_eq!(tracker.count("api/web"), 0);
         assert!(token.is_cancelled());
     }
+    struct Backend {
+        endpoint: Endpoint,
+    }
+    #[async_trait::async_trait]
+    impl Orchestrator for Backend {
+        async fn scale_up(&self, _: &JobId, _: &str, _: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn scale_down(&self, _: &JobId, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn scale_to(&self, _: &JobId, _: &str, _: u32, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_job_count(&self, _: &JobId, _: &str) -> Result<u32> {
+            Ok(1)
+        }
+        async fn get_healthy_endpoint(&self, _: &JobId, _: &str) -> Result<Option<Endpoint>> {
+            Ok(Some(self.endpoint.clone()))
+        }
+    }
+    #[async_trait::async_trait]
+    impl ServiceDiscovery for Backend {
+        async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+        async fn deregister_fallback(&self, _: &ServiceName) -> Result<()> {
+            Ok(())
+        }
+        async fn healthy_endpoints(&self, _: &ServiceName) -> Result<Vec<Endpoint>> {
+            Ok(vec![self.endpoint.clone()])
+        }
+        async fn wait_for_healthy(&self, _: &ServiceName, _: Duration) -> Result<Endpoint> {
+            Ok(self.endpoint.clone())
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated Redis"]
     async fn retry_preserves_authentication() {
-        use super::*;
-        use nscale_core::{
-            job::{Endpoint, JobRegistration},
-            traits::{Orchestrator, ServiceDiscovery},
-        };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
-        struct Backend {
-            endpoint: Endpoint,
-        }
-        #[async_trait::async_trait]
-        impl Orchestrator for Backend {
-            async fn scale_up(&self, _: &JobId, _: &str, _: u32) -> Result<()> {
-                Ok(())
-            }
-            async fn scale_down(&self, _: &JobId, _: &str) -> Result<()> {
-                Ok(())
-            }
-            async fn scale_to(&self, _: &JobId, _: &str, _: u32, _: &str) -> Result<()> {
-                Ok(())
-            }
-            async fn get_job_count(&self, _: &JobId, _: &str) -> Result<u32> {
-                Ok(1)
-            }
-            async fn get_healthy_endpoint(&self, _: &JobId, _: &str) -> Result<Option<Endpoint>> {
-                Ok(Some(self.endpoint.clone()))
-            }
-        }
-        #[async_trait::async_trait]
-        impl ServiceDiscovery for Backend {
-            async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
-                Ok(())
-            }
-            async fn deregister_fallback(&self, _: &ServiceName) -> Result<()> {
-                Ok(())
-            }
-            async fn healthy_endpoints(&self, _: &ServiceName) -> Result<Vec<Endpoint>> {
-                Ok(vec![self.endpoint.clone()])
-            }
-            async fn wait_for_healthy(&self, _: &ServiceName, _: Duration) -> Result<Endpoint> {
-                Ok(self.endpoint.clone())
-            }
-        }
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
         let sequence = calls.clone();
@@ -823,6 +841,7 @@ mod tests {
                 .header("Authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
+            &mut None,
         )
         .await;
         assert!(calls.load(Ordering::SeqCst) >= 2);
@@ -831,5 +850,153 @@ mod tests {
             StatusCode::OK,
             "transport retry must keep authentication context"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis; verifies WebSocket renewal beyond the 30-second TTL"]
+    async fn websocket_tunnel_keeps_shared_request_alive_until_close() {
+        use axum::{Router, routing::any};
+        use hyper_util::rt::TokioIo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = Arc::new(Backend {
+            endpoint: Endpoint::new("127.0.0.1", backend_listener.local_addr().unwrap().port()),
+        });
+        let backend_router = Router::new().fallback(any(|mut req: Request<Body>| async move {
+            if req.uri().path() == "/denied" {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            let upgrade = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                let stream = TokioIo::new(upgrade.await.unwrap());
+                let (mut read, mut write) = tokio::io::split(stream);
+                tokio::io::copy(&mut read, &mut write).await.unwrap();
+            });
+            Response::builder()
+                .status(StatusCode::SWITCHING_PROTOCOLS)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .body(Body::empty())
+                .unwrap()
+        }));
+        let backend_task =
+            tokio::spawn(
+                async move { axum::serve(backend_listener, backend_router).await.unwrap() },
+            );
+        let redis_url = std::env::var("NSCALE_TEST_REDIS_URL").unwrap();
+        let store = Arc::new(
+            nscale_store::activity::RedisActivityStore::new(&redis_url)
+                .await
+                .unwrap(),
+        );
+        // A separate client represents the scaler on another proxy replica.
+        let observer = nscale_store::activity::RedisActivityStore::new(&redis_url)
+            .await
+            .unwrap();
+        let state = AppState {
+            coordinator: Arc::new(WakeCoordinator::new(
+                backend.clone(),
+                backend,
+                10,
+                Duration::from_secs(2),
+            )),
+            registry: Arc::new(JobRegistry::new(store.client().clone())),
+            http_client: reqwest::Client::new(),
+            in_flight: InFlightTracker::new(),
+            activity_store: store.clone(),
+            missing_job_tracker: Arc::new(
+                nscale_store::auto_deregister::RedisMissingJobTracker::new(store.client().clone()),
+            ),
+            proxy_metrics: ProxyMetrics::new(),
+            heartbeat_interval: Duration::from_millis(100),
+            auto_deregister_enabled: false,
+            auto_deregister_threshold: 3,
+        };
+        let name = nscale_core::lease::unique_token();
+        let reg = JobRegistration {
+            job_id: name.clone().into(),
+            service_name: name.clone().into(),
+            nomad_group: "web".into(),
+            scale_unit: Some(format!("{name}/web")),
+            autoscaling: None,
+            traefik_routers: vec![],
+        };
+        state.registry.register(&reg).await.unwrap();
+        let unit = reg.scale_unit_key();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let router = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(state.clone());
+        let proxy_task =
+            tokio::spawn(async move { axum::serve(proxy_listener, router).await.unwrap() });
+        let mut client = tokio::net::TcpStream::connect(proxy_address).await.unwrap();
+        client.write_all(format!("GET /socket HTTP/1.1\r\nHost: {name}.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(client.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8(head).unwrap().starts_with("HTTP/1.1 101"));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(observer.active_requests(&unit).await.unwrap(), 1);
+        assert_eq!(state.in_flight.count(&unit.0), 1);
+        assert_eq!(
+            state
+                .proxy_metrics
+                .snapshot(&reg.job_id, &reg.service_name, Duration::from_secs(60))
+                .request_count,
+            0
+        );
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"ping");
+        client.shutdown().await.unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.active_requests(&unit).await.unwrap() != 0
+                || state.in_flight.count(&unit.0) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .proxy_metrics
+                .snapshot(&reg.job_id, &reg.service_name, Duration::from_secs(60))
+                .request_count,
+            1
+        );
+        let denied = reqwest::Client::new()
+            .get(format!("http://{proxy_address}/denied"))
+            .header(header::HOST, format!("{name}.example"))
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        denied.bytes().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.active_requests(&unit).await.unwrap() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.in_flight.count(&unit.0), 0);
+        state.registry.deregister(&reg.job_id).await.unwrap();
+        store.remove_activity(&unit).await.unwrap();
+        proxy_task.abort();
+        backend_task.abort();
     }
 }

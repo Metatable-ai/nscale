@@ -108,6 +108,26 @@ Only GET/HEAD requests with a known empty body are replayed. Regressions cover
 an authenticated request timing out on the first attempt, header preservation,
 nonempty GET rejection, lease completion/error handoff, and cancellation cleanup.
 
+## Main branch integration
+
+The merge incorporates local `main` at `e8d5499` (WebSocket upgrade tunneling).
+Successful upgrades transfer the existing local request guard, Redis request
+lease, heartbeat, and completion metrics into the tunnel. Failed or rejected
+handshakes retain response-body tracking. The upgrade helper takes the guard
+only after a 101 response, so the caller can finish tracking other responses.
+The existing public forwarding API remains available unchanged.
+
+A real-Redis HTTP upgrade regression holds a tunnel open for 31 seconds,
+verifies shared activity through a separate Redis client, exchanges bytes,
+and checks cleanup on tunnel closure and a rejected upgrade. The original
+bidirectional tunnel regression is retained.
+
+Final merged validation passed: formatting, `cargo check --workspace`, strict
+workspace Clippy, and `cargo nextest run --workspace --run-ignored all` against
+isolated Redis (160 passed, none skipped). Shell syntax and diff checks passed.
+The full Nomad/Consul/Traefik integration scripts were not rerun in this final
+merge pass; their earlier results are recorded above.
+
 ## Operational boundaries
 
 - Redis request tokens expire after 30 seconds without renewal. Application
